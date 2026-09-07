@@ -174,65 +174,77 @@ pub(crate) fn run_report_pipeline(
 
     let stack_text = stack_lines
         .iter()
-        .map(|s| format!("- {}", s))
+        .map(|s| format!("- {}", markdown_inline_code(s)))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let report_md = format!(
-        "# {}\n\n## Summary\nA reproduced crash was observed while processing a `{}` model input.\n\n- Target: `{}`\n- Verdict: `{}`\n- Crash kind: `{}`\n- Sanitizer: `{}`\n- Signal: `{}`\n- Normalized signature: `{}`\n- Source input: `{}`\n- Evidence manifest: `manifest.json`\n\n## Steps to Reproduce\n1. Review `meta.json` for source triage metadata and input hashes.\n2. Use the collected PoC input when available: `{}`.\n3. Run: `tool triage --target {} --input '{}' --repro-retries {} --timeout-sec {}`\n4. Compare `normalized_frame_hash` with `crash_report.txt` and the stack frames below.\n\n## Impact\nObserved crash signature and parser/runtime failure require manual impact confirmation. Treat this as a submission candidate, not an automatic exploitability conclusion.\n\n## Suggested Severity\n- Suggested severity: `{}`\n- Suggested CVSS vector: `{}`\n- Confidence: `{}`\n- Reason: `{}`\n- Manual confirmation required: yes\n\n## Suggested Fix\nValidate parser assumptions around the crashing input path, add regression coverage for the PoC, and reject malformed model files before reaching the crashing code path.\n\n## PoC\n- Original input: `{}`\n- Original sha256: `{}`\n- Collected copy: `{}`\n- Collection status: `{}`\n\n## Minimization\n- Requested: `{}`\n- Minimized: `{}`\n- Strategy: `{}`\n- Minimized input: `{}`\n- Original size: `{}` bytes\n- Minimized size: `{}` bytes\n- Size reduction ratio: `{:.4}`\n- Error: `{}`\n- Validation status: `{}`\n- Validation verdict: `{}`\n- Minimized normalized signature: `{}`\n- Validation summary: `{}`\n- Report generation blocked by minimization failure: no\n\n## Exploit Scenario\nA crafted model file reaches the `{}` parsing path and triggers the reproduced crash condition.\n\n## Crash Summary\n{}\n\n## Stack Top3\n{}\n",
-        build_report_title(&target, &stack_lines, &triage_crash),
-        target,
-        target,
-        verdict,
-        triage_crash.crash_kind,
-        triage_crash.sanitizer,
-        triage_crash.signal,
-        triage_crash.normalized_frame_hash,
-        input,
-        if poc.path.is_empty() { "-" } else { &poc.path },
+    let report_title = build_report_title(&target, &stack_lines, &triage_crash);
+    let target_code = markdown_inline_code(&target);
+    let verdict_code = markdown_inline_code(&verdict);
+    let crash_kind_code = markdown_inline_code(&triage_crash.crash_kind);
+    let sanitizer_code = markdown_inline_code(&triage_crash.sanitizer);
+    let signal_code = markdown_inline_code(&triage_crash.signal);
+    let normalized_signature_code = markdown_inline_code(&triage_crash.normalized_frame_hash);
+    let input_code = markdown_inline_code(&input);
+    let poc_path = if poc.path.is_empty() { "-" } else { &poc.path };
+    let poc_path_code = markdown_inline_code(poc_path);
+    let repro_command = format!(
+        "tool triage --target {} --input '{}' --repro-retries {} --timeout-sec {}",
         target,
         shell_escape_single_quoted(&repro_input),
         repro_retries,
-        timeout_sec,
-        severity.suggested_severity,
-        severity.suggested_cvss_vector,
-        severity.confidence,
-        severity.reason,
-        input,
-        input_sha256,
-        if poc.path.is_empty() { "-" } else { &poc.path },
-        if poc.collected { "collected" } else { "not_collected" },
-        if minimization.requested { "yes" } else { "no" },
-        if minimization.minimized { "yes" } else { "no" },
-        minimization.strategy,
-        if minimization.input_path.is_empty() {
-            "-"
-        } else {
-            &minimization.input_path
-        },
-        minimization.original_size_bytes,
-        minimization.size_bytes,
-        minimization.size_reduction_ratio,
-        if minimization.error.is_empty() {
-            "-"
-        } else {
-            &minimization.error
-        },
-        minimization.validation_status,
-        minimization.validation_verdict,
-        if minimization.validation_normalized_frame_hash.is_empty() {
-            "-"
-        } else {
-            &minimization.validation_normalized_frame_hash
-        },
-        if minimization.validation_summary.is_empty() {
-            "-"
-        } else {
-            &minimization.validation_summary
-        },
-        target,
-        triage_crash.crash_summary,
-        stack_text
+        timeout_sec
+    );
+    let repro_command_code = markdown_inline_code(&repro_command);
+    let severity_code = markdown_inline_code(severity.suggested_severity);
+    let cvss_code = markdown_inline_code(severity.suggested_cvss_vector);
+    let confidence_code = markdown_inline_code(severity.confidence);
+    let severity_reason_code = markdown_inline_code(severity.reason);
+    let input_sha256_code = markdown_inline_code(&input_sha256);
+    let collection_status_code = markdown_inline_code(if poc.collected {
+        "collected"
+    } else {
+        "not_collected"
+    });
+    let minimize_requested_code =
+        markdown_inline_code(if minimization.requested { "yes" } else { "no" });
+    let minimized_code = markdown_inline_code(if minimization.minimized { "yes" } else { "no" });
+    let minimize_strategy_code = markdown_inline_code(&minimization.strategy);
+    let minimized_input = if minimization.input_path.is_empty() {
+        "-"
+    } else {
+        &minimization.input_path
+    };
+    let minimized_input_code = markdown_inline_code(minimized_input);
+    let original_size_code = markdown_inline_code(&minimization.original_size_bytes.to_string());
+    let minimized_size_code = markdown_inline_code(&minimization.size_bytes.to_string());
+    let reduction_ratio_code =
+        markdown_inline_code(&format!("{:.4}", minimization.size_reduction_ratio));
+    let minimize_error = if minimization.error.is_empty() {
+        "-"
+    } else {
+        &minimization.error
+    };
+    let minimize_error_code = markdown_inline_code(minimize_error);
+    let validation_status_code = markdown_inline_code(&minimization.validation_status);
+    let validation_verdict_code = markdown_inline_code(&minimization.validation_verdict);
+    let minimized_signature = if minimization.validation_normalized_frame_hash.is_empty() {
+        "-"
+    } else {
+        &minimization.validation_normalized_frame_hash
+    };
+    let minimized_signature_code = markdown_inline_code(minimized_signature);
+    let validation_summary = if minimization.validation_summary.is_empty() {
+        "-"
+    } else {
+        &minimization.validation_summary
+    };
+    let validation_summary_code = markdown_inline_code(validation_summary);
+    let crash_summary = &triage_crash.crash_summary;
+    let crash_summary_fence = markdown_fence(crash_summary);
+
+    let report_md = format!(
+        "# {report_title}\n\n## Summary\nA reproduced crash was observed while processing a {target_code} model input.\n\n- Target: {target_code}\n- Verdict: {verdict_code}\n- Crash kind: {crash_kind_code}\n- Sanitizer: {sanitizer_code}\n- Signal: {signal_code}\n- Normalized signature: {normalized_signature_code}\n- Source input: {input_code}\n- Evidence manifest: `manifest.json`\n\n## Steps to Reproduce\n1. Review `meta.json` for source triage metadata and input hashes.\n2. Use the collected PoC input when available: {poc_path_code}.\n3. Run: {repro_command_code}\n4. Compare `normalized_frame_hash` with `crash_report.txt` and the stack frames below.\n\n## Impact\nObserved crash signature and parser/runtime failure require manual impact confirmation. Treat this as a submission candidate, not an automatic exploitability conclusion.\n\n## Suggested Severity\n- Suggested severity: {severity_code}\n- Suggested CVSS vector: {cvss_code}\n- Confidence: {confidence_code}\n- Reason: {severity_reason_code}\n- Manual confirmation required: yes\n\n## Suggested Fix\nValidate parser assumptions around the crashing input path, add regression coverage for the PoC, and reject malformed model files before reaching the crashing code path.\n\n## PoC\n- Original input: {input_code}\n- Original sha256: {input_sha256_code}\n- Collected copy: {poc_path_code}\n- Collection status: {collection_status_code}\n\n## Minimization\n- Requested: {minimize_requested_code}\n- Minimized: {minimized_code}\n- Strategy: {minimize_strategy_code}\n- Minimized input: {minimized_input_code}\n- Original size: {original_size_code} bytes\n- Minimized size: {minimized_size_code} bytes\n- Size reduction ratio: {reduction_ratio_code}\n- Error: {minimize_error_code}\n- Validation status: {validation_status_code}\n- Validation verdict: {validation_verdict_code}\n- Minimized normalized signature: {minimized_signature_code}\n- Validation summary: {validation_summary_code}\n- Report generation blocked by minimization failure: no\n\n## Exploit Scenario\nA crafted model file reaches the {target_code} parsing path and triggers the reproduced crash condition.\n\n## Crash Summary\n{crash_summary_fence}text\n{crash_summary}\n{crash_summary_fence}\n\n## Stack Top3\n{stack_text}\n"
     );
     let report_md_path = report_dir.join("report.md");
     fs::write(&report_md_path, report_md)
@@ -505,6 +517,24 @@ fn markdown_list(lines: &[String]) -> String {
 /// an attacker-steered submission report. Markdown allows a longer fence, so the
 /// evidence is preserved byte for byte instead of being mangled.
 fn markdown_fence(content: &str) -> String {
+    "`".repeat(longest_backtick_run(content).saturating_add(1).max(3))
+}
+
+/// Wrap one value in a Markdown code span that its own backticks cannot close.
+///
+/// Ordinary values keep the existing one-backtick rendering. Only a value that
+/// contains backticks gets a longer delimiter, so this is an escaping fix rather
+/// than a report-format change.
+fn markdown_inline_code(content: &str) -> String {
+    let fence = "`".repeat(longest_backtick_run(content).saturating_add(1));
+    if content.starts_with(['`', ' ']) || content.ends_with(['`', ' ']) {
+        format!("{fence} {content} {fence}")
+    } else {
+        format!("{fence}{content}{fence}")
+    }
+}
+
+fn longest_backtick_run(content: &str) -> usize {
     let mut longest = 0usize;
     let mut run = 0usize;
     for c in content.chars() {
@@ -515,7 +545,7 @@ fn markdown_fence(content: &str) -> String {
             run = 0;
         }
     }
-    "`".repeat(longest.saturating_add(1).max(3))
+    longest
 }
 
 fn crash_report_excerpt(crash_report: &str) -> String {
@@ -1548,6 +1578,67 @@ fn record_manual_review(
 
 #[cfg(test)]
 mod tests {
+    // R15 / A20 stage 2: report.md repeats attacker-influenced values inside
+    // one-backtick spans and leaves crash evidence / stack frames in raw Markdown.
+    // A backtick from an input path or parser message can therefore close the span
+    // or fence and turn the rest into active report markup.
+    #[test]
+    fn report_markdown_keeps_attacker_backticks_inside_code_boundaries() {
+        let root = std::env::temp_dir().join(format!(
+            "tool-r15-report-markdown-{}-{}",
+            std::process::id(),
+            crate::common::now_unix_millis()
+        ));
+        let data = root.join("data");
+        let seeds = root.join("seeds");
+        let app_paths = crate::common::AppPaths::prepare(&data, &seeds).expect("prepare paths");
+        let input = root.join("input`close-span.gguf");
+        std::fs::write(&input, b"GGUF test input").expect("write input");
+
+        let triage_dir = data.join("triage").join("triage-1700000000999");
+        std::fs::create_dir_all(&triage_dir).expect("create triage dir");
+        let crash_summary = "parser said ```\n# attacker heading";
+        let stack_frame = "frame` # attacker list item";
+        let summary = format!(
+            "{{\n  \"target\": \"gguf\",\n  \"input\": \"{}\",\n  \"verdict\": \"reproduced\",\n  \"repro_retries\": 3,\n  \"timeout_sec\": 60,\n  \"signature_top3\":[\"{}\"],\n  \"crash_kind\": \"signal\",\n  \"sanitizer\": \"none\",\n  \"signal\": \"SIGSEGV\",\n  \"normalized_frame_hash\": \"abc123\",\n  \"signature_basis\": \"normalized_frame_hash\",\n  \"crash_summary\": \"{}\"\n}}\n",
+            crate::json_utils::json_escape(&input.display().to_string()),
+            crate::json_utils::json_escape(stack_frame),
+            crate::json_utils::json_escape(crash_summary),
+        );
+        std::fs::write(triage_dir.join("summary.json"), summary).expect("write summary");
+        std::fs::write(
+            triage_dir.join("attempt-1.log"),
+            "parser evidence ```\n# attacker evidence heading\n",
+        )
+        .expect("write attempt log");
+
+        super::run_report_pipeline(&app_paths, false).expect("generate report");
+        let report_dir = std::fs::read_dir(data.join("reports"))
+            .expect("read reports")
+            .map(|entry| entry.expect("report entry").path())
+            .find(|path| path.is_dir())
+            .expect("report directory");
+        let report = std::fs::read_to_string(report_dir.join("report.md")).expect("read report");
+        let expected_source = format!("- Source input: ``{}``", input.display());
+        let expected_crash =
+            "## Crash Summary\n````text\nparser said ```\n# attacker heading\n````";
+        let expected_stack = "- ``frame` # attacker list item``";
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            report.contains(&expected_source),
+            "input path escaped its inline-code boundary:\n{report}"
+        );
+        assert!(
+            report.contains(expected_crash),
+            "crash summary escaped its fenced block:\n{report}"
+        );
+        assert!(
+            report.contains(expected_stack),
+            "stack frame escaped its inline-code boundary:\n{report}"
+        );
+    }
+
     // A20: crash evidence is raw output from the library under test. A closing
     // fence inside it used to end the code block early, so the rest of the draft
     // rendered as markdown wherever the operator pasted it.
@@ -1571,6 +1662,15 @@ mod tests {
 
         assert_eq!(super::markdown_fence("plain crash output"), "```");
         assert_eq!(markdown_fence("one ` backtick"), "```");
+    }
+
+    #[test]
+    fn inline_code_keeps_ordinary_rendering_and_separates_edge_backticks() {
+        use super::markdown_inline_code;
+
+        assert_eq!(markdown_inline_code("gguf"), "`gguf`");
+        assert_eq!(markdown_inline_code("left`right"), "``left`right``");
+        assert_eq!(markdown_inline_code("`edge`"), "`` `edge` ``");
     }
 
     use super::{
