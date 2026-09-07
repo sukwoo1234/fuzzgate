@@ -5,8 +5,6 @@ Format-Aware Fuzzing for AI Model File Loaders
 > 퍼징으로 찾는 데서 끝내지 않고,
 > 재현·검증·트리아지·리포트까지 연결하는 보안 검증 도구입니다.
 
-> "퍼징으로 찾았다"에서 끝내지 않고, **재현·검증·리포트까지 자동화**하는 버그바운티용 퍼징 플랫폼.
-
 ## 먼저 읽기
 - 설계/결정: [first.md](first.md)
 - 구현 명세: [docs/specs.md](docs/specs.md)
