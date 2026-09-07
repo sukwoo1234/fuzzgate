@@ -15,7 +15,10 @@ __pycache__/
 
 # internal/private docs
 AGENTS.md
-.github/
+# root-anchored: an unanchored `.github/` also matched vendor/*/.github, which
+# excluded 27 files that the crates' .cargo-checksum.json lists -> `cargo build
+# --offline` failed on every fresh clone while the dev machine kept working.
+/.github/
 .claude/
 docs/
 docs/dev-todo.md
