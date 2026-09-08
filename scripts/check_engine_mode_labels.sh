@@ -11,6 +11,10 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+# run_long.sh sends lifecycle notifications when the operator's real hook file exists.
+# This fixture must be hermetic and must never contact that external endpoint.
+export HOOK_FILE="$WORK/no-discord-hook"
+export DISCORD_WEBHOOK=""
 
 log() {
   echo "[engine-mode-check] $*"
@@ -253,6 +257,8 @@ cp "$WORK/bin/tool" "$WORK/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
 run_loop fuzz-loop-libfuzzer.sh
 [ "$LOOP_EXIT" -eq 0 ] || fail "libfuzzer native loop exited $LOOP_EXIT"
 assert_contains "libfuzzer_mode=native"
+assert_not_contains "-rss_limit_mb="
+assert_not_contains "-malloc_limit_mb="
 
 # B2: the native-driver decision was hardcoded to onnx, so a gguf run with a perfectly
 # good native driver sitting right there was labelled blackbox and ran through the
@@ -274,6 +280,11 @@ run_loop fuzz-loop-libfuzzer.sh TARGET=gguf CORPUS_DIR="$WORK/seeds/gguf"
 [ "$LOOP_EXIT" -eq 0 ] || fail "libfuzzer gguf native loop exited $LOOP_EXIT"
 assert_contains "libfuzzer_mode=native"
 assert_contains "gguf_loader_fuzzer"
+# R16: the parser has attacker-controlled allocation lengths. The shared wrapper is
+# the systemd/manual-loop path, so a GGUF command without both limits is unbounded even
+# when the short native-engine check itself used safe flags.
+assert_contains "-rss_limit_mb=2048"
+assert_contains "-malloc_limit_mb=2048"
 # the profile file name must follow the target, or two arms overwrite each other
 assert_not_contains "onnx-native-%p.profraw"
 
@@ -508,6 +519,45 @@ set -e
 [ "$LOOP_EXIT" -eq 0 ] || fail "run_long gguf libfuzzer exited $LOOP_EXIT: $LOOP_OUT"
 assert_contains "libfuzzer_mode=native"
 assert_contains "gguf-native-%p.profraw"
+assert_contains "-rss_limit_mb=2048"
+assert_contains "-malloc_limit_mb=2048"
+
+# A caller-provided template bypasses run_long's generated command. That escape hatch
+# must fail closed for GGUF unless it carries both positive limits, or a stale shell
+# environment can silently turn an otherwise safe campaign back into an OOM campaign.
+log "run_long: a custom gguf libfuzzer command without memory limits must fail"
+set +e
+LOOP_OUT="$(env -u REQUIRE_NATIVE TOOL_LIBFUZZER_CMD='true {corpus_dir}' \
+  WORKDIR="$WORK" DATA_DIR="$WORK/data" TOOL_BIN="$WORK/bin/tool" LOOP_SLEEP_SEC=0 \
+  bash "$PROJECT_ROOT/scripts/run_long.sh" --target gguf --backend libfuzzer \
+    --duration-seconds 1 --tag engine-mode-check --corpus-dir "$WORK/seeds/gguf" 2>&1)"
+LOOP_EXIT=$?
+set -e
+[ "$LOOP_EXIT" -ne 0 ] || fail "run_long accepted an unbounded custom gguf libfuzzer command: $LOOP_OUT"
+assert_contains "requires positive -rss_limit_mb and -malloc_limit_mb"
+
+log "run_long: a later zero must not override an earlier positive gguf limit"
+set +e
+LOOP_OUT="$(env -u REQUIRE_NATIVE \
+  TOOL_LIBFUZZER_CMD='true -rss_limit_mb=2048 -rss_limit_mb=0 -malloc_limit_mb=2048 {corpus_dir}' \
+  WORKDIR="$WORK" DATA_DIR="$WORK/data" TOOL_BIN="$WORK/bin/tool" LOOP_SLEEP_SEC=0 \
+  bash "$PROJECT_ROOT/scripts/run_long.sh" --target gguf --backend libfuzzer \
+    --duration-seconds 1 --tag engine-mode-check --corpus-dir "$WORK/seeds/gguf" 2>&1)"
+LOOP_EXIT=$?
+set -e
+[ "$LOOP_EXIT" -ne 0 ] || fail "run_long accepted duplicate gguf limits with an effective zero: $LOOP_OUT"
+assert_contains "requires positive -rss_limit_mb and -malloc_limit_mb"
+
+log "run_long: a custom gguf libfuzzer command with both memory limits may run"
+set +e
+LOOP_OUT="$(env -u REQUIRE_NATIVE \
+  TOOL_LIBFUZZER_CMD='true -rss_limit_mb=2048 -malloc_limit_mb=2048 {corpus_dir}' \
+  WORKDIR="$WORK" DATA_DIR="$WORK/data" TOOL_BIN="$WORK/bin/tool" LOOP_SLEEP_SEC=0 \
+  bash "$PROJECT_ROOT/scripts/run_long.sh" --target gguf --backend libfuzzer \
+    --duration-seconds 1 --tag engine-mode-check --corpus-dir "$WORK/seeds/gguf" 2>&1)"
+LOOP_EXIT=$?
+set -e
+[ "$LOOP_EXIT" -eq 0 ] || fail "run_long refused a bounded custom gguf libfuzzer command: $LOOP_OUT"
 
 log "run_long: LIBFUZZER_DRIVER override must match the selected target before native label"
 cp "$WORK/bin/tool" "$WORK/harnesses/libfuzzer/onnxruntime_loader_fuzzer"

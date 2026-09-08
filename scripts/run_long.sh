@@ -30,6 +30,26 @@ TIMEOUT_SEC="30"
 RESTART_LIMIT="1"
 MAX_JOBS=""
 
+libfuzzer_command_has_one_positive_limit() {
+  local command="$1"
+  local name="$2"
+  local positive_pattern="^-${name}=[1-9][0-9]*$"
+  local found="0"
+  local token
+  local -a tokens=()
+
+  read -r -a tokens <<< "$command"
+  for token in "${tokens[@]}"; do
+    case "$token" in
+      -"${name}"=*)
+        [[ "$token" =~ $positive_pattern ]] || return 1
+        found=$((found + 1))
+        ;;
+    esac
+  done
+  [[ "$found" -eq 1 ]]
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) TARGET="${2:-}"; shift 2 ;;
@@ -86,6 +106,14 @@ case "$BACKEND" in
   local-harness)
     ;;
   libfuzzer)
+    # R16: the pinned GGUF parser has attacker-controlled allocation lengths. The
+    # source clamp handles the known V4 shape; explicit libFuzzer limits remain the
+    # campaign-level backstop and keep allocator events bounded and recognizable.
+    if [[ "$TARGET" == "gguf" ]]; then
+      LIBFUZZER_RESOURCE_LIMITS="-rss_limit_mb=2048 -malloc_limit_mb=2048"
+    else
+      LIBFUZZER_RESOURCE_LIMITS=""
+    fi
     if [[ -z "${TOOL_LIBFUZZER_CMD:-}" ]]; then
       # Same per-target resolution as ops/scripts/fuzz-loop-libfuzzer.sh: this is the
       # path the campaign runners take, and the two must decide identically or a
@@ -110,7 +138,7 @@ case "$BACKEND" in
       if [[ "$LIBFUZZER_OVERRIDE_MISMATCH" -eq 0 \
         && -n "$NATIVE_DRIVER" && -x "$NATIVE_DRIVER" ]]; then
         export TOOL_LIBFUZZER_MODE="native"
-        export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && LLVM_PROFILE_FILE={artifact_dir}/${TARGET}-native-%p.profraw ${NATIVE_DRIVER} -artifact_prefix={artifact_dir}/ -max_total_time=5 {corpus_dir} >/dev/null 2>&1"
+        export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && LLVM_PROFILE_FILE={artifact_dir}/${TARGET}-native-%p.profraw ${NATIVE_DRIVER} ${LIBFUZZER_RESOURCE_LIMITS} -artifact_prefix={artifact_dir}/ -max_total_time=5 {corpus_dir} >/dev/null 2>&1"
       else
         export TOOL_LIBFUZZER_MODE="blackbox"
         if [[ "$LIBFUZZER_OVERRIDE_MISMATCH" -eq 1 ]]; then
@@ -124,11 +152,17 @@ case "$BACKEND" in
           echo "[run-long] REQUIRE_NATIVE=1 is set; refusing to run in black-box mode" >&2
           exit 3
         fi
-        export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && TOOL_HARNESS_TOOL=${TOOL_BIN} TOOL_HARNESS_TARGET=${TARGET} TOOL_HARNESS_EXT=${TARGET} ${WORKDIR}/harnesses/libfuzzer/tool_harness_driver -artifact_prefix={artifact_dir}/ -max_total_time=5 {corpus_dir} >/dev/null 2>&1"
+        export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && TOOL_HARNESS_TOOL=${TOOL_BIN} TOOL_HARNESS_TARGET=${TARGET} TOOL_HARNESS_EXT=${TARGET} ${WORKDIR}/harnesses/libfuzzer/tool_harness_driver ${LIBFUZZER_RESOURCE_LIMITS} -artifact_prefix={artifact_dir}/ -max_total_time=5 {corpus_dir} >/dev/null 2>&1"
       fi
       echo "[run-long] libfuzzer_mode=${TOOL_LIBFUZZER_MODE}"
       echo "[run-long] TOOL_LIBFUZZER_CMD=${TOOL_LIBFUZZER_CMD}"
     else
+      if [[ "$TARGET" == "gguf" ]] \
+        && { ! libfuzzer_command_has_one_positive_limit "$TOOL_LIBFUZZER_CMD" rss_limit_mb \
+          || ! libfuzzer_command_has_one_positive_limit "$TOOL_LIBFUZZER_CMD" malloc_limit_mb; }; then
+        echo "[run-long] GGUF libFuzzer requires positive -rss_limit_mb and -malloc_limit_mb values in TOOL_LIBFUZZER_CMD" >&2
+        exit 2
+      fi
       echo "[run-long] libfuzzer_mode=${TOOL_LIBFUZZER_MODE:-unlabeled} (TOOL_LIBFUZZER_CMD provided by caller)"
     fi
     ;;

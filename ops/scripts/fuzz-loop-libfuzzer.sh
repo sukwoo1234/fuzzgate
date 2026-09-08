@@ -46,6 +46,14 @@ MAX_ITERATIONS="${FUZZ_LOOP_MAX_ITERATIONS:-0}"
 REQUIRE_NATIVE="${REQUIRE_NATIVE:-0}"
 
 LIBFUZZER_MAX_TOTAL_TIME="${LIBFUZZER_MAX_TOTAL_TIME:-30}"
+# R16: gguf has attacker-controlled allocation lengths. The build-time parser clamp
+# rejects the known V4 shape, but the campaign still needs process-level backstops for
+# any equivalent path the fuzzer reaches. Keep these explicit in the command so the
+# loop log is also an auditable record of the limits used.
+case "${TARGET}" in
+    gguf) LIBFUZZER_RESOURCE_LIMITS="-rss_limit_mb=2048 -malloc_limit_mb=2048" ;;
+    *)    LIBFUZZER_RESOURCE_LIMITS="" ;;
+esac
 # The native driver is per target, not per project: hardcoding onnx here meant a gguf
 # run with a perfectly good native driver next to it was labelled blackbox and fuzzed
 # through the tool wrapper instead. An empty NATIVE_DRIVER means "no native driver
@@ -142,9 +150,9 @@ if [[ "${LIBFUZZER_MODE}" == "native" ]]; then
         onnx) LIBFUZZER_PROFILE_PREFIX="LLVM_PROFILE_FILE={artifact_dir}/${TARGET}-native-%p.profraw " ;;
         *)    LIBFUZZER_PROFILE_PREFIX="" ;;
     esac
-    export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && ${LIBFUZZER_PROFILE_PREFIX}${LIBFUZZER_DRIVER} -artifact_prefix={artifact_dir}/ -max_total_time=${LIBFUZZER_MAX_TOTAL_TIME} {corpus_dir} >/dev/null 2>&1"
+    export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && ${LIBFUZZER_PROFILE_PREFIX}${LIBFUZZER_DRIVER} ${LIBFUZZER_RESOURCE_LIMITS} -artifact_prefix={artifact_dir}/ -max_total_time=${LIBFUZZER_MAX_TOTAL_TIME} {corpus_dir} >/dev/null 2>&1"
 else
-    export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && TOOL_HARNESS_TOOL=${TOOL_BIN} TOOL_HARNESS_TARGET=${TARGET} TOOL_HARNESS_EXT=${TARGET} ${LIBFUZZER_DRIVER} -artifact_prefix={artifact_dir}/ -max_total_time=${LIBFUZZER_MAX_TOTAL_TIME} {corpus_dir} >/dev/null 2>&1"
+    export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && TOOL_HARNESS_TOOL=${TOOL_BIN} TOOL_HARNESS_TARGET=${TARGET} TOOL_HARNESS_EXT=${TARGET} ${LIBFUZZER_DRIVER} ${LIBFUZZER_RESOURCE_LIMITS} -artifact_prefix={artifact_dir}/ -max_total_time=${LIBFUZZER_MAX_TOTAL_TIME} {corpus_dir} >/dev/null 2>&1"
 fi
 
 iter=0
