@@ -4,6 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 usage: run_long.sh --target <onnx|gguf|safetensors> --backend <local-harness|libfuzzer|aflpp> (--hours <N>|--duration-seconds <N>) --tag <TAG> [--corpus-dir <dir>] [--data-dir <dir>] [--workers <n>] [--timeout-sec <n>] [--restart-limit <n>] [--max-jobs <n>]
+GGUF libFuzzer uses generated commands with memory limits; unset TOOL_LIBFUZZER_CMD before running.
 EOF
 }
 
@@ -29,26 +30,6 @@ WORKERS="1"
 TIMEOUT_SEC="30"
 RESTART_LIMIT="1"
 MAX_JOBS=""
-
-libfuzzer_command_has_one_positive_limit() {
-  local command="$1"
-  local name="$2"
-  local positive_pattern="^-${name}=[1-9][0-9]*$"
-  local found="0"
-  local token
-  local -a tokens=()
-
-  read -r -a tokens <<< "$command"
-  for token in "${tokens[@]}"; do
-    case "$token" in
-      -"${name}"=*)
-        [[ "$token" =~ $positive_pattern ]] || return 1
-        found=$((found + 1))
-        ;;
-    esac
-  done
-  [[ "$found" -eq 1 ]]
-}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -159,10 +140,11 @@ case "$BACKEND" in
       echo "[run-long] libfuzzer_mode=${TOOL_LIBFUZZER_MODE}"
       echo "[run-long] TOOL_LIBFUZZER_CMD=${TOOL_LIBFUZZER_CMD}"
     else
-      if [[ "$TARGET" == "gguf" ]] \
-        && { ! libfuzzer_command_has_one_positive_limit "$TOOL_LIBFUZZER_CMD" rss_limit_mb \
-          || ! libfuzzer_command_has_one_positive_limit "$TOOL_LIBFUZZER_CMD" malloc_limit_mb; }; then
-        echo "[run-long] GGUF libFuzzer requires positive -rss_limit_mb and -malloc_limit_mb values in TOOL_LIBFUZZER_CMD" >&2
+      # The backend evaluates templates with bash -lc. Token checks cannot prove
+      # which limits reach the engine after quoting, expansion or extra commands.
+      # Refuse overrides explicitly rather than silently discarding caller intent.
+      if [[ "$TARGET" == "gguf" ]]; then
+        echo "[run-long] GGUF libFuzzer does not accept TOOL_LIBFUZZER_CMD; unset TOOL_LIBFUZZER_CMD to use the generated command with -rss_limit_mb=2048 -malloc_limit_mb=2048" >&2
         exit 2
       fi
       echo "[run-long] libfuzzer_mode=${TOOL_LIBFUZZER_MODE:-unlabeled} (TOOL_LIBFUZZER_CMD provided by caller)"

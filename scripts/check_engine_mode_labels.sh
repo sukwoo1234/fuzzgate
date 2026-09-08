@@ -523,8 +523,8 @@ assert_contains "-rss_limit_mb=2048"
 assert_contains "-malloc_limit_mb=2048"
 
 # A caller-provided template bypasses run_long's generated command. That escape hatch
-# must fail closed for GGUF unless it carries both positive limits, or a stale shell
-# environment can silently turn an otherwise safe campaign back into an OOM campaign.
+# must fail closed for GGUF even if it appears to carry both positive limits: shell
+# expansion can pass different limits to the engine than a token check sees.
 log "run_long: a custom gguf libfuzzer command without memory limits must fail"
 set +e
 LOOP_OUT="$(env -u REQUIRE_NATIVE TOOL_LIBFUZZER_CMD='true {corpus_dir}' \
@@ -534,7 +534,8 @@ LOOP_OUT="$(env -u REQUIRE_NATIVE TOOL_LIBFUZZER_CMD='true {corpus_dir}' \
 LOOP_EXIT=$?
 set -e
 [ "$LOOP_EXIT" -ne 0 ] || fail "run_long accepted an unbounded custom gguf libfuzzer command: $LOOP_OUT"
-assert_contains "requires positive -rss_limit_mb and -malloc_limit_mb"
+assert_contains "does not accept TOOL_LIBFUZZER_CMD"
+assert_contains "unset TOOL_LIBFUZZER_CMD"
 
 log "run_long: a later zero must not override an earlier positive gguf limit"
 set +e
@@ -546,9 +547,9 @@ LOOP_OUT="$(env -u REQUIRE_NATIVE \
 LOOP_EXIT=$?
 set -e
 [ "$LOOP_EXIT" -ne 0 ] || fail "run_long accepted duplicate gguf limits with an effective zero: $LOOP_OUT"
-assert_contains "requires positive -rss_limit_mb and -malloc_limit_mb"
+assert_contains "does not accept TOOL_LIBFUZZER_CMD"
 
-log "run_long: a custom gguf libfuzzer command with both memory limits may run"
+log "run_long: even a custom gguf command with both limits must be refused"
 set +e
 LOOP_OUT="$(env -u REQUIRE_NATIVE \
   TOOL_LIBFUZZER_CMD='true -rss_limit_mb=2048 -malloc_limit_mb=2048 {corpus_dir}' \
@@ -557,7 +558,8 @@ LOOP_OUT="$(env -u REQUIRE_NATIVE \
     --duration-seconds 1 --tag engine-mode-check --corpus-dir "$WORK/seeds/gguf" 2>&1)"
 LOOP_EXIT=$?
 set -e
-[ "$LOOP_EXIT" -eq 0 ] || fail "run_long refused a bounded custom gguf libfuzzer command: $LOOP_OUT"
+[ "$LOOP_EXIT" -eq 2 ] || fail "run_long accepted a custom gguf libfuzzer command: $LOOP_OUT"
+assert_contains "does not accept TOOL_LIBFUZZER_CMD"
 
 log "run_long: LIBFUZZER_DRIVER override must match the selected target before native label"
 cp "$WORK/bin/tool" "$WORK/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
