@@ -84,16 +84,18 @@ if [[ -n "$HOURS" && -n "$DURATION_SECONDS" ]]; then
   exit 2
 fi
 
+SEED_FIXTURE=""
 if [[ -z "$CORPUS_DIR" ]]; then
   CORPUS_DIR="seeds/${TARGET}"
   # C3: a gguf libFuzzer run seeds from the under-cap derivative when one is built.
   # Only libFuzzer: AFL++ has no input-length cap and its arm keeps the originals.
   if [[ "$TARGET" == gguf && "$BACKEND" == libfuzzer ]]; then
-    if CORPUS_DIR="$(gguf_libfuzzer_seed_fixture "$WORKDIR")"; then
+    if SEED_FIXTURE="$(gguf_libfuzzer_seed_fixture "$WORKDIR")"; then
       :
     else
-      echo "[run-long] WARN no usable libfuzzer-sized corpus at $WORKDIR/data/corpus/gguf-libfuzzer; using $CORPUS_DIR, whose oversized units libFuzzer can never reproduce (build it with scripts/build_gguf_libfuzzer_corpus.sh)" >&2
+      echo "[run-long] WARN no usable libfuzzer-sized corpus at $WORKDIR/data/corpus/gguf-libfuzzer; seeding from $SEED_FIXTURE, whose oversized units libFuzzer can never reproduce (build it with scripts/build_gguf_libfuzzer_corpus.sh)" >&2
     fi
+    CORPUS_DIR="$SEED_FIXTURE"
   fi
 fi
 
@@ -234,6 +236,18 @@ case "$BACKEND" in
     exit 2
     ;;
 esac
+
+# R26: fixtures are inputs, never the writable libFuzzer corpus. Only an omitted
+# --corpus-dir uses this shared working copy; campaign arm copies stay caller-owned.
+# Seed after the source and engine checks so refused runs do not alter the corpus.
+if [[ -n "$SEED_FIXTURE" ]]; then
+  CORPUS_DIR="$WORKDIR/data/corpus/libfuzzer/gguf"
+  EVICTED="$(gguf_seed_working_corpus "$CORPUS_DIR" "$SEED_FIXTURE")"
+  echo "[run-long] seed_fixture=$SEED_FIXTURE"
+  if [[ "$EVICTED" -ne 0 ]]; then
+    echo "[run-long] evicted $EVICTED old fixture units from $CORPUS_DIR"
+  fi
+fi
 
 if [[ -n "$DURATION_SECONDS" ]]; then
   DURATION_LABEL="${DURATION_SECONDS}s"

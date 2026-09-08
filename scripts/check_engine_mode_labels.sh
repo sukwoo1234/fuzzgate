@@ -577,7 +577,7 @@ assert_not_contains "libfuzzer_mode=native"
 # campaign - there is no gguf libFuzzer systemd unit - so it must choose the same seed
 # fixture the loop does. Neither case passes --corpus-dir: the default IS the thing
 # under test.
-log "run_long: a gguf libfuzzer run defaults to the libfuzzer-sized corpus"
+log "run_long: a gguf libfuzzer run seeds a working corpus from the libfuzzer-sized fixture"
 set +e
 LOOP_OUT="$(env -u REQUIRE_NATIVE -u REQUIRE_INSTRUMENTED -u TOOL_LIBFUZZER_CMD \
   WORKDIR="$WORK" DATA_DIR="$WORK/data" TOOL_BIN="$WORK/bin/tool" LOOP_SLEEP_SEC=0 \
@@ -586,7 +586,8 @@ LOOP_OUT="$(env -u REQUIRE_NATIVE -u REQUIRE_INSTRUMENTED -u TOOL_LIBFUZZER_CMD 
 LOOP_EXIT=$?
 set -e
 [ "$LOOP_EXIT" -eq 0 ] || fail "run_long gguf libfuzzer exited $LOOP_EXIT: $LOOP_OUT"
-assert_contains "corpus=$WORK/data/corpus/gguf-libfuzzer"
+assert_contains "seed_fixture=$WORK/data/corpus/gguf-libfuzzer"
+assert_contains "corpus=$WORK/data/corpus/libfuzzer/gguf"
 
 # ...and the AFL++ arm deliberately keeps the full-size originals: AFL++ has no input
 # length cap, and switching it would silently change what the two arms compare.
