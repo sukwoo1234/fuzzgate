@@ -104,7 +104,7 @@ discord_notify "[START] ${TAG} ts=${ts_start} host=$(hostname)"
 end_ts=$(( $(date +%s) + DURATION_SECS ))
 runs=0
 failures=0
-last_ec=0
+loop_ec=0
 last_alert_sig=""
 
 cd "$WORKDIR"
@@ -120,9 +120,13 @@ while true; do
   set -e
 
   runs=$((runs + 1))
-  last_ec="$ec"
   if [[ "$ec" -ne 0 ]]; then
     failures=$((failures + 1))
+    # Keep running until the deadline, but never let recovery erase a failure.
+    # Preserve the first failing tool code for both the record and the caller.
+    if [[ "$loop_ec" -eq 0 ]]; then
+      loop_ec="$ec"
+    fi
   fi
 
   latest_status="$(ls -1t "$DATA_DIR"/runs/run-*/status.json 2>/dev/null | head -n 1 || true)"
@@ -142,21 +146,22 @@ while true; do
 done
 
 ts_end="$(date -Iseconds)"
-echo "[DONE] ${TAG} ts=${ts_end} exit=${last_ec} runs=${runs} failures=${failures} host=$(hostname)" | tee -a "$LOG_FILE"
+echo "[DONE] ${TAG} ts=${ts_end} exit=${loop_ec} runs=${runs} failures=${failures} host=$(hostname)" | tee -a "$LOG_FILE"
 echo "${ts_end}" > "$DONE_FILE"
 cat > "$EXIT_FILE" <<EOF
 timestamp=${ts_end}
-exit_code=${last_ec}
+exit_code=${loop_ec}
 runs=${runs}
 failures=${failures}
 tag=${TAG}
 EOF
 
-if [[ "$last_ec" -eq 0 ]]; then
-  discord_notify "[DONE] ${TAG} ts=${ts_end} exit=${last_ec} runs=${runs} failures=${failures} host=$(hostname)"
+if [[ "$loop_ec" -eq 0 ]]; then
+  discord_notify "[DONE] ${TAG} ts=${ts_end} exit=${loop_ec} runs=${runs} failures=${failures} host=$(hostname)"
 else
-  discord_notify "[FAIL] ${TAG} ts=${ts_end} exit=${last_ec} runs=${runs} failures=${failures} host=$(hostname)"
+  discord_notify "[FAIL] ${TAG} ts=${ts_end} exit=${loop_ec} runs=${runs} failures=${failures} host=$(hostname)"
 fi
 
 # terminal bell for local attention
 printf '\a'
+exit "$loop_ec"
