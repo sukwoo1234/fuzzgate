@@ -229,6 +229,27 @@ make smoke-all TARGET=onnx SECONDS=60
 
 캠페인 결과는 `data/campaigns/<campaign-id>/` 아래에 저장된다. 원본 시드는 `seeds/<target>/`에서 캠페인 스냅샷으로 한 번 복사되고, backend별 실행은 `arms/<backend>/corpus/`와 `arms/<backend>/data/`로 분리된다. 같은 `campaign-id` 재사용은 결과 혼합을 막기 위해 차단한다. 중단 신호(`Ctrl+C`, `TERM`)를 받으면 실행 중인 backend 프로세스를 종료하고 `status.json`/`arms/<backend>/status.json`에 `interrupted` 상태를 기록한다.
 
+**GGUF 엔진 비교의 초기 corpus 조건:** 실행 경로에 따라 선택하는 시드가 다르다.
+
+| 실행 경로 | libFuzzer 초기 시드 출처 | AFL++ 초기 시드 출처 |
+|---|---|---|
+| `scripts/run_long.sh`에서 `--corpus-dir` 생략 / ops 루프 기본값 | 사용 가능한 `data/corpus/gguf-libfuzzer` 축소 fixture. 없거나 불완전하면 경고 후 `seeds/gguf`로 폴백 | `seeds/gguf` 원본 |
+| `tool campaign` / `scripts/run_campaign.sh` (`serial`·`parallel`) | 공통 스냅샷의 팔별 사본 | 같은 스냅샷의 팔별 사본 |
+
+축소 생성기 `scripts/build_gguf_libfuzzer_corpus.sh`의 기본 산출물 상한은 **1 MiB 미만**이다.
+메타데이터 배열을 줄이고, 텐서는 크기에 맞는 오프셋 순 prefix를 유지하므로 원본과 내용이
+달라질 수 있다. 기본 실행에서 축소본과 원본을 썼다면 비교 표·그림·논문·포스터에도 그 조건을
+같이 적는다. 이는 엔진과 corpus 조건이 함께 다른 비교이며 엔진만의 효과로 해석할 수 없다.
+campaign은 `--corpus-dir`로 선택한 출처(생략 시 `seeds/gguf`)를 한 번 복사하고 각 팔에
+명시 경로로 전달하므로 libFuzzer만 자동 축소본으로 바꾸지 않는다. 동일 스냅샷은 초기 입력의
+동일성을 뜻하며, 이후 발견물이나 엔진의 입력 길이·메모리 제한까지 같다는 뜻은 아니다.
+
+비교 기록에는 작업 `corpus_dir`, 선택한 `seed_fixture`, campaign manifest의
+`corpus_source`·`seed_snapshot`·`seed_snapshot_hash`와 실제 엔진 명령을 함께 보존한다.
+`seed_fixture`는 경로 기록이며 내용 해시가 아니다. `null`이거나 과거 status에 필드가 없으면
+출처를 추정하지 않는다. 과거 GGUF 결과에도 현재의 축소/원본 구분을 소급 적용하지 않으며,
+같은 경로명만으로 당시 입력 바이트가 같았다고 주장하지 않는다.
+
 퍼징컴에서는 먼저 `make build`, `make preflight TARGET=onnx`, `make smoke TARGET=onnx` 순서로 확인한다.
 
 ### AFL++
