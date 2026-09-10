@@ -22,48 +22,84 @@ fail() { echo "[st-engines] fail: $*" >&2; exit 1; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --require-aflpp) REQUIRE_AFLPP=1; shift ;;
-    -h|--help) echo "usage: check_safetensors_native_engines.sh [--require-aflpp]"; exit 0 ;;
+    -h|--help)
+      echo "usage: check_safetensors_native_engines.sh [--require-aflpp]"
+      echo "LSAN_OPTIONS defaults to detect_leaks=0 for this smoke check; explicit values are preserved."
+      echo "Failures preserve logs, inputs and artifacts under the printed evidence path."
+      exit 0 ;;
     *) echo "[st-engines] unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
+WORK="$(mktemp -d)"
+cleanup() {
+  local rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    rm -rf "$WORK"
+  else
+    log "evidence preserved: $WORK" >&2
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+mkdir -p "$WORK/corpus" "$WORK/artifacts" "$WORK/replay-inputs"
+
+# LSan's ptrace requirement can fail in restricted WSL/dev environments after a
+# clean fuzzing run, even writing a zero-byte crash artifact. This bounded smoke
+# checks parser execution, not leaks. Preserve caller settings (including empty).
+CHECK_LSAN_OPTIONS="${LSAN_OPTIONS-detect_leaks=0}"
+log "libFuzzer LSAN_OPTIONS=$CHECK_LSAN_OPTIONS"
+printf 'LSAN_OPTIONS=%q\n' "$CHECK_LSAN_OPTIONS" >"$WORK/configuration.log"
+printf 'command: %q ' "$FUZZER" >>"$WORK/configuration.log"
+printf '%q ' -runs="$RUNS" -max_len=1048576 -artifact_prefix="$WORK/artifacts/" "$WORK/corpus" \
+  >>"$WORK/configuration.log"
+printf '\n' >>"$WORK/configuration.log"
+
 # build the harness if missing
 if [[ ! -x "$FUZZER" || ! -x "$REPLAY" ]]; then
   log "harness missing; building"
-  bash "$PROJECT_ROOT/scripts/build_libfuzzer_safetensors_native.sh" >/dev/null
+  bash "$PROJECT_ROOT/scripts/build_libfuzzer_safetensors_native.sh" >"$WORK/libfuzzer-build.log" 2>&1 \
+    || fail "native build failed; see $WORK/libfuzzer-build.log"
 fi
 [[ -x "$FUZZER" ]] || fail "libFuzzer target not built: $FUZZER"
 [[ -x "$REPLAY" ]] || fail "replay not built: $REPLAY"
 
-# 1. the in-process libFuzzer target runs a real corpus clean (no crash artifact). This
-#    is where a crash WOULD surface if deserialize had one; a clean run corroborates the
-#    crate's 'safe' claim rather than a tooling failure.
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-cp "$SEED_DIR"/*.safetensors "$WORK"/ 2>/dev/null || true
-[[ -n "$(ls -A "$WORK" 2>/dev/null)" ]] || fail "no seeds to run under $SEED_DIR"
+# 1. Run the real corpus cleanly. Logs and artifacts are kept out of the corpus so
+# diagnostic bytes cannot become fuzzer inputs or satisfy the nonempty-seed check.
+cp "$SEED_DIR"/*.safetensors "$WORK/corpus/" 2>/dev/null || true
+[[ -n "$(ls -A "$WORK/corpus" 2>/dev/null)" ]] || fail "no seeds to run under $SEED_DIR"
 set +e
-"$FUZZER" -runs="$RUNS" -max_len=1048576 -artifact_prefix="$WORK/" "$WORK" >/dev/null 2>&1
+LSAN_OPTIONS="$CHECK_LSAN_OPTIONS" "$FUZZER" -runs="$RUNS" -max_len=1048576 \
+  -artifact_prefix="$WORK/artifacts/" "$WORK/corpus" >"$WORK/libfuzzer.log" 2>&1
 rc=$?
 set -e
-crashes="$(find "$WORK" -maxdepth 1 -name 'crash-*' -o -name 'oom-*' -o -name 'timeout-*' 2>/dev/null | wc -l)"
-if [[ "$crashes" -ne 0 ]]; then
-  log "NOTE: the libFuzzer target produced $crashes crash artifact(s) under $WORK - triage them"
-  fail "unexpected crash artifacts (deserialize is expected to hold)"
+printf 'libfuzzer_exit=%s\n' "$rc" >>"$WORK/configuration.log"
+if grep -Fq 'LeakSanitizer has encountered a fatal error' "$WORK/libfuzzer.log"; then
+  fail "LeakSanitizer runtime failed; inspect $WORK/libfuzzer.log and artifacts before classifying parser crashes"
 fi
-[[ $rc -eq 0 ]] || fail "libFuzzer target exited $rc on a clean corpus"
-log "libFuzzer target ran $RUNS runs clean (held, as expected for the audited crate)"
+crashes="$(find "$WORK/artifacts" -maxdepth 1 -type f \( -name 'crash-*' -o -name 'oom-*' -o -name 'timeout-*' \) | wc -l)"
+if [[ "$crashes" -ne 0 ]]; then
+  fail "unexpected artifacts ($crashes); inspect $WORK/artifacts and $WORK/libfuzzer.log"
+fi
+[[ $rc -eq 0 ]] || fail "libFuzzer target exited $rc; see $WORK/libfuzzer.log"
+log "libFuzzer target ran $RUNS runs clean (leak-check policy shown above)"
 
 # 2. the replay's accept/reject boundary is the crate's: good -> 0, malformed -> 9
 if [[ ! -d "$MAL_DIR" ]] || [[ -z "$(ls -A "$MAL_DIR" 2>/dev/null)" ]]; then
-  bash "$PROJECT_ROOT/scripts/gen_safetensors_malformed_seeds.sh" >/dev/null
+  bash "$PROJECT_ROOT/scripts/gen_safetensors_malformed_seeds.sh" >"$WORK/malformed-seeds.log" 2>&1 \
+    || fail "malformed seed generation failed; see $WORK/malformed-seeds.log"
 fi
 GOOD="$(find "$SEED_DIR" -name '*.safetensors' | head -1)"
 [[ -n "$GOOD" ]] || fail "no valid safetensors seed under $SEED_DIR"
-"$REPLAY" "$GOOD" >/dev/null 2>&1 || fail "replay rejected a valid seed"
+cp "$GOOD" "$WORK/replay-inputs/good.safetensors"
+GOOD="$WORK/replay-inputs/good.safetensors"
+"$REPLAY" "$GOOD" >"$WORK/replay-good.log" 2>&1 || fail "replay rejected a valid seed; see $WORK/replay-good.log"
 POC="$(find "$MAL_DIR" -name '*.safetensors' | head -1)"
-set +e; "$REPLAY" "$POC" >/dev/null 2>&1; rc=$?; set -e
-[[ $rc -eq 9 ]] || fail "replay gave exit $rc on a malformed PoC, expected 9"
+[[ -n "$POC" ]] || fail "no malformed safetensors seed under $MAL_DIR"
+cp "$POC" "$WORK/replay-inputs/bad.safetensors"
+POC="$WORK/replay-inputs/bad.safetensors"
+set +e; "$REPLAY" "$POC" >"$WORK/replay-malformed.log" 2>&1; rc=$?; set -e
+[[ $rc -eq 9 ]] || fail "replay gave exit $rc on a malformed PoC, expected 9; see $WORK/replay-malformed.log"
 log "replay accept/reject boundary is the crate's (good->0, malformed->9)"
 
 # 3. AFL++ arm. Rust is built through cargo-afl; a host with a standalone afl-showmap
