@@ -1965,6 +1965,19 @@ mod tests {
         use super::{gguf_library_connect, LibraryConnectOutcome};
         use std::os::unix::fs::PermissionsExt;
 
+        const CHILD_INPUT: &str = "TOOL_TEST_GGUF_FALLBACK_INPUT";
+        if let Some(input) = std::env::var_os(CHILD_INPUT) {
+            let result = gguf_library_connect(std::path::Path::new(&input));
+            assert!(
+                matches!(result.outcome, LibraryConnectOutcome::SessionOk),
+                "the working candidate was never reached: {} / {}",
+                result.step,
+                result.outcome.as_str()
+            );
+            assert!(result.step.contains("sha256: dead"), "{}", result.step);
+            return;
+        }
+
         let _guard = env_lock();
         let root = std::env::temp_dir().join(format!(
             "tool-a34-{}-{}",
@@ -1985,7 +1998,14 @@ mod tests {
         .expect("chmod a");
 
         let good = dir_b.join("llama-gguf-hash");
-        std::fs::write(&good, "#!/bin/sh\necho 'sha256: dead'\n").expect("write b");
+        std::fs::write(
+            &good,
+            "#!/bin/sh\nroot=${2%/*}\n: > \"$root/probe-ready\"\n\
+             tries=0\nwhile [ ! -f \"$root/hash-done\" ]; do\n\
+             tries=$((tries + 1))\n[ \"$tries\" -lt 500 ] || exit 1\n\
+             /bin/sleep 0.01\ndone\necho 'sha256: dead'\n",
+        )
+        .expect("write b");
         std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).expect("chmod b");
 
         let input = root.join("model.gguf");
@@ -2000,26 +2020,55 @@ mod tests {
         std::fs::set_permissions(&prlimit, std::fs::Permissions::from_mode(0o755))
             .expect("chmod prlimit");
 
+        // R30: hash while the fallback probe is active, as a concurrent report
+        // test would. The fixture handshake guarantees overlap without relying
+        // on the test runner's scheduling to reproduce the PATH race.
+        let expected_hash = crate::common::sha256_file(&input).expect("baseline hash");
+        let observer_root = root.clone();
+        let observer_input = input.clone();
+        let observer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !observer_root.join("probe-ready").exists() {
+                if std::time::Instant::now() >= deadline {
+                    return Err("fallback probe never became ready".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let hash = crate::common::sha256_file(&observer_input);
+            std::fs::write(observer_root.join("hash-done"), b"done").expect("release probe");
+            hash
+        });
+
+        // Only this exact test runs in the child. Its restricted PATH and probe
+        // overrides must never affect the parent test runner's other threads.
         let previous_path = std::env::var_os("PATH");
-        std::env::set_var("PATH", &dir_b);
-        std::env::set_var(super::GGUF_PROBE_KIND, "legacy_hash");
-        std::env::set_var("TOOL_LLAMA_CLI_BIN", dir_a.join("llama-cli"));
-        let result = gguf_library_connect(&input);
-        std::env::remove_var("TOOL_LLAMA_CLI_BIN");
-        std::env::remove_var(super::GGUF_PROBE_KIND);
-        match previous_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
-
-        assert!(
-            matches!(result.outcome, LibraryConnectOutcome::SessionOk),
-            "the working candidate was never reached: {} / {}",
-            result.step,
-            result.outcome.as_str()
-        );
-
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"));
+        child
+            .arg("--exact")
+            .arg("target::tests::a_gguf_candidate_that_cannot_be_executed_falls_through_to_the_next")
+            .arg("--nocapture")
+            .env(CHILD_INPUT, &input)
+            .env("PATH", &dir_b)
+            .env(super::GGUF_PROBE_KIND, "legacy_hash")
+            .env("TOOL_LLAMA_CLI_BIN", dir_a.join("llama-cli"));
+        let result = crate::common::output_with_deadline(child, 10);
+        let concurrent_hash = observer.join().expect("hash observer");
         let _ = std::fs::remove_dir_all(&root);
+
+        let (output, timed_out) = result.expect("run isolated fallback test");
+        assert!(!timed_out, "isolated fallback test timed out");
+        assert!(
+            output.status.success(),
+            "isolated fallback test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::env::var_os("PATH"), previous_path);
+        assert_eq!(
+            concurrent_hash,
+            Ok(expected_hash),
+            "the fallback probe test disrupted hashing in another thread"
+        );
     }
 
     #[cfg(unix)]
