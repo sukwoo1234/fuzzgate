@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""V2.5 step-5 analysis: turn the coverage dataset into the preregistered RQ1/RQ2
-statistics (docs/plans/coverage-comparison-prereg.md §10-11).
+"""V2.5 coverage analysis: paired per-seed comparisons and within-strategy
+connect-rate correlations (RQ1/RQ2 statistics).
 
 PRIMARY (RQ1): per-seed paired marginal parse-reachable regions, S vs B1_1x.
   marginal(arm,s) = | (arm_union \\ seed) ∩ parse_reachable |   (asymmetric set diff)
@@ -47,7 +47,7 @@ def load_bits(path, n):
     return np.unpackbits(raw, count=n, bitorder="little").astype(bool)
 
 
-# Per-region-group classification (prereg §4/§17). RQ1 ("reaches deeper loader code") is
+# Per-region-group classification. RQ1 ("reaches deeper loader code") is
 # only interpretable per layer: parser-error BREADTH vs post-parse DEPTH.
 GROUP_ORDER = ["parser", "checker_shapeinf", "graph", "optimizer", "cpu_ep", "framework_session"]
 

@@ -1,5 +1,5 @@
 //! The strong byte baseline for the coverage-comparison experiment - the GGUF
-//! counterpart of onnx/havoc.rs (B1 in docs/plans/coverage-comparison-prereg.md §2).
+//! counterpart of src/mutate/onnx/havoc.rs (the B1 byte baseline).
 //! Unlike byte_flip (a single-bit flip), it applies a fixed mix of multi-byte edits
 //! {overwrite, insert, delete, block_copy} until a cumulative perturbed-byte budget is
 //! reached. It is deliberately format-blind: it exists to measure what byte-level

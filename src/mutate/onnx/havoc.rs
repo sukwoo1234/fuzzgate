@@ -2,9 +2,8 @@ use super::{DeterministicRng, MutationOutput, OperatorError};
 
 pub(crate) const NAME: &str = "havoc";
 
-// Multi-byte havoc operator = the STRONG byte baseline (B1) for the coverage-comparison
-// experiment (docs/plans/coverage-comparison-prereg.md §2). Unlike byte_flip (B0, a
-// single-bit flip), havoc applies a fixed mix of multi-byte edits
+// Multi-byte havoc operator = the STRONG byte baseline (B1) for coverage comparisons.
+// Unlike byte_flip (B0, a single-bit flip), havoc applies a fixed mix of multi-byte edits
 // {overwrite, insert, delete, block_copy} until a cumulative perturbed-byte budget is
 // reached.
 //

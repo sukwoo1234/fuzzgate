@@ -12,7 +12,7 @@
 // the loader, which is this PoC's focus. Malformed/unsupported models are
 // expected and counted, not fatal -- the load path is covered either way.
 //
-// V2.5 changes (coverage-comparison experiment, see docs/plans/coverage-comparison-prereg.md):
+// V2.5 coverage measurement contract:
 //  - SessionOptions pinned single-threaded (intra=inter=1) for determinism.
 //  - GraphOptimizationLevel selectable via ONNX_COV_OPT_LEVEL (default ENABLE_ALL)
 //    for the optimizer-level sensitivity sweep.
@@ -21,8 +21,8 @@
 //    per input so each process writes its own LLVM_PROFILE_FILE -> per-input profraw
 //    separation -> order-independent union + per-input set-difference.
 //  - parse_ok distinguishes "reached graph build" from "died at protobuf parse",
-//    enabling the parse-reachable stratification the prereg requires. The raw error
-//    message is emitted verbatim so the frozen analysis defines the exact rule.
+//    allowing analysis to separate parse failures from graph-build outcomes. The raw
+//    error message is emitted verbatim so analysis can refine the classification.
 #include <onnxruntime_cxx_api.h>
 
 #include <cstdio>

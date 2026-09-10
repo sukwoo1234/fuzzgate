@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Continuous ONNX fuzzing wrapper for 1-week systemd run on 퍼징컴.
-# Decision context: docs/plans/session-handoff.md ⑦(c).
+# Each iteration mutates seed inputs into a separate batch before running them.
 #
 # Loop: mutate (50 inputs) -> run (workers 12, timeout 30s) -> sleep 2s -> next.
 # Graceful stop: SIGTERM finishes current run, then exits.

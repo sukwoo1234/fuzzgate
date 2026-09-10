@@ -4,25 +4,20 @@
 Status: archived/deferred follow-up helper. Requires frozen coverage artifacts,
 coverage_experiment.py dependencies, and the Python coverage/scientific stack.
 
-Pre-registered as deferred work in docs/plans/coverage-freeze.json
-("intensity sweep (RQ2 confirmatory)"). The frozen confirmatory run answered RQ1 and
-gave only a CROSS-SEED first look at RQ2; prereg §10 RQ2 requires WITHIN-STRATEGY
-variation across >=4 intensity levels so connect_rate actually moves (the cross-seed
-cut is flagged in the prereg as a 2-cluster Simpson artifact).
+Measures how connect_rate changes with mutation intensity within the byte strategy.
+Budgets combine absolute byte counts (RQ2_LOW) with fractions of each seed's size
+(RQ2_FRACS), deduplicated and floored at 1 byte. This supports both small edits and
+size-dependent perturbations; a rounded multiplier ladder around a one-byte budget
+would collapse distinct intensity levels.
 
-DEVIATION (honest, construct-motivated — recorded in the sweep manifest):
-  prereg §2 specifies the byte sweep as {0.5,1,2}*b_S. The frozen run measured b_S=1
-  for ALL 60 seeds (structure-preserving edits change ~1 byte), so that multiplier
-  ladder is DEGENERATE ({1,1,2}) and would NOT vary connect_rate -> it cannot satisfy
-  the §10 requirement. This follow-up instead sweeps a per-seed FRACTIONAL byte-budget
-  ladder (fraction of seed size, floored at 1 byte) so connect_rate spans its range,
-  fulfilling §10's intent (>=4 levels, connect varies, within-strategy, cluster
-  bootstrap). Same frozen .so / universe / seeds / harness / generation+measure path.
+Reuse baselines only with the same shared library, coverage universe, seed inputs,
+harness, and generation/measurement settings. Record the budget ladder in the sweep
+manifest so runs with different intensity settings can be distinguished.
 
 Reuses the frozen per-seed baselines (experiment_run/<seed>/seed.bin) and the
 coverage_experiment helpers (identical generation + coverage measurement code).
 
-Config via env: RQ2_N (outputs/level, default 50), RQ2_FRACS (csv fractions),
+Config via env: RQ2_N (outputs/level, default 50), RQ2_LOW (csv byte counts), RQ2_FRACS (csv fractions),
 RQ2_WORKERS (parallel harness procs), RQ2_OUT, RQ2_FROZEN (frozen seed-baseline dir).
 Usage: coverage_rq2_sweep.py <seed.onnx> [<seed.onnx> ...]
 """

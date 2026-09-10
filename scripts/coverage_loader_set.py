@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve the loader-reachable source-file allow-list for the V2.5 coverage-
-comparison experiment (docs/plans/coverage-comparison-prereg.md §5).
+"""Resolve the loader-reachable source-file allow-list for V2.5 coverage comparisons.
 
 Reads an `llvm-cov export -summary-only` JSON (the per-file region totals of the
 instrumented libonnxruntime.so) and partitions files into:
@@ -16,7 +15,7 @@ instrumented libonnxruntime.so) and partitions files into:
 
 EXCLUDE (kernel compute / inference-only / non-CPU EP / MLAS microkernels / LoRA / tests)
 is applied first; the registration-glue files are an explicit include that overrides the
-`/providers/cpu/` exclusion (the intra-directory carve-out the prereg requires). The
+`/providers/cpu/` exclusion so session-construction coverage is retained. The
 function-level registration-vs-compute split (symbol-name regex) is layered in the
 analysis step; this script produces the file-level allow-list and the freeze-time
 assertion that the parser + EP-registration files are present with >0 total regions.
@@ -144,7 +143,7 @@ def main():
     if out_path:
         json.dump(out, open(out_path, "w"), indent=2)
 
-    # Freeze-time assertion (prereg §5): the parser + EP-registration files must be present
+    # Coverage-universe assertion: the parser + EP-registration files must be present
     # with >0 total regions, else the denominator silently drops the code under test.
     def present(substr):
         return [p for p in full_loader if substr in p]
