@@ -376,7 +376,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
     if [[ -n "$MAX_JOBS" ]]; then
       max_jobs_arg=" --max-jobs $MAX_JOBS"
     fi
-    echo "DATA_DIR=$CAMPAIGN_ROOT/arms/$backend/data TOOL_BIN=$TOOL_BIN scripts/run_long.sh --target $TARGET --backend $backend $duration_arg --tag ${CAMPAIGN_ID}_${TARGET}_${backend} --corpus-dir $CAMPAIGN_ROOT/arms/$backend/corpus/$TARGET --workers $WORKERS --timeout-sec $TIMEOUT_SEC --restart-limit $RESTART_LIMIT$max_jobs_arg"
+    echo "DATA_DIR=$CAMPAIGN_ROOT/arms/$backend/data TOOL_BIN=$TOOL_BIN scripts/run_long.sh --target $TARGET --backend $backend $duration_arg --tag ${CAMPAIGN_ID}_${TARGET}_${backend} --corpus-dir $CAMPAIGN_ROOT/arms/$backend/corpus/$TARGET --seed-fixture $SEED_SNAPSHOT --workers $WORKERS --timeout-sec $TIMEOUT_SEC --restart-limit $RESTART_LIMIT$max_jobs_arg"
   done
   exit 0
 fi
@@ -434,6 +434,7 @@ start_arm() {
       "${duration_args[@]}" \
       --tag "$tag" \
       --corpus-dir "$arm_corpus_dir" \
+      --seed-fixture "$SEED_SNAPSHOT" \
       --workers "$WORKERS" \
       --timeout-sec "$TIMEOUT_SEC" \
       --restart-limit "$RESTART_LIMIT" \
@@ -450,6 +451,7 @@ start_arm() {
       "${duration_args[@]}" \
       --tag "$tag" \
       --corpus-dir "$arm_corpus_dir" \
+      --seed-fixture "$SEED_SNAPSHOT" \
       --workers "$WORKERS" \
       --timeout-sec "$TIMEOUT_SEC" \
       --restart-limit "$RESTART_LIMIT" \

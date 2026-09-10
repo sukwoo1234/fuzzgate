@@ -3,7 +3,8 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: run_long.sh --target <onnx|gguf|safetensors> --backend <local-harness|libfuzzer|aflpp> (--hours <N>|--duration-seconds <N>) --tag <TAG> [--corpus-dir <dir>] [--data-dir <dir>] [--workers <n>] [--timeout-sec <n>] [--restart-limit <n>] [--max-jobs <n>]
+usage: run_long.sh --target <onnx|gguf|safetensors> --backend <local-harness|libfuzzer|aflpp> (--hours <N>|--duration-seconds <N>) --tag <TAG> [--corpus-dir <dir>] [--seed-fixture <dir>] [--data-dir <dir>] [--workers <n>] [--timeout-sec <n>] [--restart-limit <n>] [--max-jobs <n>]
+--seed-fixture records a caller-known source for an explicit corpus; it does not copy seeds.
 GGUF libFuzzer uses generated commands with memory limits; unset TOOL_LIBFUZZER_CMD before running.
 EOF
 }
@@ -26,6 +27,8 @@ HOURS=""
 DURATION_SECONDS=""
 TAG=""
 CORPUS_DIR=""
+SEED_FIXTURE=""
+SEED_DEFAULT_GGUF="0"
 WORKERS="1"
 TIMEOUT_SEC="30"
 RESTART_LIMIT="1"
@@ -39,6 +42,7 @@ while [[ $# -gt 0 ]]; do
     --duration-seconds) DURATION_SECONDS="${2:-}"; shift 2 ;;
     --tag) TAG="${2:-}"; shift 2 ;;
     --corpus-dir) CORPUS_DIR="${2:-}"; shift 2 ;;
+    --seed-fixture) SEED_FIXTURE="${2:-}"; shift 2 ;;
     --data-dir) DATA_DIR="${2:-}"; shift 2 ;;
     --workers) WORKERS="${2:-}"; shift 2 ;;
     --timeout-sec) TIMEOUT_SEC="${2:-}"; shift 2 ;;
@@ -65,12 +69,15 @@ if [[ -n "$HOURS" && -n "$DURATION_SECONDS" ]]; then
   exit 2
 fi
 
-SEED_FIXTURE=""
 if [[ -z "$CORPUS_DIR" ]]; then
   CORPUS_DIR="seeds/${TARGET}"
+  # Default selection owns its source label; caller metadata applies only to an
+  # explicit corpus. Keep the copy decision separate from provenance metadata.
+  SEED_FIXTURE="$CORPUS_DIR"
   # C3: a gguf libFuzzer run seeds from the under-cap derivative when one is built.
   # Only libFuzzer: AFL++ has no input-length cap and its arm keeps the originals.
   if [[ "$TARGET" == gguf && "$BACKEND" == libfuzzer ]]; then
+    SEED_DEFAULT_GGUF="1"
     if SEED_FIXTURE="$(gguf_libfuzzer_seed_fixture "$WORKDIR")"; then
       :
     else
@@ -222,7 +229,7 @@ esac
 # R26: fixtures are inputs, never the writable libFuzzer corpus. Only an omitted
 # --corpus-dir uses this shared working copy; campaign arm copies stay caller-owned.
 # Seed after the source and engine checks so refused runs do not alter the corpus.
-if [[ -n "$SEED_FIXTURE" ]]; then
+if [[ "$SEED_DEFAULT_GGUF" == "1" ]]; then
   CORPUS_DIR="$WORKDIR/data/corpus/libfuzzer/gguf"
   EVICTED="$(gguf_seed_working_corpus "$CORPUS_DIR" "$SEED_FIXTURE")"
   echo "[run-long] seed_fixture=$SEED_FIXTURE"
@@ -246,6 +253,7 @@ TOOL_BIN="$TOOL_BIN" \
 TARGET="$TARGET" \
 BACKEND="$BACKEND" \
 CORPUS_DIR="$CORPUS_DIR" \
+SEED_FIXTURE="$SEED_FIXTURE" \
 WORKERS="$WORKERS" \
 TIMEOUT_SEC="$TIMEOUT_SEC" \
 RESTART_LIMIT="$RESTART_LIMIT" \

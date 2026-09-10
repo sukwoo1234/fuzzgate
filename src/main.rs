@@ -97,6 +97,10 @@ struct RunArgs {
     #[arg(long)]
     corpus_dir: Option<PathBuf>,
 
+    /// Selected seed source (metadata only; omitted means unknown)
+    #[arg(long)]
+    seed_fixture: Option<PathBuf>,
+
     /// Parallel workers (default: 8)
     #[arg(long, default_value_t = 8)]
     workers: usize,
@@ -563,6 +567,7 @@ fn main() -> ExitCode {
                 &args.backend,
                 args.local,
                 args.corpus_dir.as_deref(),
+                args.seed_fixture.as_deref(),
                 args.workers,
                 args.timeout_sec,
                 args.restart_limit,

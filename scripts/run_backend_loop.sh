@@ -7,6 +7,8 @@ TOOL_BIN="${TOOL_BIN:-$WORKDIR/target/debug/tool}"
 TARGET="${TARGET:-onnx}"
 BACKEND="${BACKEND:-local-harness}"
 CORPUS_DIR="${CORPUS_DIR:-seeds/${TARGET}}"
+# Optional source metadata from the launcher; an unlabelled corpus stays unknown.
+SEED_FIXTURE="${SEED_FIXTURE:-}"
 WORKERS="${WORKERS:-2}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-30}"
 RESTART_LIMIT="${RESTART_LIMIT:-1}"
@@ -92,6 +94,9 @@ run_once() {
   )
   if [[ -n "$MAX_JOBS" ]]; then
     cmd+=(--max-jobs "$MAX_JOBS")
+  fi
+  if [[ -n "$SEED_FIXTURE" ]]; then
+    cmd+=(--seed-fixture "$SEED_FIXTURE")
   fi
 
   "${cmd[@]}"

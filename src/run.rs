@@ -128,6 +128,7 @@ pub(crate) fn run_fuzz_pipeline(
     backend: &RunBackend,
     local: bool,
     corpus_dir: Option<&Path>,
+    seed_fixture: Option<&Path>,
     workers: usize,
     timeout_sec: u64,
     restart_limit: u32,
@@ -146,6 +147,7 @@ pub(crate) fn run_fuzz_pipeline(
             backend,
             local,
             corpus_dir,
+            seed_fixture,
             workers,
             timeout_sec,
             restart_limit,
@@ -283,6 +285,8 @@ pub(crate) fn run_fuzz_pipeline(
         timeout_sec,
         restart_limit,
         &engine_mode,
+        &corpus_dir,
+        seed_fixture,
     )?;
 
     println!("[run] done");
@@ -404,6 +408,7 @@ fn run_engine_backend(
     backend: &RunBackend,
     local: bool,
     corpus_dir: Option<&Path>,
+    seed_fixture: Option<&Path>,
     workers: usize,
     timeout_sec: u64,
     restart_limit: u32,
@@ -512,6 +517,8 @@ fn run_engine_backend(
         timeout_sec,
         restart_limit,
         &engine_mode,
+        &corpus_dir,
+        seed_fixture,
     )?;
 
     println!("[run] done");
@@ -1250,10 +1257,20 @@ fn write_run_status(
     timeout_sec: u64,
     restart_limit: u32,
     engine_mode: &str,
+    corpus_dir: &Path,
+    seed_fixture: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let status_path = run_dir.join("status.json");
+    // Record the source selected by the caller, never infer it from a mutable
+    // corpus or a neighboring marker. This is a path label, not a content hash or
+    // a claim that every current corpus input came from that fixture. Preserve
+    // caller spelling; relative paths are relative to the run's working directory.
+    let seed_fixture_json = seed_fixture
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| format!("\"{}\"", json_escape(&path.display().to_string())))
+        .unwrap_or_else(|| "null".to_string());
     let status_json = format!(
-        "{{\n  \"run_id\": \"{}\",\n  \"target\": \"{}\",\n  \"backend\": \"{}\",\n  \"total\": {},\n  \"success\": {},\n  \"failed\": {},\n  \"timeout\": {},\n  \"rejected\": {},\n  \"retries\": {},\n  \"job_errors\": {},\n  \"worker_errors\": {},\n  \"workers\": {},\n  \"timeout_sec\": {},\n  \"restart_limit\": {},\n  \"engine_mode\": \"{}\",\n  \"backend_crash_artifacts\": {},\n  \"backend_crashes_triaged\": {},\n  \"backend_crash_triage_errors\": {},\n  \"backend_crash_scan_errors\": {}\n}}\n",
+        "{{\n  \"run_id\": \"{}\",\n  \"target\": \"{}\",\n  \"backend\": \"{}\",\n  \"total\": {},\n  \"success\": {},\n  \"failed\": {},\n  \"timeout\": {},\n  \"rejected\": {},\n  \"retries\": {},\n  \"job_errors\": {},\n  \"worker_errors\": {},\n  \"workers\": {},\n  \"timeout_sec\": {},\n  \"restart_limit\": {},\n  \"engine_mode\": \"{}\",\n  \"backend_crash_artifacts\": {},\n  \"backend_crashes_triaged\": {},\n  \"backend_crash_triage_errors\": {},\n  \"backend_crash_scan_errors\": {},\n  \"corpus_dir\": \"{}\",\n  \"seed_fixture\": {}\n}}\n",
         run_id,
         target_label(target),
         run_backend_label(backend),
@@ -1272,7 +1289,9 @@ fn write_run_status(
         counts.backend_crash_artifacts,
         counts.backend_crashes_triaged,
         counts.backend_crash_triage_errors,
-        counts.backend_crash_scan_errors
+        counts.backend_crash_scan_errors,
+        json_escape(&corpus_dir.display().to_string()),
+        seed_fixture_json
     );
     fs::write(&status_path, status_json)
         .map_err(|e| format!("failed to write '{}': {e}", status_path.display()))?;
@@ -1419,6 +1438,8 @@ mod tests {
             30,
             1,
             "blackbox_n",
+            std::path::Path::new("seeds/onnx"),
+            None,
         )
         .expect("write status");
 
@@ -1444,6 +1465,7 @@ mod tests {
             &TargetKind::Onnx,
             &RunBackend::LocalHarness,
             true,
+            None,
             None,
             1,
             0,
@@ -1605,6 +1627,8 @@ mod tests {
             30,
             1,
             "local_harness",
+            std::path::Path::new("seeds/onnx"),
+            None,
         )
         .expect("write status");
 
@@ -1669,6 +1693,8 @@ mod tests {
             30,
             1,
             "blackbox",
+            std::path::Path::new("seeds/onnx"),
+            None,
         )
         .expect("write status");
 
@@ -1753,6 +1779,8 @@ mod tests {
             30,
             1,
             "blackbox_n",
+            std::path::Path::new("seeds/onnx"),
+            None,
         )
         .expect("write status");
 

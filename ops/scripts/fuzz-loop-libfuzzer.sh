@@ -174,6 +174,7 @@ while :; do
         --workers "${WORKERS}" \
         --timeout-sec "${TIMEOUT_SEC}" \
         --restart-limit "${RESTART_LIMIT}" \
+        --seed-fixture "${SEED_FIXTURE}" \
         --corpus-dir "${CORPUS_DIR}"
     then
         log "iter=${iter} run failed, continuing to next iteration"
