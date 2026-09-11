@@ -220,6 +220,14 @@ tool campaign --mode parallel --target onnx --hours 168 --campaign-id hunt-onnx-
 있으므로, 입력 1개당 상한을 엔진에 직접 넘기고 싶다면 템플릿에 명시적으로 넣으면 된다
 (예: libFuzzer `-timeout={timeout_sec}`). 넣지 않으면 엔진 기본값이 쓰인다.
 
+host에서 `TOOL_AFLPP_CMD`로 AFL++를 직접 실행할 때, `ASAN_OPTIONS`가 미설정이거나
+빈 값(공백만 포함)이면 `abort_on_error=1:symbolize=0:disable_coredump=1`을 기본 적용한다.
+명시한 옵션은 기존 공통 wrapper 규칙대로 보존하며, `disable_coredump`가 없을 때만
+`disable_coredump=1`을 덧붙인다. 명시값에는 AFL++가 요구하는 `abort_on_error=1`과
+`symbolize=0`을 포함해야 한다. 호환되지 않으면 엔진 시작 실패가 로그·status·종료 코드에 남는다.
+명령 템플릿 안의 환경 지정은 이 기본값보다 우선한다. `run_long.sh`의 기본 Docker 명령은
+host의 ASAN 환경을 컨테이너에 전달하지 않으며, libFuzzer·local-harness의 기본값은 별개다.
+
 짧은 스모크는 시간/입력 수를 제한한다.
 
 ```bash

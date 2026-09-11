@@ -78,6 +78,7 @@ struct RunStatusCounts {
 
 struct EngineWorkerPlan {
     worker_id: usize,
+    backend: RunBackend,
     engine_cmd: String,
     worker_log_path: PathBuf,
 }
@@ -464,6 +465,7 @@ fn run_engine_backend(
         println!("backend_engine_cmd[w{worker_id}]: {engine_cmd}");
         worker_plans.push(EngineWorkerPlan {
             worker_id,
+            backend: backend.clone(),
             engine_cmd,
             worker_log_path,
         });
@@ -622,6 +624,19 @@ fn summarize_engine_workers(
 
 fn run_engine_worker(plan: EngineWorkerPlan) -> Result<EngineWorkerResult, String> {
     let mut cmd = command_with_core_dump_off("bash");
+    // The common wrapper supplies disable_coredump alone, which AFL++ rejects
+    // as an incomplete custom ASAN_OPTIONS. Supply compatible defaults only for
+    // AFL++ and only when the caller has no options; preserve explicit settings
+    // (including incompatible ones, which AFL++ must report as startup errors).
+    if plan.backend == RunBackend::Aflpp
+        && std::env::var_os("ASAN_OPTIONS")
+            .is_none_or(|value| value.to_str().is_some_and(|text| text.trim().is_empty()))
+    {
+        cmd.env(
+            "ASAN_OPTIONS",
+            "abort_on_error=1:symbolize=0:disable_coredump=1",
+        );
+    }
     cmd.arg("-lc").arg(&plan.engine_cmd);
     let output = cmd.output().map_err(|e| {
         format!(
