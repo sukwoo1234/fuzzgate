@@ -59,7 +59,7 @@ fi
 RAW="$OUT_DIR/raw"
 # Per-input profraw are named by array index, so re-running a SMALLER corpus into a
 # reused OUT_DIR would leave the previous run's higher-indexed files behind and merge
-# them into this number. run_coverage_onnx.sh:36 guards the same way. Under
+# them into this number. run_coverage_onnx.sh guards the same way. Under
 # src/coverage.rs OUT_DIR is always fresh; this protects the direct-invocation path,
 # which is how the number gets re-measured by hand.
 rm -rf "$RAW" "$OUT_DIR/cov.profdata" "$OUT_DIR/llvmcov.json" "$OUT_DIR/coverage.json"
