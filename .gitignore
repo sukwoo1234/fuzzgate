@@ -54,3 +54,10 @@ demo-stage/
 # coverage profiles (never commit; vendor/ is committed)
 *.profraw
 *.profdata
+
+# R55: staging files a build leaves behind when it is killed (SIGKILL/OOM) before its EXIT
+# trap can run. harnesses/aflpp/ is ignored as a whole directory above; the libFuzzer
+# binaries are listed one by one, so their staging names need their own rule.
+# Appended at the end on purpose: inserting mid-file shifts every line number below it,
+# and BASE-01 cases cite this file by line (that is how two citations went stale once).
+/harnesses/libfuzzer/*.new.*

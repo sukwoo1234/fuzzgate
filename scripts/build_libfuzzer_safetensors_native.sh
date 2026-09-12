@@ -11,6 +11,7 @@
 #   5. self-test the replay's exit-code contract
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 ST_VER="${ST_VER:-v0.7.0}"
 ST_CRATE_VER="${ST_CRATE_VER:-0.7.0}"
@@ -60,15 +61,25 @@ log "crate pin ok: safetensors $ST_CRATE_VER in fuzz/Cargo.lock"
 command -v cargo-fuzz >/dev/null || fail "cargo-fuzz missing (run S0 provisioning)"
 rustup toolchain list 2>/dev/null | grep -q nightly || fail "nightly toolchain missing (run S0)"
 
-mkdir -p "$(dirname "$OUT_FUZZER")"
+# R55: cp opens its destination O_WRONLY|O_TRUNC, so an interrupted copy leaves a
+# truncated file where the binary was - these two are the largest in the tree (19MB/6MB),
+# the widest window of any build here.
+# shellcheck source=lib/staged_install.sh
+. "$SCRIPT_DIR/lib/staged_install.sh"
+staged_target OUT_FUZZER || exit 1
+staged_target OUT_REPLAY || exit 1
+# Armed before the first staged_new: if the SECOND one fails, the first staging file is
+# already on disk and nothing else would remove it.
+trap staged_cleanup EXIT
+staged_new "$OUT_FUZZER" STAGED_FUZZER || exit 1
+staged_new "$OUT_REPLAY" STAGED_REPLAY || exit 1
 
 # 3. in-process libFuzzer target (ASan on by default under cargo-fuzz)
 log "building libFuzzer target (cargo-fuzz, offline)"
 ( cd "$PROJECT_ROOT" && CARGO_NET_OFFLINE=true cargo +nightly fuzz build safetensors_deserialize )
 FUZZER_BIN="$(find "$FUZZ_DIR/target" -type f -path '*/release/safetensors_deserialize' ! -path '*/build/*' | head -1)"
 [[ -n "$FUZZER_BIN" ]] || fail "could not locate built safetensors_deserialize binary"
-cp "$FUZZER_BIN" "$OUT_FUZZER"
-log "fuzzer -> $OUT_FUZZER"
+cp "$FUZZER_BIN" "$STAGED_FUZZER"
 
 # 4. standalone replay: -C panic=abort so a Rust panic becomes SIGABRT (a finding),
 #    while a clean SafeTensorError still exits 9 (rejected).
@@ -77,12 +88,19 @@ log "building standalone replay (panic=abort, offline)"
     cargo +nightly build --release --bin safetensors_loader_replay --manifest-path "$FUZZ_DIR/Cargo.toml" )
 REPLAY_BIN="$(find "$FUZZ_DIR/target" -type f -path '*/release/safetensors_loader_replay' ! -path '*/build/*' | head -1)"
 [[ -n "$REPLAY_BIN" ]] || fail "could not locate built safetensors_loader_replay binary"
-cp "$REPLAY_BIN" "$OUT_REPLAY"
-log "replay -> $OUT_REPLAY"
+cp "$REPLAY_BIN" "$STAGED_REPLAY"
 
 # 5. self-test the exit-code contract of the replay we just produced
-"$OUT_REPLAY" --selftest | grep -q "exit_codes: ok=0 rejected=9 unavailable=10" \
-  || fail "replay --selftest did not print the expected exit-code contract"
+# Self-test the staged binary BEFORE it replaces the operational one: a replay that
+# fails its own exit-code contract must not be installed.
+"$STAGED_REPLAY" --selftest | grep -q "exit_codes: ok=0 rejected=9 unavailable=10" \
+  || fail "replay --selftest did not print the expected exit-code contract ($OUT_REPLAY left unchanged)"
+
+staged_commit "$STAGED_FUZZER" "$OUT_FUZZER" || exit 1
+staged_commit "$STAGED_REPLAY" "$OUT_REPLAY" || exit 1
+trap - EXIT
+log "fuzzer -> $OUT_FUZZER"
+log "replay -> $OUT_REPLAY"
 log "replay selftest ok"
 
 log "done"

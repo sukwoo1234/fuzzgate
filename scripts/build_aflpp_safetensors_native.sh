@@ -13,6 +13,7 @@
 # After that this build is offline and uses the vendored fuzz crate dependencies.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 ST_VER="${ST_VER:-v0.7.0}"
 ST_CRATE_VER="${ST_CRATE_VER:-0.7.0}"
@@ -101,9 +102,14 @@ log "crate pin ok: safetensors $ST_CRATE_VER in fuzz/Cargo.lock"
 # run whether or not the replay already exists, so any build failure - offline
 # resolution, toolchain, RAM - destroyed a replay that is the only copy on the fuzzing
 # computer. The staging file is a sibling, so the mv is a same-filesystem rename.
-mkdir -p "$(dirname "$OUT")"
-STAGED="$(mktemp "$OUT.new.XXXXXX")"
-trap 'rm -f "$STAGED"' EXIT
+# R49/R55: the staging discipline R46 introduced here now lives in one place, so this
+# build also gets the properties it was missing - 0755 instead of 0711, no 0-byte
+# install, symlink and directory handling. See scripts/lib/staged_install.sh.
+# shellcheck source=lib/staged_install.sh
+. "$SCRIPT_DIR/lib/staged_install.sh"
+staged_target OUT || exit 1
+trap staged_cleanup EXIT
+staged_new "$OUT" STAGED || exit 1
 
 BUILD_RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C panic=abort"
 log "building AFL++ Rust replay with ${CARGO_AFL_CMD[*]} (offline)"
@@ -118,7 +124,6 @@ REPLAY_BIN="$(find "$AFLPP_TARGET_DIR" -type f \
   -print -quit)"
 [[ -n "$REPLAY_BIN" ]] || fail "could not locate cargo-afl replay under $AFLPP_TARGET_DIR"
 cp "$REPLAY_BIN" "$STAGED"
-chmod +x "$STAGED"
 
 # shellcheck source=lib/engine_mode.sh
 . "$PROJECT_ROOT/scripts/lib/engine_mode.sh"
@@ -146,7 +151,7 @@ case "$SCOPE" in
     ;;
 esac
 
-mv -f "$STAGED" "$OUT"
+staged_commit "$STAGED" "$OUT" || exit 1
 trap - EXIT
 
 log "done"

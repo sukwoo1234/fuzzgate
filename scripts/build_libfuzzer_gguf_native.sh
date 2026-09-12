@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 LLAMA_VER="${LLAMA_VER:-b7921}"
 TARGET_DIR="${TARGET_DIR:-$PROJECT_ROOT/data/targets/llama.cpp/$LLAMA_VER}"
@@ -204,7 +205,17 @@ log "symbol check ok: parser present, ASan and coverage instrumentation present"
 # 6. link both binaries from the one source
 # ---------------------------------------------------------------------------
 INC="$SRC_DIR/ggml/include"
-mkdir -p "$(dirname "$OUT_FUZZER")"
+# R55: both outputs go through the shared staging helper - a link failure used to
+# unlink the operational binary, which .gitignore keeps untracked.
+# shellcheck source=lib/staged_install.sh
+. "$SCRIPT_DIR/lib/staged_install.sh"
+staged_target OUT_FUZZER || exit 1
+staged_target OUT_REPLAY || exit 1
+# Armed before the first staged_new: if the SECOND one fails, the first staging file is
+# already on disk and nothing else would remove it.
+trap staged_cleanup EXIT
+staged_new "$OUT_FUZZER" STAGED_FUZZER || exit 1
+staged_new "$OUT_REPLAY" STAGED_REPLAY || exit 1
 
 common_flags=(
   -std=c++17 -O1 -g
@@ -215,13 +226,22 @@ common_flags=(
 
 log "linking libFuzzer target"
 "$CLANGXX" "${common_flags[@]}" -fsanitize=address,fuzzer \
-  "$SRC_CC" "$LIB_A" -lpthread -lm -o "$OUT_FUZZER"
+  "$SRC_CC" "$LIB_A" -lpthread -lm -o "$STAGED_FUZZER"
 
 # The replay binary keeps ASan too: the oracle has to see memory errors, and an
 # ASan-instrumented archive cannot be linked without the runtime anyway.
 log "linking standalone replay"
 "$CLANGXX" "${common_flags[@]}" -fsanitize=address -DGGUF_FUZZ_STANDALONE \
-  "$SRC_CC" "$LIB_A" -lpthread -lm -o "$OUT_REPLAY"
+  "$SRC_CC" "$LIB_A" -lpthread -lm -o "$STAGED_REPLAY"
+
+# Both linked before either is installed, so a link failure never replaces just one of
+# the pair. Not fully atomic: if the FIRST staged_commit succeeds and the second fails
+# (empty staging file, chmod or rename error) the fuzzer is new and the replay is old.
+# Two renames cannot be made one operation in shell; the window is a failing commit, not
+# a failing build.
+staged_commit "$STAGED_FUZZER" "$OUT_FUZZER" || exit 1
+staged_commit "$STAGED_REPLAY" "$OUT_REPLAY" || exit 1
+trap - EXIT
 
 log "done"
 echo "src: $SRC_CC"

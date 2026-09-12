@@ -35,6 +35,7 @@ BUILD_ROOT="${BUILD_ROOT:-$TARGET_DIR/cov-build}"
 SRC_DIR="$BUILD_ROOT/src"
 BUILD_DIR="$BUILD_ROOT/build"
 SRC_CC="${SRC_CC:-$PROJECT_ROOT/harnesses/libfuzzer/gguf_loader_fuzzer.cc}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 OUT_BIN="${OUT_BIN:-$BUILD_ROOT/gguf_loader_replay_cov}"
 JOBS="${JOBS:-4}"
 CLANG_BUNDLE_DIR="$PROJECT_ROOT/data/toolchains/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04/bin"
@@ -187,6 +188,15 @@ log "symbol check ok: parser present, profile counters present, coverage mapping
 # GGUF_FUZZ_CLAMP_PATCH=0 so --selftest reports the truth about this tree.
 # The coverage flags MUST be on the link line too, or the profile runtime is
 # never pulled in and the binary emits no .profraw.
+# R55: same staging discipline as the native builds. These outputs are rebuildable, but
+# a link or copy that fails part-way still leaves a truncated binary where a working
+# one was, and the coverage runners would then measure it.
+# shellcheck source=lib/staged_install.sh
+. "$SCRIPT_DIR/lib/staged_install.sh"
+staged_target OUT_BIN || exit 1
+trap staged_cleanup EXIT
+staged_new "$OUT_BIN" STAGED_BIN || exit 1
+
 log "linking coverage replay"
 "$CLANGXX" -std=c++17 -O1 -g $COV_FLAGS \
   -I"$SRC_DIR/ggml/include" \
@@ -194,16 +204,22 @@ log "linking coverage replay"
   -DGGUF_FUZZ_CLAMP_PATCH=0 \
   -DGGUF_FUZZ_STANDALONE \
   -DGGUF_FUZZ_COVERAGE=1 \
-  "$SRC_CC" "$LIB_A" -lpthread -lm -o "$OUT_BIN"
+  "$SRC_CC" "$LIB_A" -lpthread -lm -o "$STAGED_BIN"
 
 # Writing the selftest profile into the build root keeps default.profraw out of
 # the working tree.
-selftest_out="$(LLVM_PROFILE_FILE="$BUILD_ROOT/selftest-%p.profraw" "$OUT_BIN" --selftest)" \
+selftest_out="$(LLVM_PROFILE_FILE="$BUILD_ROOT/selftest-%p.profraw" "$STAGED_BIN" --selftest)" \
   || fail "coverage replay selftest failed"
 grep -q 'clamp_patch=absent' <<<"$selftest_out" \
   || fail "selftest says the clamp patch is applied; the tree is not pristine:\n$selftest_out"
 grep -q 'asan=off' <<<"$selftest_out" \
   || fail "selftest reports ASan on; the coverage build must not be ASan-instrumented:\n$selftest_out"
+
+# Install only after the selftest has vouched for the binary: a replay that reports the
+# clamp patch applied or ASan on is the wrong build, and the coverage runner would measure
+# it. Committing first would leave exactly that binary in place when the check fails.
+staged_commit "$STAGED_BIN" "$OUT_BIN" || exit 1
+trap - EXIT
 log "selftest ok (pristine, ASan off)"
 
 log "done"

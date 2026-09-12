@@ -11,6 +11,7 @@ FUZZ_DIR="${FUZZ_DIR:-$PROJECT_ROOT/fuzz}"
 # Distinct output dir so the instrumented binary never collides with the panic=abort
 # fuzzing replay under fuzz/target/release.
 COV_TARGET_DIR="${COV_TARGET_DIR:-$FUZZ_DIR/target-cov}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 OUT_BIN="${OUT_BIN:-$COV_TARGET_DIR/safetensors_loader_replay_cov}"
 
 log() { echo "[st-cov-build] $*"; }
@@ -32,8 +33,19 @@ RUSTFLAGS="-Cinstrument-coverage" CARGO_NET_OFFLINE=true \
     --manifest-path "$FUZZ_DIR/Cargo.toml" \
     --target-dir "$COV_TARGET_DIR"
 
+# R55: same staging discipline as the native builds. These outputs are rebuildable, but
+# a link or copy that fails part-way still leaves a truncated binary where a working
+# one was, and the coverage runners would then measure it.
+# shellcheck source=lib/staged_install.sh
+. "$SCRIPT_DIR/lib/staged_install.sh"
+staged_target OUT_BIN || exit 1
+trap staged_cleanup EXIT
+staged_new "$OUT_BIN" STAGED_BIN || exit 1
+
 BUILT="$(find "$COV_TARGET_DIR" -type f -path '*/release/safetensors_loader_replay' ! -path '*/build/*' | head -1)"
 [[ -n "$BUILT" ]] || fail "could not locate instrumented replay binary"
-cp "$BUILT" "$OUT_BIN"
+cp "$BUILT" "$STAGED_BIN"
+staged_commit "$STAGED_BIN" "$OUT_BIN" || exit 1
+trap - EXIT
 log "instrumented replay -> $OUT_BIN"
 echo "$OUT_BIN"
