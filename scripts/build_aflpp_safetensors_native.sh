@@ -95,8 +95,15 @@ awk -v want="$ST_CRATE_VER" '
   || fail "fuzz/Cargo.lock does not pin safetensors $ST_CRATE_VER"
 log "crate pin ok: safetensors $ST_CRATE_VER in fuzz/Cargo.lock"
 
+# R46: stage the new replay beside $OUT and only move it into place once the build and
+# the instrumentation-scope check have both passed. This script used to `rm -f "$OUT"`
+# here, before cargo ran. check_safetensors_native_engines.sh calls it on every cargo-afl
+# run whether or not the replay already exists, so any build failure - offline
+# resolution, toolchain, RAM - destroyed a replay that is the only copy on the fuzzing
+# computer. The staging file is a sibling, so the mv is a same-filesystem rename.
 mkdir -p "$(dirname "$OUT")"
-rm -f "$OUT"
+STAGED="$(mktemp "$OUT.new.XXXXXX")"
+trap 'rm -f "$STAGED"' EXIT
 
 BUILD_RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C panic=abort"
 log "building AFL++ Rust replay with ${CARGO_AFL_CMD[*]} (offline)"
@@ -110,12 +117,12 @@ REPLAY_BIN="$(find "$AFLPP_TARGET_DIR" -type f \
   -path '*/release/safetensors_loader_replay' ! -path '*/build/*' \
   -print -quit)"
 [[ -n "$REPLAY_BIN" ]] || fail "could not locate cargo-afl replay under $AFLPP_TARGET_DIR"
-cp "$REPLAY_BIN" "$OUT"
-chmod +x "$OUT"
+cp "$REPLAY_BIN" "$STAGED"
+chmod +x "$STAGED"
 
 # shellcheck source=lib/engine_mode.sh
 . "$PROJECT_ROOT/scripts/lib/engine_mode.sh"
-SCOPE="$(instrumentation_scope "$OUT")"
+SCOPE="$(instrumentation_scope "$STAGED")"
 case "$SCOPE" in
   library)
     log "instrumentation_scope=library (safetensors parser is statically linked and classified)"
@@ -124,20 +131,23 @@ case "$SCOPE" in
     if [[ "${ALLOW_DRIVER_ONLY:-0}" == "1" ]]; then
       log "WARN: instrumentation_scope=driver_only (ALLOW_DRIVER_ONLY=1)"
     else
-      fail "$OUT is instrumented but safetensors parser symbols were not found; refusing a driver-only arm"
+      fail "the freshly built replay is instrumented but safetensors parser symbols were not found; refusing a driver-only arm ($OUT left unchanged)"
     fi
     ;;
   none)
     if [[ "${ALLOW_UNINSTRUMENTED:-0}" == "1" ]]; then
       log "WARN: $OUT has no AFL++ instrumentation (ALLOW_UNINSTRUMENTED=1)"
     else
-      fail "$OUT has no AFL++ instrumentation; cargo-afl runtime was not linked"
+      fail "the freshly built replay has no AFL++ instrumentation; cargo-afl runtime was not linked ($OUT left unchanged)"
     fi
     ;;
   *)
     fail "unexpected instrumentation scope: $SCOPE"
     ;;
 esac
+
+mv -f "$STAGED" "$OUT"
+trap - EXIT
 
 log "done"
 echo "out: $OUT"
