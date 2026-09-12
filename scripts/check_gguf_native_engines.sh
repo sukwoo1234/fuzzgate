@@ -142,6 +142,12 @@ if command -v afl-clang-fast++ >/dev/null 2>&1 && command -v afl-showmap >/dev/n
   tuples="$(wc -l < "$AFL_MAP" | tr -d ' ')"
   [[ "$tuples" -gt 0 ]] \
     || fail "afl-showmap produced zero tuples (rc=$showmap_rc); see $OUT_DIR/afl-showmap.log"
+  # A nonempty map is not proof the run was healthy: afl-showmap can write the map and
+  # still fail (target fault, timeout, forkserver mismatch). Capturing showmap_rc into a
+  # log line was never a gate, so the whole arm passed on a broken run. Checked last so
+  # the more specific "no map" / "zero tuples" diagnostics still win when they apply.
+  [[ "$showmap_rc" -eq 0 ]] \
+    || fail "afl-showmap exited $showmap_rc with a $tuples-tuple map; see $OUT_DIR/afl-showmap.log"
   log "OK   afl-showmap tuples=$tuples (rc=$showmap_rc)"
 else
   msg="AFL++ tools missing: afl-clang-fast++ and/or afl-showmap"

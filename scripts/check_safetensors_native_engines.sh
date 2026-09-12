@@ -154,6 +154,12 @@ if [[ -n "$AFLPP_SHOWMAP_MODE" ]]; then
   tuples="$(wc -l < "$AFL_MAP" | tr -d ' ')"
   [[ "$tuples" -gt 0 ]] \
     || fail "afl-showmap produced zero tuples (rc=$showmap_rc); see $AFLPP_CHECK_DIR/safetensors-aflpp-showmap.log"
+  # A nonempty map is not proof the run was healthy: afl-showmap can write the map and
+  # still fail (target fault, timeout, forkserver mismatch). Capturing showmap_rc into a
+  # log line was never a gate, so the whole arm passed on a broken run. Checked last so
+  # the more specific "no map" / "zero tuples" diagnostics still win when they apply.
+  [[ "$showmap_rc" -eq 0 ]] \
+    || fail "afl-showmap exited $showmap_rc with a $tuples-tuple map (mode=$AFLPP_SHOWMAP_MODE); see $AFLPP_CHECK_DIR/safetensors-aflpp-showmap.log"
   log "afl-showmap tuples=$tuples (rc=$showmap_rc, mode=$AFLPP_SHOWMAP_MODE)"
 elif [[ "$REQUIRE_AFLPP" -eq 1 ]]; then
   fail "AFL++ tooling missing: install cargo-afl or provide afl-showmap"
