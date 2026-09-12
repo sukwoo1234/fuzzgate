@@ -194,28 +194,36 @@ if [[ "$afl_refs" -eq 0 || "$asan_refs" -eq 0 ]]; then
   fi
 fi
 
-mkdir -p "$(dirname "$OUT")"
+# R49/R55: never link straight onto the operational replay. scripts/lib/staged_install.sh
+# carries the reasoning and the contract; it is shared so the six native builds cannot
+# drift apart again.
+# shellcheck source=lib/staged_install.sh
+. "$SCRIPT_DIR/lib/staged_install.sh"
+staged_target OUT || exit 1
+trap staged_cleanup EXIT
+staged_new "$OUT" STAGED || exit 1
+
 log "linking standalone replay"
 AFL_USE_ASAN=1 "$AFL_CXX" -std=c++17 -O1 -g \
   -DGGUF_FUZZ_STANDALONE \
   -DGGUF_FUZZ_TARGET_ID="\"llama.cpp/$LLAMA_VER\"" \
   -DGGUF_FUZZ_CLAMP_PATCH=1 \
   -I"$SRC_DIR/ggml/include" \
-  "$SRC_CC" "$LIB_A" -lpthread -lm -o "$OUT"
+  "$SRC_CC" "$LIB_A" -lpthread -lm -o "$STAGED"
 
 # shellcheck source=lib/engine_mode.sh
 . "$SCRIPT_DIR/lib/engine_mode.sh"
 
-SCOPE="$(instrumentation_scope "$OUT")"
+SCOPE="$(instrumentation_scope "$STAGED")"
 case "$SCOPE" in
   library)
     log "instrumentation_scope: library (the parser itself is instrumented)"
     ;;
   driver_only)
     if [[ "${ALLOW_DRIVER_ONLY:-0}" == "1" ]]; then
-      log "WARN: $OUT is instrumented but its parser is not linked in (ALLOW_DRIVER_ONLY=1)"
+      log "WARN: the new replay is instrumented but its parser is not linked in (ALLOW_DRIVER_ONLY=1)"
     else
-      echo "[build-aflpp-gguf] $OUT is instrumented, but the parser is not inside it" >&2
+      echo "[build-aflpp-gguf] the new replay is instrumented, but the parser is not inside it; $OUT left unchanged" >&2
       echo "[build-aflpp-gguf] this is the ONNX G2 situation: afl-fuzz would see driver edges only" >&2
       echo "[build-aflpp-gguf] (set ALLOW_DRIVER_ONLY=1 for a deliberate baseline build)" >&2
       exit 1
@@ -223,15 +231,18 @@ case "$SCOPE" in
     ;;
   *)
     if [[ "${ALLOW_UNINSTRUMENTED:-0}" == "1" ]]; then
-      log "WARN: $OUT has no AFL++ instrumentation (ALLOW_UNINSTRUMENTED=1)"
+      log "WARN: the new replay has no AFL++ instrumentation (ALLOW_UNINSTRUMENTED=1)"
     else
-      echo "[build-aflpp-gguf] $OUT has no AFL++ instrumentation" >&2
+      echo "[build-aflpp-gguf] the new replay has no AFL++ instrumentation; $OUT left unchanged" >&2
       echo "[build-aflpp-gguf] AFL_CXX=$AFL_CXX did not instrument; build inside aflplusplus/aflplusplus" >&2
       echo "[build-aflpp-gguf] (set ALLOW_UNINSTRUMENTED=1 for a deliberate baseline build)" >&2
       exit 1
     fi
     ;;
 esac
+
+staged_commit "$STAGED" "$OUT" || exit 1
+trap - EXIT
 
 log "done"
 echo "src: $SRC_CC"

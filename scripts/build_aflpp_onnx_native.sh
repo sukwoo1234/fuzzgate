@@ -59,7 +59,13 @@ fi
 [[ -f "$SO" ]] || { echo "[build-aflpp-onnx-native] shared library not found: $SO" >&2; exit 1; }
 [[ -f "$INCLUDE_DIR/onnxruntime_cxx_api.h" ]] || { echo "[build-aflpp-onnx-native] header not found: $INCLUDE_DIR/onnxruntime_cxx_api.h" >&2; exit 1; }
 
-mkdir -p "$(dirname "$OUT")"
+# R49/R55: never compile straight onto the operational replay. See
+# scripts/lib/staged_install.sh for the reasoning and the contract.
+# shellcheck source=lib/staged_install.sh
+. "$SCRIPT_DIR/lib/staged_install.sh"
+staged_target OUT || exit 1
+trap staged_cleanup EXIT
+staged_new "$OUT" STAGED || exit 1
 
 echo "[build-aflpp-onnx-native] compiling"
 "$AFL_CXX" -std=c++17 -O1 -g \
@@ -69,22 +75,25 @@ echo "[build-aflpp-onnx-native] compiling"
   -I"$INCLUDE_DIR" \
   "$SRC" \
   -L"$SO_DIR" -lonnxruntime -Wl,-rpath,"$SO_DIR" \
-  -o "$OUT"
+  -o "$STAGED"
 
 # shellcheck source=lib/engine_mode.sh
 . "$SCRIPT_DIR/lib/engine_mode.sh"
 
-if has_afl_instrumentation "$OUT"; then
+if has_afl_instrumentation "$STAGED"; then
   INSTRUMENTATION=instrumented
 elif [[ "${ALLOW_UNINSTRUMENTED:-0}" == "1" ]]; then
   INSTRUMENTATION=uninstrumented
-  echo "[build-aflpp-onnx-native] WARN: $OUT has no AFL++/sancov instrumentation (ALLOW_UNINSTRUMENTED=1)" >&2
+  echo "[build-aflpp-onnx-native] WARN: the new replay has no AFL++/sancov instrumentation (ALLOW_UNINSTRUMENTED=1)" >&2
 else
-  echo "[build-aflpp-onnx-native] $OUT has no AFL++/sancov instrumentation" >&2
+  echo "[build-aflpp-onnx-native] the new replay has no AFL++/sancov instrumentation; $OUT left unchanged" >&2
   echo "[build-aflpp-onnx-native] AFL_CXX=$AFL_CXX did not instrument; build inside aflplusplus/aflplusplus" >&2
   echo "[build-aflpp-onnx-native] (set ALLOW_UNINSTRUMENTED=1 for a deliberate baseline build)" >&2
   exit 1
 fi
+
+staged_commit "$STAGED" "$OUT" || exit 1
+trap - EXIT
 
 echo "[build-aflpp-onnx-native] done"
 echo "src: $SRC"
