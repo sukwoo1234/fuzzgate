@@ -77,6 +77,22 @@ fi
 actual_sha="$(sha256sum "$CRASH_POC" | awk '{print $1}')"
 [[ "$actual_sha" == "$SIGSEGV_SHA256" ]] || fail "PoC sha256 mismatch: got $actual_sha expected $SIGSEGV_SHA256"
 
+# The PoC is deliberately not committed (see usage above), so the path handed in here is
+# usually the operator's only local copy - and the path most likely to be handed in is the
+# one a previous run left inside the default DATA_DIR, which `rm -rf "$DATA_DIR"` below
+# removes. The A11 guard next to that rm inspects DATA_DIR's *name* only, so it cannot see
+# this case: the name is exactly the dedicated one it demands. Compare resolved paths and
+# not text, because a symlink or a `..` walks straight through a string test. Refusing here,
+# before the tool and the harness are built, makes the refusal immediate instead of costing
+# a native build first.
+poc_real="$(realpath -- "$CRASH_POC")"
+data_real="$(realpath -m -- "$DATA_DIR")"
+case "$poc_real" in
+  "$data_real" | "$data_real"/*)
+    fail "PoC '$CRASH_POC' is inside DATA_DIR '$DATA_DIR', which this check wipes; copy it outside that tree (or point DATA_DIR elsewhere) and rerun"
+    ;;
+esac
+
 if [[ ! -x "$TOOL_BIN" ]]; then
   log "$TOOL_BIN missing; building debug tool"
   cargo build --offline >/tmp/onnx-libfuzzer-artifact-cargo-build.log
