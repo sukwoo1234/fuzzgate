@@ -39,6 +39,26 @@ fail() {
 [[ -f "$SEED" ]] || fail "seed not found: $SEED"
 mkdir -p "$OUT_DIR"
 
+# The instrumented ONNX harnesses write one .profraw per process; without a contained
+# LLVM_PROFILE_FILE they drop default.profraw into the working directory. Naming them by
+# PID inside OUT_DIR meant every run added two more and nothing removed them - measured
+# 2026-09-13: 26 files / 1.1 GB in data/native-engine-checks/onnx, the oldest from
+# 2026-06-12. Nothing reads them: this check asserts on its logs, and a repository-wide
+# grep finds no other consumer. Scratch that goes away is where they belong, the shape
+# check_safetensors_native_engines.sh:34-45 already uses; OUT_DIR keeps the logs, which
+# this check rewrites by design.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/onnx-native-check-XXXXXX")"
+cleanup() {
+  local rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    rm -rf "$WORK"
+  else
+    log "scratch preserved: $WORK" >&2
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+
 # Build only when the harness is missing, the shape check_safetensors_native_engines.sh
 # already uses. Building unconditionally reinstalled harnesses/libfuzzer/onnxruntime_*
 # on every run of the check suite: this script observes those binaries, so rewriting
@@ -58,12 +78,12 @@ if [[ ! -x "$LF_REPLAY" ]]; then
 fi
 
 log "run libFuzzer fixed-input smoke"
-LLVM_PROFILE_FILE="$OUT_DIR/libfuzzer-%p.profraw" \
+LLVM_PROFILE_FILE="$WORK/libfuzzer-%p.profraw" \
   "$PROJECT_ROOT/harnesses/libfuzzer/onnxruntime_loader_fuzzer" -runs=1 "$SEED" \
   >"$OUT_DIR/libfuzzer-smoke.log" 2>&1
 
 log "run standalone replay smoke"
-LLVM_PROFILE_FILE="$OUT_DIR/replay-%p.profraw" \
+LLVM_PROFILE_FILE="$WORK/replay-%p.profraw" \
   "$PROJECT_ROOT/harnesses/libfuzzer/onnxruntime_loader_replay" "$SEED" \
   >"$OUT_DIR/replay-smoke.log" 2>&1
 
