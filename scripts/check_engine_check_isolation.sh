@@ -9,9 +9,12 @@
 # check_safetensors_native_engines.sh:59 already had the right shape - build only when
 # the harness is missing - so this is the odd-one-out class, not a new contract.
 #
-# The assertion is behavioural and deliberately uses mtime, not just content: the
-# builds happen to be byte-stable today, so a content-only check would pass while the
-# rebuild still happened. mtime proves the build did not run at all.
+# The assertion is behavioural and deliberately uses mtime, not just content. Back to
+# back rebuilds of these harnesses are byte-identical, so a content-only check passes
+# while the rebuild still happens. Over longer gaps the bytes do change - three distinct
+# gguf_loader_fuzzer hashes turned up in a single session, cause not identified (R68) -
+# so content is unreliable in both directions. mtime always moves when a build runs,
+# which is the signal this gate actually needs.
 #
 # Skips (not fails) a checker whose harness is absent: with nothing built there is
 # nothing to protect, and building one here to create the precondition would be the
