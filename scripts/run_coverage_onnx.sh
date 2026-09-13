@@ -21,7 +21,12 @@ SO="$SO_DIR/libonnxruntime.so"
 HARNESS_SRC="${HARNESS_SRC:-$PROJECT_ROOT/harnesses/coverage-onnx/harness.cc}"
 CORPUS_DIR="${CORPUS_DIR:-$PROJECT_ROOT/seeds/onnx}"
 SOURCE_CORPUS_DIR="${SOURCE_CORPUS_DIR:-$CORPUS_DIR}"
-OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/data/coverage/onnx-smoke}"
+# Required, like the gguf and safetensors runners. This used to default to
+# data/coverage/onnx-smoke, which is a real measurement: the wipe below then deleted it
+# whenever the script ran with no OUT_DIR, with no undo. src/coverage.rs always passes
+# OUT_DIR, so only the by-hand path was ever exposed - and that is the path that
+# re-measures the number.
+OUT_DIR="${OUT_DIR:?OUT_DIR must be set by the coverage runner}"
 # Toolchain MUST match the one used to build the instrumented .so (clang-17), so
 # the harness compile and the profdata/cov readers are all version-consistent.
 CLANG_DIR="${CLANG_DIR:-$PROJECT_ROOT/data/toolchains/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04}"
