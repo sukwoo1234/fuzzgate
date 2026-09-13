@@ -46,6 +46,24 @@ fail() {
 
 mkdir -p "$OUT_DIR"
 
+# clean/crash/poc-corpus are scratch, not output: every step needs them empty, so the
+# check wipes them. Hanging them off OUT_DIR pointed that wipe at a caller's directory,
+# and the default OUT_DIR is data/native-engine-checks/gguf-engines - gitignored, no undo.
+# check_safetensors_native_engines.sh:34-45 already holds the shape this class uses: a
+# mktemp scratch dir, preserved on failure so a real finding stays inspectable. OUT_DIR
+# keeps the logs and the afl-showmap map, which this check rewrites by design.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/gguf-engines-XXXXXX")"
+cleanup() {
+  local rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    rm -rf "$WORK"
+  else
+    log "scratch preserved: $WORK" >&2
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+
 log "generating the seeds this check depends on"
 SEED_ROOT="$SEED_ROOT" bash "$PROJECT_ROOT/scripts/gen_gguf_malformed_seeds.sh" \
   >"$OUT_DIR/seeds.log" 2>&1 || fail "seed generator failed; see $OUT_DIR/seeds.log"
@@ -70,7 +88,7 @@ fi
 LIBFUZZER_LIMITS=(-rss_limit_mb=2048 -malloc_limit_mb=2048)
 
 log "libFuzzer target must run a good seed cleanly"
-clean_dir="$OUT_DIR/clean"
+clean_dir="$WORK/clean"
 rm -rf "$clean_dir"; mkdir -p "$clean_dir"
 rc=0
 "$FUZZER" -runs=1 "${LIBFUZZER_LIMITS[@]}" -artifact_prefix="$clean_dir/" "$SEED" \
@@ -89,7 +107,7 @@ log "OK   good seed: executed, exit 0, no artifacts"
 # corpus DIRECTORY it crashes while loading and writes crash-* , which is the path a
 # campaign's artifact gate depends on.
 log "libFuzzer target must die on a known PoC given as a file"
-crash_dir="$OUT_DIR/crash"
+crash_dir="$WORK/crash"
 rm -rf "$crash_dir"; mkdir -p "$crash_dir"
 rc=0
 "$FUZZER" -runs=1 "${LIBFUZZER_LIMITS[@]}" -artifact_prefix="$crash_dir/" "$POC" \
@@ -100,7 +118,7 @@ grep -q 'deadly signal\|ERROR: AddressSanitizer\|GGML_ASSERT' "$OUT_DIR/libfuzze
 log "OK   poc as a file: rc=$rc, crash reported"
 
 log "libFuzzer target must write a crash artifact when the PoC is in the corpus"
-corpus_dir="$OUT_DIR/poc-corpus"
+corpus_dir="$WORK/poc-corpus"
 rm -rf "$corpus_dir" "$crash_dir"; mkdir -p "$corpus_dir" "$crash_dir"
 cp "$POC" "$corpus_dir/"
 rc=0
