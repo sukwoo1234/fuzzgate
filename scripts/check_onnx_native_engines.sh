@@ -39,11 +39,23 @@ fail() {
 [[ -f "$SEED" ]] || fail "seed not found: $SEED"
 mkdir -p "$OUT_DIR"
 
-log "build native libFuzzer harness"
-"$PROJECT_ROOT/scripts/build_libfuzzer_onnx_native.sh" >/tmp/onnx-native-libfuzzer-build.log
+# Build only when the harness is missing, the shape check_safetensors_native_engines.sh
+# already uses. Building unconditionally reinstalled harnesses/libfuzzer/onnxruntime_*
+# on every run of the check suite: this script observes those binaries, so rewriting
+# them is a side effect, and SO_DIR auto-detection can pick a differently instrumented
+# build than the one that was originally installed.
+LF_FUZZER="$PROJECT_ROOT/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
+LF_REPLAY="$PROJECT_ROOT/harnesses/libfuzzer/onnxruntime_loader_replay"
 
-log "build native standalone replay"
-BUILD_STANDALONE=1 "$PROJECT_ROOT/scripts/build_libfuzzer_onnx_native.sh" >/tmp/onnx-native-standalone-build.log
+if [[ ! -x "$LF_FUZZER" ]]; then
+  log "libFuzzer harness missing; building"
+  "$PROJECT_ROOT/scripts/build_libfuzzer_onnx_native.sh" >/tmp/onnx-native-libfuzzer-build.log
+fi
+
+if [[ ! -x "$LF_REPLAY" ]]; then
+  log "standalone replay missing; building"
+  BUILD_STANDALONE=1 "$PROJECT_ROOT/scripts/build_libfuzzer_onnx_native.sh" >/tmp/onnx-native-standalone-build.log
+fi
 
 log "run libFuzzer fixed-input smoke"
 LLVM_PROFILE_FILE="$OUT_DIR/libfuzzer-%p.profraw" \

@@ -52,9 +52,15 @@ SEED_ROOT="$SEED_ROOT" bash "$PROJECT_ROOT/scripts/gen_gguf_malformed_seeds.sh" 
 [[ -f "$SEED" ]] || fail "seed not found: $SEED"
 [[ -f "$POC"  ]] || fail "poc not found: $POC"
 
-log "build native libFuzzer target and standalone replay"
-bash "$PROJECT_ROOT/scripts/build_libfuzzer_gguf_native.sh" >"$OUT_DIR/libfuzzer-build.log" 2>&1 \
-  || fail "native build failed; see $OUT_DIR/libfuzzer-build.log"
+# Build only when the harness is missing, the shape check_safetensors_native_engines.sh
+# already uses. Building unconditionally reinstalled harnesses/libfuzzer/gguf_loader_*
+# on every run of the check suite: this script observes those binaries, so rewriting
+# them is a side effect, and BASE-02 pins them by hash.
+if [[ ! -x "$FUZZER" || ! -x "$REPLAY" ]]; then
+  log "harness missing; building native libFuzzer target and standalone replay"
+  bash "$PROJECT_ROOT/scripts/build_libfuzzer_gguf_native.sh" >"$OUT_DIR/libfuzzer-build.log" 2>&1 \
+    || fail "native build failed; see $OUT_DIR/libfuzzer-build.log"
+fi
 [[ -x "$FUZZER" ]] || fail "libFuzzer target not produced: $FUZZER"
 [[ -x "$REPLAY" ]] || fail "standalone replay not produced: $REPLAY"
 
