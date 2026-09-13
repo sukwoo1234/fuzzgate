@@ -32,6 +32,14 @@ LLVM_COV="$RUSTLIB/llvm-cov"
 [[ -x "$LLVM_PROFDATA" && -x "$LLVM_COV" ]] || fail "rustc llvm tools missing under $RUSTLIB (run S0: llvm-tools-preview)"
 
 RAW="$OUT_DIR/raw"
+# profraw are named by PID, so a reused OUT_DIR keeps every previous run's files and the
+# merge below folds them into this run's number. Measured 2026-09-13: a 4-input run
+# followed by a 1-input run into the same OUT_DIR published lines 112/575 functions 12/64
+# for a corpus that covers 21/575 and 2/64, with exit 0 and no warning. run_coverage_gguf.sh
+# and run_coverage_onnx.sh guard the same way. Under src/coverage.rs OUT_DIR is always
+# fresh; this protects the direct-invocation path, which is how the number gets re-measured
+# by hand.
+rm -rf "$RAW" "$OUT_DIR/cov.profdata" "$OUT_DIR/llvmcov.json" "$OUT_DIR/coverage.json"
 mkdir -p "$RAW"
 
 shopt -s nullglob
