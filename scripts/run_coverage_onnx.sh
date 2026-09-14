@@ -49,10 +49,52 @@ echo "[run-cov-onnx] corpus: $CORPUS_DIR"
 mapfile -t MODELS < <(find "$CORPUS_DIR" -type f -name '*.onnx' | sort)
 [ "${#MODELS[@]}" -gt 0 ] || { echo "[run-cov-onnx] no .onnx in $CORPUS_DIR"; exit 1; }
 echo "[run-cov-onnx] replaying ${#MODELS[@]} models"
-LLVM_PROFILE_FILE="$OUT_DIR/raw/cov-%p-%m.profraw" "$HARNESS_BIN" "${MODELS[@]}" || true
+# The harness writes one JSON record per input on stdout and a loaded/failed/total line on
+# stderr; both used to go nowhere, and its exit status was dropped with `|| true`. Every
+# model goes through ONE process here, so a model that kills it leaves a profile covering
+# only the models before it - and the report below would still be published against the
+# whole corpus, on exit 0, with corpus_models claiming the full count. That is the
+# denominator run_coverage_gguf.sh:76-94 keeps by tallying each input's exit. R39.
+RECORDS="$OUT_DIR/harness-records.jsonl"
+HARNESS_LOG="$OUT_DIR/harness.log"
+harness_rc=0
+LLVM_PROFILE_FILE="$OUT_DIR/raw/cov-%p-%m.profraw" "$HARNESS_BIN" "${MODELS[@]}" \
+  >"$RECORDS" 2>"$HARNESS_LOG" || harness_rc=$?
+RECORDED="$(grep -c '^{' "$RECORDS" || true)"
+if [ "$harness_rc" -ne 0 ] || [ "$RECORDED" -ne "${#MODELS[@]}" ]; then
+  echo "[run-cov-onnx] fail: the harness recorded $RECORDED of ${#MODELS[@]} models (rc=$harness_rc);" \
+       "the profile covers only those, so any percentage here would be published against a" \
+       "corpus it did not measure. See $HARNESS_LOG and $RECORDS"
+  exit 1
+fi
+# bytes:-1 is the harness's "cannot open file": the input never reached onnxruntime. If
+# that is every input, the library was never entered and a 0% report would read like a
+# finding - the shape run_coverage_gguf.sh:98-99 refuses as "the replay never ran".
+UNOPENED="$(grep -c '"bytes":-1' "$RECORDS" || true)"
+if [ "$UNOPENED" -eq "${#MODELS[@]}" ]; then
+  echo "[run-cov-onnx] fail: none of the ${#MODELS[@]} models could be opened; nothing reached onnxruntime"
+  exit 1
+fi
+LOADED="$(grep -c '"session_ok":true' "$RECORDS" || true)"
+echo "[run-cov-onnx] recorded=$RECORDED loaded=$LOADED unopened=$UNOPENED of ${#MODELS[@]}"
 
 echo "[run-cov-onnx] merging profiles"
-"$LLVM_PROFDATA" merge -sparse "$OUT_DIR"/raw/*.profraw -o "$OUT_DIR/cov.profdata"
+# A process that dies without flushing leaves a 0-BYTE profraw, and llvm-profdata merges
+# those without complaint - a run where nothing was measured becomes a well-formed 0%
+# report on exit 0. run_coverage_gguf.sh:106-118 drops them; this used to hand the merge a
+# raw glob.
+shopt -s nullglob
+PROFS=("$OUT_DIR"/raw/*.profraw)
+shopt -u nullglob
+[ "${#PROFS[@]}" -gt 0 ] || { echo "[run-cov-onnx] fail: no profraw produced (instrumentation did not run)"; exit 1; }
+USABLE=()
+for f in "${PROFS[@]}"; do [ -s "$f" ] && USABLE+=("$f"); done
+EMPTY=$(( ${#PROFS[@]} - ${#USABLE[@]} ))
+[ "$EMPTY" -eq 0 ] \
+  || echo "[run-cov-onnx] WARN: $EMPTY of ${#PROFS[@]} profraw files are empty (process died before flushing); dropped"
+[ "${#USABLE[@]}" -gt 0 ] \
+  || { echo "[run-cov-onnx] fail: every profraw is empty; no model produced a profile, so any percentage here would be fiction"; exit 1; }
+"$LLVM_PROFDATA" merge -sparse "${USABLE[@]}" -o "$OUT_DIR/cov.profdata"
 
 # onnxruntime sources only: exclude fetched deps / generated build files.
 IGNORE='(_deps/|/build/|/external/|/test/)'
@@ -68,10 +110,10 @@ CLANG_VER="$("$CLANGXX" --version | head -1)"
 MACHINE_LABEL="${TOOL_MACHINE_LABEL:-}"
 python3 - "$OUT_DIR/llvm-cov-summary.json" "$OUT_DIR/coverage.json" \
   "$HARNESS_BIN" "$SOURCE_CORPUS_DIR" "$TOOL_COMMIT" "$CLANG_VER" "$HARNESS_BUILD_CMD" \
-  "${#MODELS[@]}" "$MACHINE_LABEL" <<'PY'
+  "${#MODELS[@]}" "$MACHINE_LABEL" "$RECORDED" "$LOADED" <<'PY'
 import json, sys
 (summ_path, out_path, harness, corpus, commit, clangver,
- buildcmd, nmodels, machine) = sys.argv[1:10]
+ buildcmd, nmodels, machine, recorded, loaded) = sys.argv[1:12]
 with open(summ_path) as f:
     data = json.load(f)
 tot = data["data"][0]["totals"]
@@ -87,7 +129,14 @@ cov = {
   "harness_path": harness,
   "harness_build_command": buildcmd,
   "source_corpus": corpus,
+  # corpus_models is what was HANDED to the harness. models_recorded is what it reported
+  # back, and the runner refuses to get here unless the two agree - so the denominator is
+  # observed, not claimed. sessions_loaded is how many of those built a full session; it is
+  # deliberately not a pass/fail, since a corpus of malformed models covers the parser
+  # precisely by failing.
   "corpus_models": int(nmodels),
+  "models_recorded": int(recorded),
+  "sessions_loaded": int(loaded),
   "covered_lines": lines.get("covered"),
   "total_lines": lines.get("count"),
   "line_coverage": lines.get("percent"),

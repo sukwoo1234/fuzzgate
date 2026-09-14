@@ -48,16 +48,43 @@ shopt -u nullglob
 [[ ${#inputs[@]} -gt 0 ]] || fail "no *.safetensors inputs in $CORPUS_DIR"
 
 log "running instrumented replay over ${#inputs[@]} inputs"
-# The replay processes every argv file and exits 9 if any was rejected; that is fine
-# for coverage (we want the parser edges either way), so ignore its exit code.
-LLVM_PROFILE_FILE="$RAW/cov-%p.profraw" "$REPLAY" "${inputs[@]}" >/dev/null 2>&1 || true
+# The replay processes every argv file and exits 9 if any was rejected; that is fine for
+# coverage (we want the parser edges either way). Ignoring the status ALTOGETHER is not:
+# every input goes through one process, so a replay that stops on input 7 of 40 leaves a
+# profile covering seven inputs and the report is published against the whole corpus, exit
+# 0, no diagnostic. Its own contract names the statuses (ok=0 rejected=9 unavailable=10
+# crash=signal), so they can be told apart. R39.
+replay_rc=0
+LLVM_PROFILE_FILE="$RAW/cov-%p.profraw" "$REPLAY" "${inputs[@]}" \
+  >"$OUT_DIR/replay.log" 2>&1 || replay_rc=$?
+case "$replay_rc" in
+  0|9) log "replay rc=$replay_rc over ${#inputs[@]} inputs" ;;
+  10)  fail "the replay reported it could not run (rc=10); nothing was measured; see $OUT_DIR/replay.log" ;;
+  *)   fail "the replay stopped partway (rc=$replay_rc); the profile covers only part of ${#inputs[@]} inputs, so any percentage here would be published against a corpus it did not measure; see $OUT_DIR/replay.log" ;;
+esac
+# LIMIT, said out loud: the replay prints nothing per input, so this establishes that it
+# exited with a status its contract defines over ${#inputs[@]} argv paths - not that each
+# of them was individually parsed. run_coverage_onnx.sh can say the stronger thing because
+# its harness writes one record per input. Closing that gap needs the replay to emit
+# records too.
 
 shopt -s nullglob
 profs=("$RAW"/*.profraw)
 shopt -u nullglob
 [[ ${#profs[@]} -gt 0 ]] || fail "no profraw produced (instrumentation did not run)"
 
-"$LLVM_PROFDATA" merge -sparse "${profs[@]}" -o "$OUT_DIR/cov.profdata"
+# A process that dies without flushing leaves a 0-BYTE profraw and llvm-profdata merges it
+# without complaint, turning a run where nothing was measured into a well-formed 0% report
+# on exit 0. run_coverage_gguf.sh:106-118 drops them.
+usable=()
+for f in "${profs[@]}"; do [[ -s "$f" ]] && usable+=("$f"); done
+empty_profiles=$(( ${#profs[@]} - ${#usable[@]} ))
+[[ "$empty_profiles" -eq 0 ]] \
+  || log "WARN: $empty_profiles of ${#profs[@]} profraw files are empty (process died before flushing); dropped"
+[[ ${#usable[@]} -gt 0 ]] \
+  || fail "every profraw is empty: no input produced a profile, so any percentage here would be fiction"
+
+"$LLVM_PROFDATA" merge -sparse "${usable[@]}" -o "$OUT_DIR/cov.profdata"
 
 # Restrict coverage to the safetensors crate source (positional source filter), so the
 # totals are the parser's line/function coverage, not std/serde/harness.
@@ -84,7 +111,7 @@ if stray:
              "Any percentage from this run would be fiction.")
 PYCHECK
 
-python3 - "$OUT_DIR/llvmcov.json" "$OUT_DIR/coverage.json" <<'PY'
+python3 - "$OUT_DIR/llvmcov.json" "$OUT_DIR/coverage.json" "${#inputs[@]}" "$replay_rc" <<'PY'
 import json, subprocess, sys
 totals = json.load(open(sys.argv[1]))["data"][0]["totals"]
 tv = subprocess.check_output(["rustc", "+nightly", "--version"]).decode().strip()
@@ -97,6 +124,10 @@ out = {
     "total_lines": totals["lines"]["count"],
     "covered_functions": totals["functions"]["covered"],
     "total_functions": totals["functions"]["count"],
+    # What the number was measured over, and how the run that measured it ended. Recorded
+    # rather than assumed: the runner refuses to get here on any status but 0 or 9.
+    "corpus_inputs": int(sys.argv[3]),
+    "replay_exit": int(sys.argv[4]),
 }
 json.dump(out, open(sys.argv[2], "w"), indent=2)
 print(f"[st-cov-run] coverage.json: lines {out['covered_lines']}/{out['total_lines']} "
