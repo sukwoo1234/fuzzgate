@@ -108,7 +108,7 @@ if command -v afl-clang-fast++ >/dev/null 2>&1 && command -v afl-showmap >/dev/n
 
   # driver_only, not library: onnxruntime is a separate .so, so AFL++ instruments this
   # driver and none of the parser - the G2 situation the paper had to describe after the
-  # fact. It is the expected answer here, and check_engine_mode_labels.sh:232-241 already
+  # fact. It is the expected answer here, and check_engine_mode_labels.sh:234-246 already
   # asserts it for the shipped drivers. Asserted rather than logged because the failure it
   # rules out is 'none': a replay that carries no forkserver at all still produces a map
   # under afl-showmap's non-instrumented mode, and the tuple count below would then be

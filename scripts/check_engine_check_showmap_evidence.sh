@@ -19,7 +19,7 @@
 #
 # ONNX's expected scope is driver_only, not library: onnxruntime is a separate .so, so the
 # AFL++ driver carries its own edges only. That is the value already asserted for the
-# shipped ONNX drivers by check_engine_mode_labels.sh:232-241, so this is the same
+# shipped ONNX drivers by check_engine_mode_labels.sh:234-246, so this is the same
 # contract read where the number is produced, not only where the binary is labelled.
 # A file:line is never split across two lines here: a citation sweep reads one line.
 #
