@@ -196,14 +196,43 @@ done
 # forever. Starving it of file descriptors is the cheapest way to force that state.
 if [[ -x "$FUZZER" ]]; then
   log "a fuzzer that cannot open its own staged input must not report clean execs"
-  starved_rc=0
-  bash -c "ulimit -n 4; exec '$FUZZER' -runs=1 '$MALFORMED_DIR/align_wrongtype.gguf'" \
-    >>"$RUN_LOG" 2>&1 || starved_rc=$?
-  if [[ "$starved_rc" -eq 0 ]]; then
-    log "FAIL fd-starved fuzzer called a known abort a clean exec"
+  # The input has to be one the target processes CLEANLY when it is not starved. This ran
+  # on $MALFORMED_DIR/align_wrongtype.gguf, which is one of the three seeds this same
+  # script asserts must die by SIGABRT: it aborted whether or not the staged path was
+  # openable, so "rc is non-zero" was already true before ulimit was applied. Measured
+  # 2026-09-14 with the real target: rc=77 unstarved, rc=77 at `ulimit -n 4`, rc=77 at
+  # `ulimit -n 8`. On a well-formed seed the same three conditions give 0, 77, 0 - the
+  # difference this case is supposed to observe. R43.
+  shopt -s nullglob
+  starve_seeds=("$SEED_DIR"/*.gguf)
+  shopt -u nullglob
+  if [[ "${#starve_seeds[@]}" -eq 0 ]]; then
+    log "FAIL fd-starvation check: no well-formed seed under $SEED_DIR to starve on"
     FAILURES=$((FAILURES + 1))
   else
-    log "OK   fd-starved fuzzer refuses to call a known abort clean (rc=$starved_rc)"
+    starve_seed="${starve_seeds[0]}"
+    baseline_rc=0
+    "$FUZZER" -runs=1 "$starve_seed" >>"$RUN_LOG" 2>&1 || baseline_rc=$?
+    starved_err="$tmp_dir/fd-starved.err"
+    starved_rc=0
+    bash -c "ulimit -n 4; exec '$FUZZER' -runs=1 '$starve_seed'" >"$starved_err" 2>&1 \
+      || starved_rc=$?
+    cat "$starved_err" >>"$RUN_LOG"
+    # Non-zero is not enough either: a death from an unrelated cause is not evidence that
+    # the staging probe fired. gguf_loader_fuzzer.cc:396-438 prints one of these three
+    # before it abort()s, and that line is what says the harness noticed.
+    if [[ "$baseline_rc" -ne 0 ]]; then
+      log "FAIL fd-starved $(basename "$starve_seed") is not clean unstarved (rc=$baseline_rc); the starved verdict would prove nothing"
+      FAILURES=$((FAILURES + 1))
+    elif [[ "$starved_rc" -eq 0 ]]; then
+      log "FAIL fd-starved fuzzer called an input it could not open a clean exec"
+      FAILURES=$((FAILURES + 1))
+    elif ! grep -qE 'gguf-harness: (staged input .* is not openable|memfd_create failed|short write staging)' "$starved_err"; then
+      log "FAIL fd-starved fuzzer died (rc=$starved_rc) without reporting a staging failure; see $RUN_LOG"
+      FAILURES=$((FAILURES + 1))
+    else
+      log "OK   fd-starved fuzzer refuses to run what it cannot open (clean rc=$baseline_rc, starved rc=$starved_rc)"
+    fi
   fi
 else
   log "skip fd-starvation check: no libFuzzer target at $FUZZER"
