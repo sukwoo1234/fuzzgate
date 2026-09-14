@@ -22,7 +22,11 @@
 #   4. the two spellings an operator actually types. The guard is only worth anything if it
 #      holds a path it has to resolve: a RELATIVE path from the repository root (the form
 #      tab-completion produces) and a SYMLINK outside DATA_DIR whose target is inside it.
-#      Both reach the same file as assertion 1 by a name that is not a prefix of DATA_DIR.
+#      Both reach the same file as assertion 1 by a name that is not a prefix of DATA_DIR,
+#      and both carry assertion 1's full verdict - survival AND a non-zero exit - because
+#      survival alone also describes a guard degraded to `exit 0`, which touches nothing and
+#      builds nothing. Measured on dev 2026-09-14: against such a variant these two cases
+#      reported ok on survived=yes built=no while rc was 0.
 #   5. negative controls - the same harness, pointed at a checker that does destroy its
 #      input, must report the destruction; and the guard degraded to a string comparison
 #      must lose the file in both spellings of assertion 4. Without the second one,
@@ -166,6 +170,10 @@ case "$res4" in
   *) bad "a relative-path PoC inside DATA_DIR was not refused ($res4)"
      sed -n '1,6p' "$WORK/case4.log" | sed 's/^/       /' ;;
 esac
+case "$res4" in
+  rc=0*) bad "the checker exited 0 for a relative-path PoC inside the directory it wipes ($res4)" ;;
+  *)     ok "the checker does not exit 0 for a relative-path PoC inside DATA_DIR ($res4)" ;;
+esac
 
 R5="$WORK/case5"; VICTIM5="$(stage_inside "$R5")"
 ln -s "$VICTIM5" "$R5/poc-link.onnx"
@@ -175,6 +183,10 @@ case "$res5" in
   *survived=yes*built=no*) ok "a symlink resolving into DATA_DIR survives, unbuilt ($res5)" ;;
   *) bad "a symlink whose target is inside DATA_DIR was not refused ($res5)"
      sed -n '1,6p' "$WORK/case5.log" | sed 's/^/       /' ;;
+esac
+case "$res5" in
+  rc=0*) bad "the checker exited 0 for a symlink resolving into the directory it wipes ($res5)" ;;
+  *)     ok "the checker does not exit 0 for a symlink resolving into DATA_DIR ($res5)" ;;
 esac
 
 # --- 5. negative control: the harness must catch a checker that destroys its input ------
