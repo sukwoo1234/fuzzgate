@@ -3,6 +3,17 @@
 set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}"
 TOOL_BIN="${TOOL_BIN:-$PROJECT_ROOT/target/debug/tool}"
+# Not a skip: this gate drives the real tool, so without the binary it observes nothing,
+# and a gate that reports anything other than a refusal when it observed nothing is the
+# failure mode this suite exists to stop - the shape check_checker_wipe_safety.sh:101-106
+# already uses. Before this guard every case launched the missing binary and failed on
+# its own, so one absent precondition was reported as 15 separate failures - which an
+# operator reads as 15 defects, not one missing build. Measured 2026-09-14. R86.
+if [[ ! -x "$TOOL_BIN" ]]; then
+  printf '[run-seed-provenance] fail: tool binary not executable: %s\n' "$TOOL_BIN" >&2
+  printf '[run-seed-provenance] build it with `cargo build` or point TOOL_BIN at one; this gate cannot run\n' >&2
+  exit 1
+fi
 python3 - "$PROJECT_ROOT" "$TOOL_BIN" <<'PY'
 import json
 import os
