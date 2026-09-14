@@ -108,7 +108,11 @@ STUB
 # --- 1+2. behavioural, both checkers ----------------------------------------------------
 onnx_sandbox() { # onnx_sandbox <root>
   local root="$1"
-  mkdir -p "$root/harnesses/libfuzzer" "$root/scripts"
+  mkdir -p "$root/harnesses/libfuzzer" "$root/scripts/lib"
+  # Sourced at the top of the AFL++ arm since R41, the way the gguf checker already did:
+  # without it the checker dies before the harnesses and the opposite-polarity case below
+  # would read as a refusal.
+  cp "$PROJECT_ROOT/scripts/lib/engine_mode.sh" "$root/scripts/lib/engine_mode.sh"
   stub "$root/harnesses/libfuzzer/onnxruntime_loader_fuzzer" "$root/harness-was-run"
   stub "$root/harnesses/libfuzzer/onnxruntime_loader_replay" "$root/harness-was-run"
   # A separate marker: the build script runs BEFORE the harnesses, so counting it as

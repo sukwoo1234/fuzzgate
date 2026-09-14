@@ -96,14 +96,44 @@ LLVM_PROFILE_FILE="$WORK/replay-%p.profraw" \
   "$PROJECT_ROOT/harnesses/libfuzzer/onnxruntime_loader_replay" "$SEED" \
   >"$OUT_DIR/replay-smoke.log" 2>&1
 
+# shellcheck source=lib/engine_mode.sh
+. "$PROJECT_ROOT/scripts/lib/engine_mode.sh"
+
 if command -v afl-clang-fast++ >/dev/null 2>&1 && command -v afl-showmap >/dev/null 2>&1; then
   log "build AFL++ native replay"
   "$PROJECT_ROOT/scripts/build_aflpp_onnx_native.sh" >"$OUT_DIR/aflpp-build.log" 2>&1
 
+  AFLPP_REPLAY="$PROJECT_ROOT/harnesses/aflpp/onnxruntime_loader_replay"
+  [[ -x "$AFLPP_REPLAY" ]] || fail "AFL++ replay not produced: $AFLPP_REPLAY"
+
+  # driver_only, not library: onnxruntime is a separate .so, so AFL++ instruments this
+  # driver and none of the parser - the G2 situation the paper had to describe after the
+  # fact. It is the expected answer here, and check_engine_mode_labels.sh:232-241 already
+  # asserts it for the shipped drivers. Asserted rather than logged because the failure it
+  # rules out is 'none': a replay that carries no forkserver at all still produces a map
+  # under afl-showmap's non-instrumented mode, and the tuple count below would then be
+  # reported as engine coverage. Measured 2026-09-14: /bin/true as the replay passed this
+  # arm with tuples=5.
+  scope="$(instrumentation_scope "$AFLPP_REPLAY")"
+  [[ "$scope" == "driver_only" ]] \
+    || fail "AFL++ replay scope is '$scope', expected 'driver_only': $AFLPP_REPLAY"
+  log "OK   instrumentation_scope=$scope"
+
   log "run afl-showmap coverage smoke"
   AFL_MAP="$OUT_DIR/afl-showmap.txt"
-  afl-showmap -q -o "$AFL_MAP" -- "$PROJECT_ROOT/harnesses/aflpp/onnxruntime_loader_replay" "$SEED" \
+  # Removed first, the shape check_gguf_native_engines.sh:164 uses: OUT_DIR is reused
+  # across runs, so a map left by an earlier one is counted as this run's coverage by any
+  # afl-showmap that exits without writing. Measured 2026-09-14 with a stub showmap: a
+  # 7-line map from a previous run was reported as `tuples=7` and the check exited 0.
+  rm -f "$AFL_MAP"
+  afl-showmap -q -o "$AFL_MAP" -- "$AFLPP_REPLAY" "$SEED" \
     >"$OUT_DIR/afl-showmap.log" 2>&1
+  # No `|| showmap_rc=$?` here, deliberately: `:2 set -euo pipefail` already makes a
+  # non-zero afl-showmap abort the check, which is stricter than the gguf and safetensors
+  # arms that capture the status and assert on it later (R36). This says what happened
+  # when it exits 0 having written nothing at all.
+  [[ -f "$AFL_MAP" ]] \
+    || fail "afl-showmap wrote no map; see $OUT_DIR/afl-showmap.log"
   tuples="$(wc -l < "$AFL_MAP" | tr -d ' ')"
   if [[ "$tuples" -le 0 ]]; then
     fail "afl-showmap produced zero tuples"
