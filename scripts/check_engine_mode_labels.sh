@@ -167,10 +167,10 @@ if [ -n "$SCOPE_CC" ] && [ -x "$SCOPE_CC" ]; then
     has_afl_instrumentation "$WORK/harnesses/aflpp/big_symtab" \
       || fail "has_afl_instrumentation lost __afl_prev_loc on a large symbol table"
   else
-    log "skip SIGPIPE case: $SCOPE_CC could not build the fixture"
+    note_skip "has_afl_instrumentation SIGPIPE case ($SCOPE_CC could not build the fixture)"
   fi
 else
-  log "skip SIGPIPE case: no C compiler available"
+  note_skip "has_afl_instrumentation SIGPIPE case (no C compiler available)"
 fi
 
 log "instrumentation_scope: a binary without the forkserver is none"
@@ -226,6 +226,8 @@ if [ -x "$GGUF_REPLAY" ]; then
   afl_marked_copy "$GGUF_REPLAY" "$WORK/harnesses/aflpp/shipped_replay"
   scope="$(instrumentation_scope "$WORK/harnesses/aflpp/shipped_replay")"
   [ "$scope" = "library" ] || fail "expected library for the shipped replay, got '$scope'"
+else
+  note_skip "instrumentation_scope shipped gguf replay case (not built: $GGUF_REPLAY)"
 fi
 
 # The shipped ONNX drivers must NOT claim library scope: onnxruntime is a .so.
@@ -233,7 +235,10 @@ for onnx_driver in \
   "$PROJECT_ROOT/harnesses/libfuzzer/onnxruntime_loader_fuzzer" \
   "$PROJECT_ROOT/harnesses/aflpp/onnxruntime_loader_replay"
 do
-  [ -x "$onnx_driver" ] || continue
+  [ -x "$onnx_driver" ] || {
+    note_skip "instrumentation_scope $(basename "$onnx_driver") case (not built: $onnx_driver)"
+    continue
+  }
   log "instrumentation_scope: $(basename "$onnx_driver") must not claim library scope"
   afl_marked_copy "$onnx_driver" "$WORK/harnesses/aflpp/onnx_scope_probe"
   scope="$(instrumentation_scope "$WORK/harnesses/aflpp/onnx_scope_probe")"
