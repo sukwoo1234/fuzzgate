@@ -57,7 +57,11 @@ skip() { SKIP=$((SKIP + 1)); printf '  skip %s\n' "$*"; }
 
 # --- 1. behavioural: the safetensors runner ----------------------------------------------
 ST_RUNNER="$PROJECT_ROOT/scripts/run_coverage_safetensors.sh"
-RUSTBIN="$(rustc +nightly --print target-libdir 2>/dev/null)/../bin"
+# `|| true` is load-bearing: under `set -e` an assignment takes the command
+# substitution's exit status, so a host without the nightly toolchain killed this gate
+# before it printed a single line - rc=1 with no output, and the skip branch below
+# unreachable. Measured 2026-09-14 with RUSTUP_HOME pointed at a missing directory.
+RUSTBIN="$(rustc +nightly --print target-libdir 2>/dev/null || true)/../bin"
 
 # A stub in place of the instrumented replay. The runner checks the rust llvm tools before
 # it ever runs the replay, so those still have to be there; everything after the replay is
