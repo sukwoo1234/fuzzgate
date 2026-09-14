@@ -29,6 +29,18 @@
 # child must be shown to have RUN first - a zero exit and its own completion line - and
 # only then is the snapshot diff worth reading. R69.
 #
+# The gate also has to survive the host it meets first, which has nothing built. Both
+# arms that read harnesses/ directly assumed it held at least one file: the rebuild probe
+# picked its victim with `find ... | head -1` and ran touch on the empty string when that
+# came back empty, and snapshot() let find fail outright when the directory was gone.
+# Either way set -e killed the run before the verdict line, so the suite saw rc=1 with no
+# ledger and could not tell "a checker rebuilt harnesses/" from "the gate never got to
+# look". Measured 2026-09-14: an emptied harnesses/ gave "touch: cannot touch" on an empty
+# name, rc=1; a removed one gave "cp: cannot stat", rc=1; neither printed a verdict line.
+# A checkout carrying only the tracked sources does NOT hit this - it has five files under
+# harnesses/ - so the earlier note that a freshly prepared host would crash here is wrong.
+# R91.
+#
 # Writes only under its own mktemp directory plus the checkers' own OUT_DIR, which is
 # pointed into that mktemp directory.
 set -euo pipefail
@@ -48,6 +60,15 @@ skip() { SKIP=$((SKIP + 1)); printf '  skip %s\n' "$*"; }
 # build takes seconds, and the content hash below closes the gap either way.
 snapshot() {
   local out="$1"
+  # A tree where nothing has been built yet may carry no harnesses/ at all. Creating one
+  # would be a side effect this gate exists to forbid, and an empty inventory is the
+  # truthful snapshot of that tree. No verdict rests on it: run_isolated skips before it
+  # ever probes when the binaries it needs are missing, so "clean" is unreachable here.
+  # Without this, find failed and pipefail killed the gate mid-run. R91.
+  if [[ ! -d "$HARNESS_DIR" ]]; then
+    : >"$out"
+    return
+  fi
   find "$HARNESS_DIR" -type f -printf '%p %T@ ' -exec sha256sum {} \; \
     | awk '{print $1, $2, $3}' | sort >"$out"
 }
@@ -144,16 +165,81 @@ case "$verdict" in
 esac
 
 # Negative control: the snapshot must actually notice a rebuild. Touching a real file
-# would mutate the tree this gate protects, so the comparison runs against a copy.
-cp -a "$HARNESS_DIR" "$WORK/harness-copy"
+# would mutate the tree this gate protects, so the comparison runs against a copy. The
+# victim is a fixture this gate plants in that copy rather than whichever file the tree
+# happens to hold: harnesses/ can legitimately contain nothing - the tracked sources are
+# the only members that travel, and a tree that has had them cleaned holds no files at
+# all - and `find ... | head -1` then yields the empty string, so `touch ""` failed and
+# set -e killed the gate before it printed a verdict line. R91.
+mkdir -p "$WORK/harness-copy"
+if [[ -d "$HARNESS_DIR" ]]; then
+  cp -a "$HARNESS_DIR/." "$WORK/harness-copy/"
+fi
+victim="$WORK/harness-copy/.rebuild-probe"
+printf 'isolation gate rebuild probe\n' >"$victim"
 HARNESS_DIR="$WORK/harness-copy" snapshot "$WORK/neg.before"
-victim="$(find "$WORK/harness-copy" -type f | head -1)"
-touch "$victim"
+# An explicit timestamp rather than a bare touch: %T@ is sub-second, so a same-instant
+# touch is not guaranteed to move it, and this arm must not be able to pass by luck.
+touch -t 200001010000 "$victim"
 HARNESS_DIR="$WORK/harness-copy" snapshot "$WORK/neg.after"
 if diff -q "$WORK/neg.before" "$WORK/neg.after" >/dev/null; then
   bad 'negative control: snapshot did not notice a touched harness file'
 else
   ok 'negative control: snapshot notices a touched harness file'
+fi
+
+# The arms above are all this gate can assert about a host that has everything built. The
+# host it actually meets first has nothing built, and the failure mode there is not a bad
+# verdict but no verdict at all: the gate died before its last line, so the suite saw rc=1
+# with an empty ledger and no way to tell "a checker rebuilt harnesses/" from "the gate
+# could not run". Re-entering itself against a tree with an empty harnesses/ is the only
+# way to pin that, so the child is told not to recurse. R91.
+if [[ -z "${ENGINE_CHECK_ISOLATION_SELFTEST:-}" ]]; then
+  # Two shapes, because they died in two different places: an empty harnesses/ killed the
+  # rebuild probe, and a missing one killed snapshot() one arm earlier.
+  for shape in empty absent; do
+    SELFROOT="$WORK/selftest-$shape"
+    mkdir -p "$SELFROOT"
+    [[ "$shape" = empty ]] && mkdir -p "$SELFROOT/harnesses"
+    # The real scripts/, so every child checker is present and skips for the honest reason -
+    # its binaries are missing - which is the shape of a freshly prepared host, not of a
+    # repository with no checkers in it.
+    ln -s "$PROJECT_ROOT/scripts" "$SELFROOT/scripts"
+    self_rc=0
+    ENGINE_CHECK_ISOLATION_SELFTEST=1 PROJECT_ROOT="$SELFROOT" \
+      timeout 600 bash "${BASH_SOURCE[0]}" >"$WORK/selftest-$shape.log" 2>&1 || self_rc=$?
+    if [[ "$self_rc" -eq 0 ]] && grep -q '^\[engine-check-isolation\] pass=' "$WORK/selftest-$shape.log"; then
+      ok "a tree whose harnesses/ is $shape still reaches a verdict line"
+    else
+      bad "a tree whose harnesses/ is $shape killed the gate (rc=$self_rc)"
+      tail -3 "$WORK/selftest-$shape.log" | sed 's/^/       /'
+    fi
+    # Reaching the verdict line is not enough on the absent shape. Without the guard in
+    # snapshot() the run still ends rc=0, but every snapshot prints a find(1) error first,
+    # and an operator reading a suite log cannot tell those from a checker failing. The
+    # guard is what makes "nothing is built here" a stated state instead of tool noise.
+    if [[ "$shape" = absent ]]; then
+      if grep -q '^find: ' "$WORK/selftest-$shape.log"; then
+        bad 'a tree whose harnesses/ is absent makes the gate emit find(1) errors an operator cannot read'
+        grep -m2 '^find: ' "$WORK/selftest-$shape.log" | sed 's/^/       /'
+      else
+        ok 'a tree whose harnesses/ is absent produces a verdict without tool errors'
+      fi
+    fi
+  done
+
+  # Opposite polarity: the arm above must be able to fail. A copy of this script with the
+  # fixture line removed is the pre-fix shape, and it must NOT reach a verdict line there.
+  sed 's|^victim="\$WORK/harness-copy/\.rebuild-probe"$|victim="$(find "$WORK/harness-copy" -type f \| head -1)"|; /^printf .isolation gate rebuild probe/d' \
+    "${BASH_SOURCE[0]}" >"$WORK/prefix-shape.sh"
+  pre_rc=0
+  ENGINE_CHECK_ISOLATION_SELFTEST=1 PROJECT_ROOT="$WORK/selftest-empty" \
+    timeout 600 bash "$WORK/prefix-shape.sh" >"$WORK/prefix-shape.log" 2>&1 || pre_rc=$?
+  if [[ "$pre_rc" -ne 0 ]] && ! grep -q '^\[engine-check-isolation\] pass=' "$WORK/prefix-shape.log"; then
+    ok "negative control: the pre-fix shape still dies without a verdict line (rc=$pre_rc)"
+  else
+    bad "negative control: the pre-fix shape survived (rc=$pre_rc); this arm proves nothing"
+  fi
 fi
 
 printf '[engine-check-isolation] pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
