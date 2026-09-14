@@ -114,7 +114,7 @@ fi
 # reduced to a sentinel. What is required is the relation between the two, not a spelling.
 scan_runner() {
   python3 - "$1" <<'PY'
-import re, sys
+import posixpath, re, sys
 
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()
@@ -190,7 +190,38 @@ def expand(text):
         text = new
     # ${OUT_DIR:?...} and ${OUT_DIR:-...} never survive as a path fragment
     text = re.sub(r'\$\{OUT_DIR[:$][^}]*\}', SENT, text)
+    return text
+
+def strip_quotes(text):
     return text.replace('"', "").replace("'", "").strip()
+
+def trailing_glob(text):
+    """True only when the token ends in an UNQUOTED /*. `"$D/*"` keeps the star inside the
+    quotes, so bash hands rm one literal path ending in an asterisk and nothing is removed -
+    a spelling that looks like the working one and empties nothing."""
+    seen, sq, dq = [], False, False
+    for ch in text:
+        if sq:
+            if ch == "'":
+                sq = False
+            else:
+                seen.append((ch, True))
+        elif dq:
+            if ch == '"':
+                dq = False
+            else:
+                seen.append((ch, True))
+        elif ch == "'":
+            sq = True
+        elif ch == '"':
+            dq = True
+        else:
+            seen.append((ch, False))
+    while seen and seen[-1] == ("/", False):
+        seen.pop()                    # `"$D"/*/` means the same thing as `"$D"/*`
+    return len(seen) >= 2 and seen[-1] == ("*", False) and seen[-2] == ("/", False)
+
+REDIR = re.compile(r'^\d*(?:>>?|<|&>|>&)')
 
 # --- ordered stream of (op, target, guarded) -------------------------------------------
 # `guarded` is the R77 distinction: a removal only counts if it runs every time the script
@@ -219,14 +250,23 @@ for _, line in lines:
             depth += 1
         elif CLOSE.match(frag) or BRACE_CLOSE.match(piece):
             depth -= 1
-        m = re.match(r'\s*(rm\s+-rf|mkdir\s+-p)\s+(.*)$', frag)
+        # `rm -fr` and `rm -r -f` are the same command as `rm -rf`. Pinning one spelling
+        # rejected correct runners and then told the operator they removed nothing.
+        m = re.match(r'\s*(rm|mkdir)\s+((?:-[A-Za-z]+\s+)+)(.*)$', frag)
         if m:
-            op = "rm" if m.group(1).startswith("rm") else "mkdir"
+            flags = set(m.group(2).replace("-", " ").replace(" ", ""))
+            if m.group(1) == "rm" and not {"r", "f"} <= flags:
+                m = None
+            elif m.group(1) == "mkdir" and "p" not in flags:
+                m = None
+        if m:
+            op = m.group(1)
             guarded = depth > 0 or prev_sep in ("&&", "||")
-            for target in m.group(2).split():
-                if target.startswith("-"):
-                    continue
-                ops.append((op, expand(target), guarded))
+            for target in m.group(3).split():
+                if target.startswith("-") or REDIR.match(target):
+                    continue          # a flag, or `2>/dev/null`: not a path being removed
+                raw = expand(target)
+                ops.append((op, strip_quotes(raw), guarded, trailing_glob(raw)))
         prev_sep = None
 
 if depth != 0:
@@ -236,24 +276,57 @@ if depth != 0:
           "cannot be told apart" % depth)
     sys.exit(1)
 
-removed = []
+# `rm -rf "$D"/*` empties D without removing D, which satisfies this contract just as well
+# - what it pins is that nothing from the previous run survives, not which of the two
+# spellings the runner picked. Only a removal whose trailing `/*` is OUTSIDE the quotes
+# counts: `"$D/*.profraw"` removes a subset, and `"$D/*"` removes nothing at all.
+def covers(removal, globbed, target):
+    base = removal[:-2] if globbed else removal
+    # `$OUT_DIR/raw/../raw2` starts with `$OUT_DIR/raw/` as text but is a sibling on disk.
+    base = posixpath.normpath(base.rstrip("/")) if base.rstrip("/") else base
+    target = posixpath.normpath(target)
+    if target == base:
+        return True
+    if not target.startswith(base + "/"):
+        return False
+    # `*` does not match a leading dot unless dotglob is set, so emptying a directory with a
+    # glob leaves its dot-named children behind.
+    return not (globbed and any(seg.startswith(".") for seg in target[len(base) + 1:].split("/")))
+
+removed_all = [(t, g) for op, t, guarded, g in ops if op == "rm" and not guarded]
 problems = []
-for op, target, guarded in ops:
+removed = []
+conditional = []
+for op, target, guarded, globbed in ops:
     if op == "rm":
-        if not guarded:
-            removed.append(target)
+        (conditional if guarded else removed).append((target, globbed))
         continue
     if SENT not in target:          # not under OUT_DIR; not this contract's business
         continue
-    if not any(target == r or target.startswith(r.rstrip("/") + "/") for r in removed):
-        problems.append(target.replace(SENT, "$OUT_DIR"))
+    if any(covers(r, g, target) for r, g in removed):
+        continue
+    # One line is all an operator gets, so it has to name the right cause. Reporting a
+    # misdirected `rm` as a missing one sends them looking for code that is already there.
+    # Each branch is a claim about the WHOLE script, so it is checked against the whole op
+    # stream - `removed` only holds what was seen before this create.
+    shown = target.replace(SENT, "$OUT_DIR")
+    if any(covers(r, g, target) for r, g in removed_all):
+        problems.append("%s, but the removal that covers it runs after the create, not "
+                        "before" % shown)
+    elif any(covers(r, g, target) for r, g in conditional):
+        problems.append("%s, but its removal is reached only through a branch, a && guard "
+                        "or a function body, so it does not run every time" % shown)
+    elif removed_all:
+        others = sorted({r.replace(SENT, "$OUT_DIR") for r, _ in removed_all})
+        problems.append("%s, but the only unconditional removals target %s"
+                        % (shown, ", ".join(others)))
+    else:
+        problems.append("%s, and the script removes nothing unconditionally" % shown)
 
 if problems:
-    print("creates %s without an unconditional prior removal (a removal reached only "
-          "through a branch, a && guard or a function body does not count)"
-          % ", ".join(problems))
+    print("creates " + "; ".join(problems))
     sys.exit(1)
-if not any(op == "mkdir" and SENT in t for op, t, _ in ops):
+if not any(op == "mkdir" and SENT in t for op, t, _, _ in ops):
     print("creates nothing under OUT_DIR; scan had nothing to judge")
     sys.exit(1)
 sys.exit(0)
@@ -364,6 +437,174 @@ if scan_runner "$WORK/run_coverage_embedded.sh" >/dev/null 2>&1; then
 else
   bad "negative control: the lexer read embedded python as shell ($(scan_runner "$WORK/run_coverage_embedded.sh" || true))"
 fi
+
+# --- R78: `rm -rf "$DIR"/*` empties the directory instead of removing it ----------------
+# The contract is about what survives into the next run, not about which of the two
+# spellings a runner picked, and `/*` is the spelling an operator reaches for when the
+# directory itself must stay (a mount point, a symlink, a path someone else holds open).
+# Before this, the scan compared the removal target verbatim, so the trailing `/*` matched
+# nothing and the runner was reported as never removing anything.
+mk_fake run_coverage_globwipe.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+RAW="$OUT_DIR/raw"
+rm -rf "$RAW"/*
+mkdir -p "$RAW"'
+if scan_runner "$WORK/run_coverage_globwipe.sh" >/dev/null 2>&1; then
+  ok 'negative control: scan accepts a directory emptied with a trailing /* instead of removed'
+else
+  bad "negative control: scan rejected a runner that empties raw/ with a trailing /* ($(scan_runner "$WORK/run_coverage_globwipe.sh" 2>&1 || true))"
+fi
+
+# The opposite polarity: stripping the `/*` must not make every glob match.
+mk_fake run_coverage_globwrongpath.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+RAW="$OUT_DIR/raw"
+rm -rf "$OUT_DIR/old"/*
+mkdir -p "$RAW"'
+if scan_runner "$WORK/run_coverage_globwrongpath.sh" >/dev/null 2>&1; then
+  bad 'negative control: scan accepted a trailing /* on a path other than the one created'
+else
+  ok 'negative control: scan still rejects a trailing /* on a different path'
+fi
+
+# Two ways stripping the `/*` could have gone wrong, pinned so it cannot drift back:
+# a glob that removes only SOME of the directory, and a prefix that is not a parent.
+mk_fake run_coverage_globsubset.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+RAW="$OUT_DIR/raw"
+rm -rf "$RAW"/*.profraw
+mkdir -p "$RAW"'
+if scan_runner "$WORK/run_coverage_globsubset.sh" >/dev/null 2>&1; then
+  bad 'negative control: scan accepted a glob that removes only part of the directory'
+else
+  ok 'negative control: scan rejects a glob that removes only part of the directory'
+fi
+
+mk_fake run_coverage_globprefix.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+rm -rf "$OUT_DIR/raw"/*
+mkdir -p "$OUT_DIR/rawdata"'
+if scan_runner "$WORK/run_coverage_globprefix.sh" >/dev/null 2>&1; then
+  bad 'negative control: scan treated $OUT_DIR/raw as covering the sibling $OUT_DIR/rawdata'
+else
+  ok 'negative control: a removed path does not cover a sibling that merely shares its prefix'
+fi
+
+# Three more ways stripping the `/*` could have gone wrong, all demonstrated against the
+# first version of this fix (2026-09-14 adversarial round).
+mk_fake run_coverage_globinquotes.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+RAW="$OUT_DIR/raw"
+rm -rf "$RAW/*"
+mkdir -p "$RAW"'
+if scan_runner "$WORK/run_coverage_globinquotes.sh" >/dev/null 2>&1; then
+  bad 'negative control: scan accepted "$RAW/*" - the star is quoted, so nothing is removed'
+else
+  ok 'negative control: scan rejects "$RAW/*", where the quoted star removes nothing'
+fi
+
+mk_fake run_coverage_dotchild.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+rm -rf "$OUT_DIR"/*
+mkdir -p "$OUT_DIR/.raw"'
+if scan_runner "$WORK/run_coverage_dotchild.sh" >/dev/null 2>&1; then
+  bad 'negative control: scan credited "$OUT_DIR"/* with removing a dot-named child'
+else
+  ok 'negative control: a /* glob is not credited with removing a dot-named child'
+fi
+
+mk_fake run_coverage_redirect.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+RAW="$OUT_DIR/raw"
+rm -rf "$OUT_DIR/other" 2>/dev/null
+mkdir -p "$RAW"'
+why_redirect="$(scan_runner "$WORK/run_coverage_redirect.sh" 2>&1 || true)"
+case "$why_redirect" in
+  *"2>/dev/null"*) bad "negative control: a redirection was listed as a removal target ($why_redirect)" ;;
+  *"removals target \$OUT_DIR/other"*) ok 'a redirection on the rm line is not listed as a removal target' ;;
+  *) bad "negative control: unexpected verdict for a redirection on the rm line (${why_redirect:-nothing})" ;;
+esac
+
+# The verdict is a prefix question - a removal below the create does not help this run - but
+# the REASON is a statement about the whole script, and must not deny code that is there.
+mk_fake run_coverage_rmafter.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+RAW="$OUT_DIR/raw"
+mkdir -p "$RAW"
+rm -rf "$RAW"'
+why_after="$(scan_runner "$WORK/run_coverage_rmafter.sh" 2>&1 || true)"
+case "$why_after" in
+  *"runs after the create, not before"*) ok 'a removal placed after the create is reported as ordered wrongly, not as missing' ;;
+  *) bad "a removal after the create was reported as something else (said: ${why_after:-nothing})" ;;
+esac
+
+# Spellings of the same command that must not be rejected, and a text prefix that is not a
+# parent on disk. All three were demonstrated rejections/acceptances (2026-09-14).
+mk_fake run_coverage_flagorder.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+RAW="$OUT_DIR/raw"
+rm -fr "$RAW"
+mkdir -p "$RAW"'
+if scan_runner "$WORK/run_coverage_flagorder.sh" >/dev/null 2>&1; then
+  ok 'negative control: scan accepts `rm -fr`, the same command spelled differently'
+else
+  bad "negative control: scan rejected \`rm -fr\` ($(scan_runner "$WORK/run_coverage_flagorder.sh" 2>&1 || true))"
+fi
+
+mk_fake run_coverage_splitflags.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+RAW="$OUT_DIR/raw"
+rm -r -f "$RAW"
+mkdir -p "$RAW"'
+if scan_runner "$WORK/run_coverage_splitflags.sh" >/dev/null 2>&1; then
+  ok 'negative control: scan accepts `rm -r -f`, the same command spelled differently'
+else
+  bad "negative control: scan rejected \`rm -r -f\` ($(scan_runner "$WORK/run_coverage_splitflags.sh" 2>&1 || true))"
+fi
+
+# A single-file removal is still out of scope - widening the flag match must not widen that.
+mk_fake run_coverage_nonrecursive.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+RAW="$OUT_DIR/raw"
+rm -f "$RAW"
+mkdir -p "$RAW"'
+if scan_runner "$WORK/run_coverage_nonrecursive.sh" >/dev/null 2>&1; then
+  bad 'negative control: scan credited a non-recursive `rm -f` with clearing a directory'
+else
+  ok 'negative control: scan does not credit a non-recursive `rm -f` with clearing a directory'
+fi
+
+mk_fake run_coverage_dotdot.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+rm -rf "$OUT_DIR/raw"
+mkdir -p "$OUT_DIR/raw/../raw2"'
+if scan_runner "$WORK/run_coverage_dotdot.sh" >/dev/null 2>&1; then
+  bad 'negative control: scan read $OUT_DIR/raw/../raw2 as living inside $OUT_DIR/raw'
+else
+  ok 'negative control: a .. that walks back out is not covered by the removal it passed through'
+fi
+
+# --- R78b: the reason has to be the reason -----------------------------------------------
+# The scan prints one line and that line is what an operator acts on. A single message for
+# every rejection sent them looking for a missing `rm` when the `rm` was there and pointed
+# somewhere else. Each of the three distinguishable causes must name itself.
+why_wrongpath="$(scan_runner "$WORK/run_coverage_wrongpath.sh" 2>&1 || true)"
+case "$why_wrongpath" in
+  *"unconditional removals target"*) ok 'a path mismatch is reported as a path mismatch' ;;
+  *) bad "a path mismatch was diagnosed as something else (said: ${why_wrongpath:-nothing})" ;;
+esac
+
+why_deadbranch="$(scan_runner "$WORK/run_coverage_deadbranch.sh" 2>&1 || true)"
+case "$why_deadbranch" in
+  *"does not run every time"*) ok 'a removal that exists but is conditional is reported as conditional' ;;
+  *) bad "a conditional removal was diagnosed as something else (said: ${why_deadbranch:-nothing})" ;;
+esac
+
+why_nofix="$(scan_runner "$WORK/run_coverage_nofix.sh" 2>&1 || true)"
+case "$why_nofix" in
+  *"removes nothing unconditionally"*) ok 'a runner that removes nothing is reported as removing nothing' ;;
+  *) bad "a missing removal was diagnosed as something else (said: ${why_nofix:-nothing})" ;;
+esac
 
 # And when the lexer cannot follow a script, the gate must say so rather than judge it: the
 # runner below removes correctly, so any verdict other than "unreadable" is luck.
