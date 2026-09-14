@@ -36,7 +36,16 @@ fail() {
   exit 1
 }
 
-[[ -f "$SEED" ]] || fail "seed not found: $SEED"
+# -s, not -f: every assertion below this line is "the harness exited 0", and both the
+# libFuzzer target and the standalone replay exit 0 on empty input without parsing a
+# byte. An empty seed would let this check report that both arms ran having run
+# nothing. -s does not replace -f: -s is true for a directory, so dropping -f would trade
+# one hole for another. ONNX-ENG-03, the BASE-01 case that pins this same run, gates on -s.
+#
+# It buys one byte, not a valid model: a 1-byte junk seed still exits 0 through both arms
+# with the same log shape, and seeds/onnx holds exactly such a leftover today. That residue
+# is R82; this guard closes the zero-byte and directory cases only.
+[[ -f "$SEED" && -s "$SEED" ]] || fail "seed missing, empty or not a regular file: $SEED"
 mkdir -p "$OUT_DIR"
 
 # The instrumented ONNX harnesses write one .profraw per process; without a contained

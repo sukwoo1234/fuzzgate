@@ -67,7 +67,11 @@ trap cleanup EXIT
 log "generating the seeds this check depends on"
 SEED_ROOT="$SEED_ROOT" bash "$PROJECT_ROOT/scripts/gen_gguf_malformed_seeds.sh" \
   >"$OUT_DIR/seeds.log" 2>&1 || fail "seed generator failed; see $OUT_DIR/seeds.log"
-[[ -f "$SEED" ]] || fail "seed not found: $SEED"
+# -s, not -f: the clean-seed arm below asserts that the libFuzzer target exits 0, which
+# an empty input satisfies without reaching the parser - a vacuous pass on the arm this
+# check exists to prove. Matches check_onnx_native_engines.sh and ONNX-ENG-03. It buys one
+# byte, not a valid model - a 1-byte junk seed is still vacuous here (R82).
+[[ -f "$SEED" && -s "$SEED" ]] || fail "seed missing, empty or not a regular file: $SEED"
 [[ -f "$POC"  ]] || fail "poc not found: $POC"
 
 # Build only when the harness is missing, the shape check_safetensors_native_engines.sh
