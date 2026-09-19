@@ -88,7 +88,10 @@ snapshot() {
   # would be a side effect this gate exists to forbid, and an empty inventory is the
   # truthful snapshot of that tree. No verdict rests on it: run_isolated skips before it
   # ever probes when the binaries it needs are missing, so "clean" is unreachable here.
-  # Without this, find failed and pipefail killed the gate mid-run. R91.
+  # Without this the gate does not die: find fails inside $(probe_isolated ...), whose
+  # status is its last command's, so errexit never sees it; the guard removes find(1) noise
+  # an operator cannot read. Measured 2026-09-19, guard deleted, harnesses/ absent: rc=0,
+  # pass=3 fail=0 skip=3, four find: lines; the pre-fix shape died at the cp -a below. R98.
   if [[ ! -d "$HARNESS_DIR" ]]; then
     : >"$out"
     return
