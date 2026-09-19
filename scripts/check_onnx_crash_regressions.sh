@@ -2,6 +2,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
+TOOL_BIN="${TOOL_BIN:-$PROJECT_ROOT/target/debug/tool}"
 DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/onnx-crash-regressions}"
 REQUIRE_POCS=0
 
@@ -95,7 +96,7 @@ check_one() {
   marker="$(mktemp "$DATA_DIR/.triage-before-${label}.XXXXXX")"
 
   log "$label triage start"
-  if ! "$PROJECT_ROOT/target/debug/tool" --data-dir "$DATA_DIR" triage \
+  if ! "$TOOL_BIN" --data-dir "$DATA_DIR" triage \
     --target onnx \
     --input "$path" \
     --repro-retries 1 \
@@ -126,9 +127,20 @@ check_one() {
   log "$label ok: verdict=$verdict signal=$signal summary=$summary"
 }
 
-if [[ ! -x "$PROJECT_ROOT/target/debug/tool" ]]; then
-  log "target/debug/tool missing; building debug tool"
-  cargo build --offline >/tmp/onnx-crash-regression-cargo-build.log
+# R95/R92: not a build. This gate drives the real tool, so without the binary it observes
+# nothing, and the shape for that is a refusal - check_aflpp_asan_env.sh:12-15, copied word
+# for word so an operator reads the same sentence from every gate that needs the tool. It ran
+# `cargo build --offline` here instead, which is R92's mechanism: one gate manufacturing
+# another gate's precondition, after which a suite verdict depends on run order. Measured
+# 2026-09-19 on a tree extracted with `git archive HEAD`: check_aflpp_asan_env.sh rc=1, then
+# this gate, then check_aflpp_asan_env.sh rc=0 - the same gate on the same tree, passing
+# because this one had built its binary for it. The build also installs at target/debug/tool
+# and never at TOOL_BIN, so under a redirected TOOL_BIN it could not produce the file the
+# check below is looking for.
+if [[ ! -x "$TOOL_BIN" ]]; then
+  printf '[onnx-crash-regression] fail: tool binary not executable: %s\n' "$TOOL_BIN" >&2
+  printf '[onnx-crash-regression] build it with `cargo build` or point TOOL_BIN at one; this gate cannot run\n' >&2
+  exit 1
 fi
 
 ran=0

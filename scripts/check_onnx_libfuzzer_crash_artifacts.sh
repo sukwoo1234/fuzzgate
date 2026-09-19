@@ -114,9 +114,18 @@ case "$poc_real" in
     ;;
 esac
 
+# R95/R92: not a build, for the same reason the PoC case above is not a silent skip - a check
+# that had to manufacture its own precondition observed a tree it made, not the tree it was
+# given. `cargo build --offline` here is R92's mechanism: measured 2026-09-19 on a tree
+# extracted with `git archive HEAD`, check_aflpp_asan_env.sh ends rc=1 before its sibling
+# ONNX gate runs and rc=0 after, on the same tree. It cannot even work for a caller who
+# redirected TOOL_BIN, since the build installs at target/debug/tool. Unlike the PoC refusal
+# above, this one does say "this gate cannot run": that phrase is
+# check_gate_tool_precondition.sh's tell for a refusal about TOOL_BIN, and this is one.
 if [[ ! -x "$TOOL_BIN" ]]; then
-  log "$TOOL_BIN missing; building debug tool"
-  cargo build --offline >/tmp/onnx-libfuzzer-artifact-cargo-build.log
+  printf '[onnx-libfuzzer-artifact-check] fail: tool binary not executable: %s\n' "$TOOL_BIN" >&2
+  printf '[onnx-libfuzzer-artifact-check] build it with `cargo build` or point TOOL_BIN at one; this gate cannot run\n' >&2
+  exit 1
 fi
 
 log "build native libFuzzer harness"

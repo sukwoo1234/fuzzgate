@@ -26,6 +26,10 @@
 #      NOT appear, so the guard cannot degrade into refusing every run.
 #   5. negative controls - the verdict function must reject a stub that tracebacks, reject
 #      one that prints a passed-summary, and accept one that refuses in the right shape.
+#   6. structural - the subject's own text must route the binary through TOOL_BIN and must
+#      not run `cargo build`. Assertion 1 can be unreachable, so text is the only witness.
+#   7. coverage - the gates that drive the tool WITHOUT naming the binary are counted and
+#      held against a record, so a new one cannot join the suite unnoticed.
 #
 # R96: assertion 1 has an escape hatch - "this gate refused earlier, for a precondition that
 # is not TOOL_BIN" - and that hatch used to be granted on a skip line alone, with no
@@ -43,6 +47,34 @@
 # hatch. /bin/true is executable without being a working tool, so an identical outcome shows
 # only that the absent path did not change the result - not that TOOL_BIN was never read.
 #
+# R95: discovery by one spelling is not discovery. The scan below used to match the literal
+# default assignment `TOOL_BIN:-$PROJECT_ROOT/target/debug/tool`, and e2b8a82's body claimed
+# from that that "a new gate cannot join the suite without the contract applying". Measured
+# 2026-09-19: that spelling matched 3 of the suite's 35 gates, while
+# check_onnx_crash_regressions.sh drove the very same binary by writing its path out inline,
+# with no TOOL_BIN variable at all, and so was not a subject. Discovery is now by what a gate
+# that drives the tool has to name - the path - which finds 4, with a floor under the count
+# because without one `subjects=3 ... fail=0` still exits 0: the failure this gate exists to
+# catch, happening to this gate. It is excluded from its own scan by name, since it names the
+# path in the pattern itself - executable code, not prose.
+#
+# Assertion 6 exists because assertion 1 can be unreachable, and both ways of it were measured
+# on 2026-09-19. check_onnx_libfuzzer_crash_artifacts.sh refuses over a missing PoC before it
+# reaches TOOL_BIN, which this gate scores as a skip. And both ONNX gates ran
+# `cargo build --offline` when the binary was missing, so there was no absent binary left to
+# refuse over - the same self-build that is R92's mechanism, one gate manufacturing another
+# gate's precondition until suite verdicts depend on run order. `cargo build` installs at
+# target/debug/tool and never at TOOL_BIN, so under a redirected TOOL_BIN it could not even
+# produce the thing it was standing in for.
+#
+# Assertion 7 is a counted class and deliberately not a skip: a gate started with
+# `cargo run --offline --` builds and runs the tool without ever naming the binary, so no path
+# scan finds it and this contract cannot reach it. check_ui_routes.sh is its one member -
+# measured 2026-09-19: subjects=4 uncovered=1. A count on its own would let a swap balance
+# out, one gate leaving the class as another joins, so its members are held against a record:
+# which gates this contract cannot reach has to be a decision someone made, not a number
+# nobody looked at.
+#
 # Writes only under its own mktemp directory. The gates it drives write their own evidence
 # under TMPDIR, which is pointed into that directory.
 set -euo pipefail
@@ -56,9 +88,34 @@ ok()   { PASS=$((PASS + 1)); printf '  ok   %s\n' "$*"; }
 bad()  { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$*"; }
 skip() { SKIP=$((SKIP + 1)); printf '  skip %s\n' "$*"; }
 
-# The gates that take TOOL_BIN, discovered rather than listed: a new one must not be able to
-# join the suite without this contract applying to it.
-mapfile -t GATES < <(grep -l 'TOOL_BIN:-\$PROJECT_ROOT/target/debug/tool' "$PROJECT_ROOT"/scripts/check_*.sh | sort)
+# code_hits <file> <pattern> - matching lines as `<lineno>:<text>`, comment lines dropped, so
+# a path or a command named in a rationale header is not read as something the gate runs.
+code_hits() { grep -n -- "$2" "$1" | grep -vE '^[0-9]+:[[:space:]]*#' || true; }
+
+# The gates that drive the tool, discovered rather than listed: a new one must not be able to
+# join the suite without this contract applying to it. By the path and not by the spelling of
+# the TOOL_BIN default - see R95 above - and without this gate, which names the path in the
+# pattern on the next line.
+mapfile -t GATES < <(grep -l 'target/debug/tool' "$PROJECT_ROOT"/scripts/check_*.sh \
+                       | grep -v '/check_gate_tool_precondition\.sh$' | sort)
+
+# The gates that drive the tool without naming the binary: `cargo run` compiles and runs it,
+# so the scan above cannot see them and TOOL_BIN cannot redirect them. Excluded the same two
+# ways as above - this gate by name, because the pattern below is executable code in it
+# (measured 2026-09-19: without that, uncovered=2, this gate sitting in the bucket next to
+# check_ui_routes.sh), and
+# comment lines everywhere, so prose about `cargo run` is not read as running it.
+mapfile -t UNCOVERED < <(
+  for g in "$PROJECT_ROOT"/scripts/check_*.sh; do
+    [[ "$(basename "$g")" == 'check_gate_tool_precondition.sh' ]] && continue
+    if [[ -n "$(code_hits "$g" 'cargo run')" ]]; then basename "$g"; fi
+  done | sort
+)
+UNCOVERED_ON_RECORD=(check_ui_routes.sh)
+
+# The subject count the floor below is held to, kept next to the record above it so the
+# failure message cannot drift from the test.
+SUBJECTS_ON_RECORD=4
 
 # refusal_verdict <rc> <output> <absent-path> <rc-with-executable-tool-bin> <that-output>
 # Five words the caller decides about: died (a traceback), invented (per-case failures or a
@@ -101,8 +158,19 @@ run_gate() { # run_gate <gate> <tool-bin>
 
 ABSENT="$WORK/no-such-tool-binary"
 
-if [[ "${#GATES[@]}" -eq 0 ]]; then
-  bad 'no gate takes TOOL_BIN; either the scan broke or the contract has no subjects'
+# A floor, not just an emptiness test: R95 was a scan that found 3 where 4 drive the tool,
+# and `subjects=3 ... fail=0` exits 0. Raise it when a subject is added on purpose.
+if [[ "${#GATES[@]}" -lt "$SUBJECTS_ON_RECORD" ]]; then
+  bad "only ${#GATES[@]} gate(s) name the tool binary, fewer than the $SUBJECTS_ON_RECORD on record; either the scan broke or a gate stopped naming what it drives"
+fi
+
+# Assertion 7, held against a record of members and not a count, so that a swap - one gate
+# leaving the class as another joins - cannot balance out. See R95 in the header for why this
+# is scored and not skipped.
+if [[ "${UNCOVERED[*]:-}" == "${UNCOVERED_ON_RECORD[*]:-}" ]]; then
+  ok "the ${#UNCOVERED[@]} gate(s) that drive the tool without naming the binary are the ones on record (${UNCOVERED[*]:-none})"
+else
+  bad "the set of gates that drive the tool without naming the binary changed: found '${UNCOVERED[*]:-none}', on record '${UNCOVERED_ON_RECORD[*]:-none}'. This contract cannot reach them, so which ones exist has to be a decision someone made, not a number nobody looked at"
 fi
 
 for gate in "${GATES[@]}"; do
@@ -129,7 +197,7 @@ for gate in "${GATES[@]}"; do
     preempted*)
               skip "$name refuses earlier for another missing precondition, so this contract could not be exercised ($verdict)"
               grep -m1 -E '^\[[a-z0-9-]+\] skip: ' <<<"$out" | sed 's/^/       /' ;;
-    *)        bad "$name exited non-zero without naming the missing binary ($verdict)"
+    *)        bad "$name did not refuse readably over the absent tool binary ($verdict)"
               tail -2 <<<"$out" | sed 's/^/       /' ;;
   esac
 
@@ -141,6 +209,30 @@ for gate in "${GATES[@]}"; do
     bad "$name refuses even when TOOL_BIN is executable; the guard is not about the binary"
   else
     ok "$name does not refuse when TOOL_BIN is executable"
+  fi
+
+  # Assertion 6, on the text, because the two arms above can both be unreachable - see R95 in
+  # the header. Every mention of the path outside the TOOL_BIN default is a use the caller
+  # cannot redirect, and a missing default is no routing at all.
+  stray="$(code_hits "$gate" 'target/debug/tool' | grep -v 'TOOL_BIN:-' || true)"
+  if [[ -z "$stray" && -n "$(code_hits "$gate" 'TOOL_BIN:-.*target/debug/tool')" ]]; then
+    ok "$name reaches the tool binary only through TOOL_BIN"
+  else
+    bad "$name does not route the tool binary through TOOL_BIN, so pointing TOOL_BIN elsewhere does not change what it runs"
+    printf '%s\n' "${stray:-(no TOOL_BIN default)}" | head -2 | sed 's/^/       /'
+  fi
+
+  # Anchored at the start of the line, because `cargo build` also appears inside the refusal
+  # message the contract asks for ("build it with `cargo build` or point TOOL_BIN at one") -
+  # measured 2026-09-19: unanchored, this arm failed check_aflpp_asan_env.sh and
+  # check_run_seed_provenance.sh on their own refusal text. A build tucked in after a `;` on a
+  # line that starts with something else would slip past; both real ones were plain statements.
+  builds="$(code_hits "$gate" '^[[:space:]]*cargo build')"
+  if [[ -z "$builds" ]]; then
+    ok "$name does not build the binary whose absence it has to refuse over"
+  else
+    bad "$name builds the tool itself, so it never has an absent binary to refuse over - and the build installs at target/debug/tool, never at TOOL_BIN"
+    printf '%s\n' "$builds" | head -2 | sed 's/^/       /'
   fi
 done
 
@@ -179,5 +271,8 @@ check_control 'a skip that only appears when the tool binary is absent' \
 printf '[stub] skip: something\n[stub] fail: tool binary not executable: %s\n[stub] this gate cannot run\n' "$ABSENT" >"$WORK/both.out"
 check_control 'a refusal that also logged a skip' "$WORK/both.out"    1 refused
 
-printf '[gate-tool-precondition] pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
+# subjects= and uncovered= are on the ledger line because that line is what the runbook asks
+# an operator to copy back (`tail -1`), and R95 was a subject count nobody could see.
+printf '[gate-tool-precondition] pass=%d fail=%d skip=%d subjects=%d uncovered=%d\n' \
+  "$PASS" "$FAIL" "$SKIP" "${#GATES[@]}" "${#UNCOVERED[@]}"
 [[ "$FAIL" -eq 0 ]]
