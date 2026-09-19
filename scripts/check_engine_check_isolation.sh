@@ -41,8 +41,32 @@
 # harnesses/ - so the earlier note that a freshly prepared host would crash here is wrong.
 # R91.
 #
-# Writes only under its own mktemp directory plus the checkers' own OUT_DIR, which is
-# pointed into that mktemp directory.
+# Writes only under its own mktemp directory, and proves it rather than claiming it. Every
+# probe is bracketed by a stamp of the repository, reported as its own arm: a checker can
+# leave harnesses/ untouched and still write elsewhere in the tree, so one verdict cannot
+# carry both. It had to become an assertion because the claim was false. OUT_DIR was the
+# only write target this gate redirected, so check_gguf_native_engines.sh:5 kept its
+# default SEED_ROOT and :68 handed it to the seed generator, which rewrote the repository's
+# own gguf seeds on every probe. Measured 2026-09-19 in a sandbox checkout with seeds and
+# harnesses copied in: one run moved all four gguf seeds from mtime 1789811098 to
+# 1789811118, sha256 unchanged, while the gate reported pass=10 fail=0 skip=0 - a gate
+# whose entire signal is mtime (see above), moving mtimes in the tree it guards.
+#
+# The children are deliberately not changed: a direct run of check_gguf_native_engines.sh
+# is supposed to produce the repository's seeds, so moving that default would break an
+# operational checker to fix a gate. The consequence stands - running the check suite still
+# has to happen in a copy of the tree.
+#
+# Stamp scope is $PROJECT_ROOT's top level by name and type only, plus a full mtime/size
+# listing of seeds/ and data/native-engine-checks - the two subtrees these checkers write
+# into. Top level is name+type because TMPDIR may sit inside the tree and a mktemp there
+# moves a directory mtime without anything being written to the repository. All of data/
+# was rejected three times over. Measured 2026-09-19 against the real repository: this
+# scope is 154 entries in under 0.02s per stamp, all of data/ is 505594 entries and took
+# between 0.67s and 9.1s across runs, cache- and load-dependent; two run directories under
+# it are unreadable, so find would fail and pipefail would kill the gate; and data/ is
+# campaign output that moves for reasons of its own, so it would fail runs that did nothing
+# wrong. Do not "tighten" it. R97.
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}"
@@ -73,29 +97,66 @@ snapshot() {
     | awk '{print $1, $2, $3}' | sort >"$out"
 }
 
+# stamp_repo <out>
+# Name+type at the top level, mtime and size below it, for the reasons in the header. An
+# absent subtree is stamped as a line of its own rather than skipped: seeds/ need not exist
+# yet, and skipping it would let a probe that creates it look unchanged.
+stamp_repo() {
+  local out="$1" d
+  {
+    find "$PROJECT_ROOT" -mindepth 1 -maxdepth 1 -printf '%y %p\n' | sort
+    for d in seeds data/native-engine-checks; do
+      if [[ -e "$PROJECT_ROOT/$d" ]]; then
+        find "$PROJECT_ROOT/$d" -printf '%y %p %T@ %s\n' | sort
+      else
+        printf 'absent %s\n' "$PROJECT_ROOT/$d"
+      fi
+    done
+  } >"$out"
+}
+
 # probe_isolated <script> <label> <completion-pattern>
 # Runs one checker against a snapshot of harnesses/ and says what happened, in four
 # words the caller decides about: notrun (non-zero exit), noreport (exited 0 without its
 # own completion line, so it may have stopped early with the status swallowed), rebuilt,
-# or clean. Separated from the verdict so the negative controls below can drive the same
-# probe with a checker that is known not to run.
+# or clean, plus repo=clean|dirty for the rest of the tree. Separated from the verdict so
+# the negative controls below can drive the same probe with a checker that is known not to
+# run.
 probe_isolated() {
   local script="$1" label="$2" done_re="$3" rc=0
+  # Every target these checkers default into the repository, pointed into this gate's
+  # scratch alongside the OUT_DIR it always redirected: SEED_ROOT for the gguf checker's
+  # seed generator, MAL_DIR and VALID_DIR for the safetensors one's, AFLPP_CHECK_DIR for
+  # its AFL++ arm. One list for every probe, so a checker that later grows one of these is
+  # contained by default; the onnx checker needs none of them, which is a claim the stamp
+  # below verifies rather than assumes. Read paths stay on the repository on purpose -
+  # FUZZER and REPLAY are the harnesses this probe observes, SEED_DIR is the real corpus.
+  # check_engine_check_scratch.sh:91-93 and check_engine_check_seed_validity.sh:161 already
+  # drive these children this way, so this is the odd-one-out shape R45 left, not a new
+  # contract. R97.
+  local redirect=(OUT_DIR="$WORK/$label-out")
+  redirect+=(SEED_ROOT="$WORK/$label-seeds" MAL_DIR="$WORK/$label-mal" VALID_DIR="$WORK/$label-valid" AFLPP_CHECK_DIR="$WORK/$label-aflpp")
   snapshot "$WORK/$label.before"
-  OUT_DIR="$WORK/$label-out" timeout 600 bash "$script" >"$WORK/$label.log" 2>&1 || rc=$?
+  stamp_repo "$WORK/$label.repo-before"
+  env "${redirect[@]}" timeout 600 bash "$script" >"$WORK/$label.log" 2>&1 || rc=$?
+  stamp_repo "$WORK/$label.repo-after"
   snapshot "$WORK/$label.after"
+  local repo=clean
+  if ! diff -q "$WORK/$label.repo-before" "$WORK/$label.repo-after" >/dev/null; then
+    repo=dirty
+  fi
   if [[ "$rc" -ne 0 ]]; then
-    printf 'notrun rc=%s' "$rc"
+    printf 'notrun rc=%s repo=%s' "$rc" "$repo"
     return
   fi
   if ! grep -qE "$done_re" "$WORK/$label.log"; then
-    printf 'noreport rc=0'
+    printf 'noreport rc=0 repo=%s' "$repo"
     return
   fi
   if diff -q "$WORK/$label.before" "$WORK/$label.after" >/dev/null; then
-    printf 'clean rc=0'
+    printf 'clean rc=0 repo=%s' "$repo"
   else
-    printf 'rebuilt rc=0'
+    printf 'rebuilt rc=0 repo=%s' "$repo"
   fi
 }
 
@@ -132,6 +193,18 @@ run_isolated() { # run_isolated <checker> <label> <completion-pattern> <required
     noreport*)
       bad "$label exited 0 without printing its completion line ($verdict); it may have stopped early, and an untouched harnesses/ would then mean nothing"
       tail -3 "$WORK/$label.log" | sed 's/^/       /' ;;
+  esac
+
+  # Its own arm, because the two are independent: the gguf checker left harnesses/ untouched
+  # and rewrote seeds/ in the same run, and folding that into the verdict above would have
+  # hidden it behind a "clean". R97.
+  case "$verdict" in
+    *repo=clean)
+      ok "$label left the repository outside harnesses/ untouched ($verdict)" ;;
+    *)
+      bad "$label wrote into the repository outside harnesses/ ($verdict)"
+      { diff "$WORK/$label.repo-before" "$WORK/$label.repo-after" || true; } \
+        | sed -n '1,8p' | sed 's/^/       /' ;;
   esac
 }
 
@@ -239,6 +312,36 @@ if [[ -z "${ENGINE_CHECK_ISOLATION_SELFTEST:-}" ]]; then
     ok "negative control: the pre-fix shape still dies without a verdict line (rc=$pre_rc)"
   else
     bad "negative control: the pre-fix shape survived (rc=$pre_rc); this arm proves nothing"
+  fi
+
+  # Opposite polarity for the repository arm: a copy of this script with the redirect line
+  # removed is the pre-fix shape - OUT_DIR redirected, everything else defaulting into the
+  # tree - and it must be caught. If the line is ever renamed the sed removes nothing, the
+  # copy behaves like this script, and this arm fails rather than quietly passing.
+  #
+  # It needs a root of its own: the two above have nothing built, so every checker skips and
+  # no probe ever runs. Two stub binaries under harnesses/libfuzzer are what it takes to
+  # make the gguf checker reach its seed generator, which is the write this arm is about.
+  # They exit 1, so the harnesses/ verdict there reads notrun - which is the point of
+  # reporting the two arms separately, and only the repository arm is read here. TMPDIR
+  # points into this gate's scratch because that failing child preserves its own mktemp dir
+  # on a non-zero exit, the same reason check_engine_check_seed_validity.sh:140-142 gives.
+  # R97.
+  CTLROOT="$WORK/selftest-redirect"
+  mkdir -p "$CTLROOT/harnesses/libfuzzer" "$WORK/ctl-tmp"
+  ln -s "$PROJECT_ROOT/scripts" "$CTLROOT/scripts"
+  for stub in gguf_loader_fuzzer gguf_loader_replay; do
+    printf '#!/usr/bin/env bash\nexit 1\n' >"$CTLROOT/harnesses/libfuzzer/$stub"
+    chmod +x "$CTLROOT/harnesses/libfuzzer/$stub"
+  done
+  sed '/^  redirect+=(SEED_ROOT=/d' "${BASH_SOURCE[0]}" >"$WORK/noredirect.sh"
+  ENGINE_CHECK_ISOLATION_SELFTEST=1 PROJECT_ROOT="$CTLROOT" TMPDIR="$WORK/ctl-tmp" \
+    timeout 600 bash "$WORK/noredirect.sh" >"$WORK/noredirect.log" 2>&1 || true
+  if grep -q '^  FAIL gguf wrote into the repository outside harnesses/' "$WORK/noredirect.log"; then
+    ok 'negative control: the pre-fix shape is caught writing into the tree it guards'
+  else
+    bad 'negative control: the pre-fix shape was not caught writing into the tree; the repository arm proves nothing'
+    tail -3 "$WORK/noredirect.log" | sed 's/^/       /'
   fi
 fi
 
