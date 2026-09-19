@@ -23,8 +23,10 @@ Checks:
   - summary verdict is reproduced
   - signal matches SIGFPE/SIGSEGV respectively
 
-Without --require-pocs, missing env vars skip the corresponding private regression.
-With --require-pocs, missing env vars or failed checks are hard failures.
+Without --require-pocs, a missing env var leaves the corresponding private regression unrun
+and exits non-zero; set ALLOW_SKIPPED_CASES=1 only if you accept that unverified run.
+With --require-pocs, missing env vars or failed checks are hard failures that
+ALLOW_SKIPPED_CASES=1 does not excuse.
 EOF
 }
 
@@ -144,6 +146,8 @@ if [[ ! -x "$TOOL_BIN" ]]; then
 fi
 
 ran=0
+SKIPPED=""
+note_skip() { SKIPPED="${SKIPPED:+$SKIPPED|}$1"; }
 
 if [[ -n "${ONNX_SIGFPE_POC:-}" ]]; then
   check_one "sigfpe" "$ONNX_SIGFPE_POC" "$SIGFPE_SHA256" "SIGFPE"
@@ -152,6 +156,7 @@ elif [[ "$REQUIRE_POCS" -eq 1 ]]; then
   fail "ONNX_SIGFPE_POC is required"
 else
   log "skip sigfpe: ONNX_SIGFPE_POC not set"
+  note_skip "sigfpe: the SIGFPE regression (ONNX_SIGFPE_POC not set)"
 fi
 
 if [[ -n "${ONNX_SIGSEGV_POC:-}" ]]; then
@@ -161,10 +166,53 @@ elif [[ "$REQUIRE_POCS" -eq 1 ]]; then
   fail "ONNX_SIGSEGV_POC is required"
 else
   log "skip sigsegv: ONNX_SIGSEGV_POC not set"
+  note_skip "sigsegv: the SIGSEGV regression (ONNX_SIGSEGV_POC not set)"
 fi
 
 if [[ "$ran" -eq 0 ]]; then
   log "no private PoCs checked"
 else
   log "done: checked $ran private ONNX crash regression(s)"
+fi
+
+# R114: a case that did not run is not a case that passed. Both PoCs are deliberately not
+# committed (see usage above), so a host that has not been handed them takes both skip
+# branches - and that printed two skip lines, "no private PoCs checked", and exited 0, which
+# put two unrun ONNX crash regressions into the suite's rc-only tally. Measured 2026-09-19 on
+# a tree extracted with `git archive HEAD` with the tool binary in place and no PoC env vars:
+# three lines, rc=0, and ALLOW_SKIPPED_CASES=1 changed nothing because nothing read it. Same
+# defect and same prescription as check_onnx_libfuzzer_crash_artifacts.sh:70-94 (R86, commit
+# 4cbd996). The register is R42's, check_engine_mode_labels.sh:627-634, reused down to the
+# wording so that the ledger reader written for that gate
+# (check_engine_mode_skip_accounting.sh:107) parses this one unchanged.
+#
+# Per case, not "none of them ran": a host with only the SIGSEGV PoC printed "done: checked 1
+# private ONNX crash regression(s)" and exited 0 with the SIGFPE regression unrun, and one of
+# two is precisely the shortfall nobody can see in a suite tally afterwards. --require-pocs
+# refuses above, before the ledger is consulted, so the strict flag stays strictly stricter.
+#
+# Two constraints on the shape, both measured rather than assumed:
+#   - the refusal must avoid the phrase "this gate cannot run". check_gate_tool_precondition.sh
+#     greps for it (:143, :207) as the tell of a refusal about TOOL_BIN, and the run it greps -
+#     TOOL_BIN executable, PoC env unset - lands here. Worded with it, that gate reports
+#     pass=28 fail=1 skip=1: a failure about the wrong contract.
+#   - the TOOL_BIN refusal above stays FIRST. The sibling reaches its PoC branch before its
+#     TOOL_BIN check, which is why that gate scores it `preempted rc=1` and takes it out of the
+#     score. Moving this one up the same way does NOT buy that hatch: it is granted only to a
+#     line matching `^\[label\] skip: `, and these skips are spelled "skip sigfpe:" /
+#     "skip sigsegv:", so the run reads as `silent rc=1` - refused without naming the missing
+#     binary - measured pass=28 fail=1 skip=1 against pass=29 fail=0 skip=1 with the order kept.
+#     Only the kept order leaves the TOOL_BIN arm aecfd7b added actually exercised on this gate.
+#
+# What pins it afterwards: nothing in the suite yet. The sibling's refusal is held by
+# check_gate_tool_precondition.sh, which scores a skip line that exits 0 as `vacuous rc=0`;
+# that arm cannot reach this branch, since the TOOL_BIN refusal answers its probe first. R119
+# is where that class gets a gate; until then this contract is held by its text and this note.
+if [[ -n "$SKIPPED" ]]; then
+  echo "[onnx-crash-regression] these cases did NOT run:" >&2
+  printf '%s\n' "$SKIPPED" | tr '|' '\n' | sed '/^$/d;s/^/  - /' >&2
+  if [[ "${ALLOW_SKIPPED_CASES:-0}" != "1" ]]; then
+    fail "some cases were skipped; set ALLOW_SKIPPED_CASES=1 only if you accept an unverified run"
+  fi
+  echo "[onnx-crash-regression] WARN: continuing with skipped cases (ALLOW_SKIPPED_CASES=1)" >&2
 fi
