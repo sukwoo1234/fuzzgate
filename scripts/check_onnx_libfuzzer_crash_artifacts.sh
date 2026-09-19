@@ -24,8 +24,10 @@ Checks:
   - tool run ingests backend artifacts
   - automatic backend triage reproduces at least one crash
 
-Without --require-poc, a missing PoC env var skips the private artifact check.
-With --require-poc, a missing PoC env var or failed check is a hard failure.
+Without --require-poc, a missing PoC env var leaves the private artifact check unrun and
+exits non-zero; set ALLOW_SKIPPED_CASES=1 only if you accept that unverified run.
+With --require-poc, a missing PoC env var or failed check is a hard failure that
+ALLOW_SKIPPED_CASES=1 does not excuse.
 EOF
 }
 
@@ -65,11 +67,30 @@ latest_status() {
     | tail -n 1
 }
 
+# R86: a check that observed nothing must not report success. The PoC is deliberately not
+# committed (see usage above), and seeds/ and harnesses/ are gitignored too, so a freshly
+# prepared fuzzing host is exactly the host that takes this branch - `exit 0` here put the
+# private artifact case into the suite's rc-only tally without observing anything. Measured
+# 2026-09-19 on a tree extracted with `git archive HEAD`: no PoC env var, one skip line,
+# rc=0, and check_gate_tool_precondition.sh scored that as a skip rather than a defect. The
+# skip line stays - the operator still needs to read which precondition is missing - and the
+# exit does not. ALLOW_SKIPPED_CASES=1 is the documented opt-out, the same variable and the
+# same register as check_engine_mode_labels.sh:630 (R42); --require-poc refuses above,
+# before the opt-out is ever consulted, so the strict flag stays strictly stricter.
+#
+# The refusal deliberately avoids the phrase "this gate cannot run", which
+# check_gate_tool_precondition.sh:140 greps for to catch a gate that refuses about TOOL_BIN
+# on every run. Measured 2026-09-19: worded with that phrase, this refusal makes that gate
+# report pass=13 fail=1 skip=1 - a failure about the wrong contract.
 if [[ -z "$CRASH_POC" ]]; then
   if [[ "$REQUIRE_POC" -eq 1 ]]; then
     fail "ONNX_SIGSEGV_POC or ONNX_CRASH_POC is required"
   fi
   log "skip: ONNX_SIGSEGV_POC/ONNX_CRASH_POC not set"
+  if [[ "${ALLOW_SKIPPED_CASES:-0}" != "1" ]]; then
+    fail "the private artifact case (known-crash PoC ingest and backend triage) did not run; set ALLOW_SKIPPED_CASES=1 only if you accept an unverified run"
+  fi
+  echo "[onnx-libfuzzer-artifact-check] WARN: continuing with skipped cases (ALLOW_SKIPPED_CASES=1)" >&2
   exit 0
 fi
 
