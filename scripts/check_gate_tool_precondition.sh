@@ -53,7 +53,7 @@
 # 2026-09-19: that spelling matched 3 of the suite's 35 gates, while
 # check_onnx_crash_regressions.sh drove the very same binary by writing its path out inline,
 # with no TOOL_BIN variable at all, and so was not a subject. Discovery is now by what a gate
-# that drives the tool has to name - the path - which finds 4, with a floor under the count
+# that drives the tool has to name - the path - which finds 5, with a floor under the count
 # because without one `subjects=3 ... fail=0` still exits 0: the failure this gate exists to
 # catch, happening to this gate. It is excluded from its own scan by name, since it names the
 # path in the pattern itself - executable code, not prose.
@@ -69,11 +69,11 @@
 #
 # Assertion 7 is a counted class and deliberately not a skip: a gate started with
 # `cargo run --offline --` builds and runs the tool without ever naming the binary, so no path
-# scan finds it and this contract cannot reach it. check_ui_routes.sh is its one member -
-# measured 2026-09-19: subjects=4 uncovered=1. A count on its own would let a swap balance
-# out, one gate leaving the class as another joins, so its members are held against a record:
-# which gates this contract cannot reach has to be a decision someone made, not a number
-# nobody looked at.
+# scan finds it and this contract cannot reach it. check_ui_routes.sh was its one member until
+# R95's second half gave it a TOOL_BIN default, so the class is now empty - measured
+# 2026-09-19: subjects=5 uncovered=0. Empty is still a decision that needs recording: a bucket
+# with no expected value is how the next such gate would join the suite silently, which is R95
+# again, so its members are held against a record instead.
 #
 # Writes only under its own mktemp directory. The gates it drives write their own evidence
 # under TMPDIR, which is pointed into that directory.
@@ -102,8 +102,7 @@ mapfile -t GATES < <(grep -l 'target/debug/tool' "$PROJECT_ROOT"/scripts/check_*
 # The gates that drive the tool without naming the binary: `cargo run` compiles and runs it,
 # so the scan above cannot see them and TOOL_BIN cannot redirect them. Excluded the same two
 # ways as above - this gate by name, because the pattern below is executable code in it
-# (measured 2026-09-19: without that, uncovered=2, this gate sitting in the bucket next to
-# check_ui_routes.sh), and
+# (measured 2026-09-19: without that, uncovered=1 and this gate is in its own bucket), and
 # comment lines everywhere, so prose about `cargo run` is not read as running it.
 mapfile -t UNCOVERED < <(
   for g in "$PROJECT_ROOT"/scripts/check_*.sh; do
@@ -111,11 +110,11 @@ mapfile -t UNCOVERED < <(
     if [[ -n "$(code_hits "$g" 'cargo run')" ]]; then basename "$g"; fi
   done | sort
 )
-UNCOVERED_ON_RECORD=(check_ui_routes.sh)
+UNCOVERED_ON_RECORD=()
 
 # The subject count the floor below is held to, kept next to the record above it so the
 # failure message cannot drift from the test.
-SUBJECTS_ON_RECORD=4
+SUBJECTS_ON_RECORD=5
 
 # refusal_verdict <rc> <output> <absent-path> <rc-with-executable-tool-bin> <that-output>
 # Five words the caller decides about: died (a traceback), invented (per-case failures or a

@@ -2,6 +2,29 @@
 set -euo pipefail
 
 WORKDIR="${WORKDIR:-$PWD}"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}"
+TOOL_BIN="${TOOL_BIN:-$PROJECT_ROOT/target/debug/tool}"
+# R92/R94: the server below used to be started with `cargo run --offline --`, which reads no
+# TOOL_BIN and builds the binary inside the gate. Both consequences were measured 2026-09-19
+# on a tree extracted with `git archive HEAD`, with TOOL_BIN pointed at a path that does not
+# exist. First pass: exit 1 after 5.2s with the build still at "Compiling tool v0.1.0",
+# because the healthz wait below allows 25 x 0.2s = 5s - the verdict was the build cache's,
+# not the routes' (R94). Second pass over that same tree: rc=0, and it left behind a
+# target/debug/tool the tree had never had - one gate manufacturing the precondition four
+# other gates refuse over, which is R92's mechanism. Driving a binary the caller names
+# removes both: nothing compiles inside the wait, and nothing is installed.
+# The cost is the one the other four subjects already pay - a stale target/debug/tool is
+# driven as it is, so building it is the operator's step. That makes the placeholder check
+# below stricter rather than weaker: dashboard_html_template() reads templates/dashboard.html
+# off disk at request time, so an unrebuilt binary now also reads as the drift it names.
+# Not a skip: this gate drives the real tool, so without the binary it observes nothing, and
+# a gate that reports anything other than a refusal when it observed nothing is the failure
+# mode this suite exists to stop - the wording is check_aflpp_asan_env.sh:12-15's. R86.
+if [[ ! -x "$TOOL_BIN" ]]; then
+  printf '[ui-check] fail: tool binary not executable: %s\n' "$TOOL_BIN" >&2
+  printf '[ui-check] build it with `cargo build` or point TOOL_BIN at one; this gate cannot run\n' >&2
+  exit 1
+fi
 
 # R5: this check used to run against the operator's real ./data on the campaign
 # port, and it calls state-writing routes. It also overwrote the per-user token
@@ -104,7 +127,7 @@ printf '{"report_id": "report-1"}\n' > "$DATA_DIR/reports/report-1/meta.json"
 printf '{"coverage_id": "coverage-1", "coverage_kind": "proxy"}\n' \
   > "$DATA_DIR/coverage/coverage-1/summary.json"
 
-cargo run --offline -- --data-dir "$DATA_DIR" --seeds-dir "$SEEDS_DIR" \
+"$TOOL_BIN" --data-dir "$DATA_DIR" --seeds-dir "$SEEDS_DIR" \
   ui-serve --bind "$BIND" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
