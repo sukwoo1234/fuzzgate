@@ -11,7 +11,7 @@
 # rc was not the problem; what an operator reads is. A traceback looks like a broken gate
 # and fifteen failures look like fifteen defects, and neither says "build the tool first".
 #
-# check_checker_wipe_safety.sh:101-106 already had the right shape - name what is missing,
+# check_checker_wipe_safety.sh:101-110 already had the default refusal shape - name what is missing,
 # say the gate cannot run, exit non-zero - so this is the odd-one-out class, not a new
 # contract. This gate pins that shape for every gate that takes TOOL_BIN.
 #
@@ -303,6 +303,13 @@ check_absent_path_control 'an unrelated refusal with the standard phrase' "$WORK
 
 # subjects= and uncovered= are on the ledger line because that line is what the runbook asks
 # an operator to copy back (`tail -1`), and R95 was a subject count nobody could see.
+if [[ "$SKIP" -gt 0 ]]; then
+  if [[ "${ALLOW_SKIPPED_CASES:-0}" == 1 ]]; then
+    printf '[gate-tool-precondition] WARN: continuing with %d skipped case(s) (ALLOW_SKIPPED_CASES=1)\n' "$SKIP" >&2
+  else
+    bad "$SKIP case(s) did not run; set ALLOW_SKIPPED_CASES=1 only if you accept an unverified run"
+  fi
+fi
 printf '[gate-tool-precondition] pass=%d fail=%d skip=%d subjects=%d uncovered=%d\n' \
   "$PASS" "$FAIL" "$SKIP" "${#GATES[@]}" "${#UNCOVERED[@]}"
 [[ "$FAIL" -eq 0 ]]

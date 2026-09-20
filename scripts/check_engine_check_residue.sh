@@ -167,5 +167,12 @@ else
   ok 'negative control: the growth check notices an OUT_DIR that gains a file per run'
 fi
 
+if [[ "$SKIP" -gt 0 ]]; then
+  if [[ "${ALLOW_SKIPPED_CASES:-0}" == 1 ]]; then
+    printf '[engine-check-residue] WARN: continuing with %d skipped case(s) (ALLOW_SKIPPED_CASES=1)\n' "$SKIP" >&2
+  else
+    bad "$SKIP case(s) did not run; set ALLOW_SKIPPED_CASES=1 only if you accept an unverified run"
+  fi
+fi
 printf '[engine-check-residue] pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ "$FAIL" -eq 0 ]]

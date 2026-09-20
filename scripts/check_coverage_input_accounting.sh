@@ -346,5 +346,12 @@ else
     || bad 'negative control: a runner that writes no profile was failed rather than excluded'
 fi
 
+if [[ "$SKIP" -gt 0 ]]; then
+  if [[ "${ALLOW_SKIPPED_CASES:-0}" == 1 ]]; then
+    printf '[coverage-input-accounting] WARN: continuing with %d skipped case(s) (ALLOW_SKIPPED_CASES=1)\n' "$SKIP" >&2
+  else
+    bad "$SKIP case(s) did not run; set ALLOW_SKIPPED_CASES=1 only if you accept an unverified run"
+  fi
+fi
 printf '[coverage-input-accounting] pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ "$FAIL" -eq 0 ]]

@@ -282,7 +282,9 @@ if [[ -z "${ENGINE_CHECK_ISOLATION_SELFTEST:-}" ]]; then
     # repository with no checkers in it.
     ln -s "$PROJECT_ROOT/scripts" "$SELFROOT/scripts"
     self_rc=0
-    ENGINE_CHECK_ISOLATION_SELFTEST=1 PROJECT_ROOT="$SELFROOT" \
+    # This selftest asks whether the ledger is reached, not whether missing harnesses
+    # should make a top-level suite pass. Permit its intentional skips explicitly.
+    ALLOW_SKIPPED_CASES=1 ENGINE_CHECK_ISOLATION_SELFTEST=1 PROJECT_ROOT="$SELFROOT" \
       timeout 600 bash "${BASH_SOURCE[0]}" >"$WORK/selftest-$shape.log" 2>&1 || self_rc=$?
     if [[ "$self_rc" -eq 0 ]] && grep -q '^\[engine-check-isolation\] pass=' "$WORK/selftest-$shape.log"; then
       ok "a tree whose harnesses/ is $shape still reaches a verdict line"
@@ -309,7 +311,7 @@ if [[ -z "${ENGINE_CHECK_ISOLATION_SELFTEST:-}" ]]; then
   sed 's|^victim="\$WORK/harness-copy/\.rebuild-probe"$|victim="$(find "$WORK/harness-copy" -type f \| head -1)"|; /^printf .isolation gate rebuild probe/d' \
     "${BASH_SOURCE[0]}" >"$WORK/prefix-shape.sh"
   pre_rc=0
-  ENGINE_CHECK_ISOLATION_SELFTEST=1 PROJECT_ROOT="$WORK/selftest-empty" \
+  ALLOW_SKIPPED_CASES=1 ENGINE_CHECK_ISOLATION_SELFTEST=1 PROJECT_ROOT="$WORK/selftest-empty" \
     timeout 600 bash "$WORK/prefix-shape.sh" >"$WORK/prefix-shape.log" 2>&1 || pre_rc=$?
   if [[ "$pre_rc" -ne 0 ]] && ! grep -q '^\[engine-check-isolation\] pass=' "$WORK/prefix-shape.log"; then
     ok "negative control: the pre-fix shape still dies without a verdict line (rc=$pre_rc)"
@@ -338,7 +340,7 @@ if [[ -z "${ENGINE_CHECK_ISOLATION_SELFTEST:-}" ]]; then
     chmod +x "$CTLROOT/harnesses/libfuzzer/$stub"
   done
   sed '/^  redirect+=(SEED_ROOT=/d' "${BASH_SOURCE[0]}" >"$WORK/noredirect.sh"
-  ENGINE_CHECK_ISOLATION_SELFTEST=1 PROJECT_ROOT="$CTLROOT" TMPDIR="$WORK/ctl-tmp" \
+  ALLOW_SKIPPED_CASES=1 ENGINE_CHECK_ISOLATION_SELFTEST=1 PROJECT_ROOT="$CTLROOT" TMPDIR="$WORK/ctl-tmp" \
     timeout 600 bash "$WORK/noredirect.sh" >"$WORK/noredirect.log" 2>&1 || true
   if grep -q '^  FAIL gguf wrote into the repository outside harnesses/' "$WORK/noredirect.log"; then
     ok 'negative control: the pre-fix shape is caught writing into the tree it guards'
@@ -348,5 +350,12 @@ if [[ -z "${ENGINE_CHECK_ISOLATION_SELFTEST:-}" ]]; then
   fi
 fi
 
+if [[ "$SKIP" -gt 0 ]]; then
+  if [[ "${ALLOW_SKIPPED_CASES:-0}" == 1 ]]; then
+    printf '[engine-check-isolation] WARN: continuing with %d skipped case(s) (ALLOW_SKIPPED_CASES=1)\n' "$SKIP" >&2
+  else
+    bad "$SKIP case(s) did not run; set ALLOW_SKIPPED_CASES=1 only if you accept an unverified run"
+  fi
+fi
 printf '[engine-check-isolation] pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ "$FAIL" -eq 0 ]]

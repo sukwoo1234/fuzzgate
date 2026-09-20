@@ -51,7 +51,9 @@ skip() { SKIP=$((SKIP + 1)); printf '  skip %s\n' "$*"; }
 # so the prerequisite is checked here first - building an operational artifact is a side
 # effect this gate must not have.
 REPLAY="$PROJECT_ROOT/fuzz/target-cov/safetensors_loader_replay_cov"
-RUSTBIN="$(rustc +nightly --print target-libdir 2>/dev/null)/../bin"
+# A host without nightly must reach the explicit skip ledger below. A failing command
+# substitution would otherwise terminate this gate under set -e before it can report why.
+RUSTBIN="$(rustc +nightly --print target-libdir 2>/dev/null || true)/../bin"
 
 covered() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["covered_lines"], d["covered_functions"])' "$1"; }
 
@@ -620,5 +622,12 @@ case "$why_unbalanced" in
   *) bad "negative control: scan judged a script whose structure it could not follow (said: ${why_unbalanced:-nothing})" ;;
 esac
 
+if [[ "$SKIP" -gt 0 ]]; then
+  if [[ "${ALLOW_SKIPPED_CASES:-0}" == 1 ]]; then
+    printf '[coverage-raw-reset] WARN: continuing with %d skipped case(s) (ALLOW_SKIPPED_CASES=1)\n' "$SKIP" >&2
+  else
+    bad "$SKIP case(s) did not run; set ALLOW_SKIPPED_CASES=1 only if you accept an unverified run"
+  fi
+fi
 printf '[coverage-raw-reset] pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ "$FAIL" -eq 0 ]]
