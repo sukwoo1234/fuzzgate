@@ -25,8 +25,8 @@ The reject cases are the point: llama-gguf-hash dereferences the NULL that
 gguf_init_from_file returns, so it dies with SIGSEGV on files the parser
 deliberately turned down. This check records that contrast.
 
-Without --require-native, a missing replay binary is a skip (exit 0) so the
-check can sit in an offline suite. With it, the missing binary is a failure.
+A missing replay binary means the oracle did not run and fails by default.
+ALLOW_SKIPPED_CASES=1 permits a warned skip unless --require-native is set.
 
 Environment:
   PROJECT_ROOT   (default: cwd)
@@ -79,6 +79,10 @@ if [[ ! -x "$REPLAY" ]]; then
     fail "$msg"
   fi
   log "skip: $msg (build it with scripts/build_libfuzzer_gguf_native.sh)"
+  if [[ "${ALLOW_SKIPPED_CASES:-0}" != 1 ]]; then
+    fail "the native replay oracle did not run; set ALLOW_SKIPPED_CASES=1 only if you accept an unverified run"
+  fi
+  echo "[gguf-oracle] WARN: continuing with skipped cases (ALLOW_SKIPPED_CASES=1)" >&2
   exit 0
 fi
 
