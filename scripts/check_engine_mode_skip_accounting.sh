@@ -110,10 +110,28 @@ run_checker() { # run_checker <root> <log> [env...]
   local root="$1" log="$2"; shift 2
   local rc=0
   mkdir -p "$root/tmp"
-  env TMPDIR="$root/tmp" PROJECT_ROOT="$root" "$@" \
+  env -u ALLOW_SKIPPED_CASES TMPDIR="$root/tmp" PROJECT_ROOT="$root" "$@" \
     timeout 900 bash "$CHECKER" >"$log" 2>&1 || rc=$?
   printf '%s' "$rc"
 }
+
+# The operator's shell must not turn the checker's missed cases into accepted skips.
+# Probe the same launcher used by every behavioural case, even when this gate itself
+# was invoked with ALLOW_SKIPPED_CASES exported.
+cat >"$WORK/env-probe.sh" <<'FAKE'
+#!/usr/bin/env bash
+if [[ ${ALLOW_SKIPPED_CASES+x} ]]; then
+  printf 'ALLOW_SKIPPED_CASES leaked\n'
+  exit 1
+fi
+printf 'ALLOW_SKIPPED_CASES absent\n'
+FAKE
+probe_rc="$(export ALLOW_SKIPPED_CASES=1; CHECKER="$WORK/env-probe.sh"; run_checker "$WORK" "$WORK/env-probe.log")"
+if [[ "$probe_rc" -eq 0 ]] && grep -qx 'ALLOW_SKIPPED_CASES absent' "$WORK/env-probe.log"; then
+  ok 'run_checker removes the operator skip opt-out from its child'
+else
+  bad "run_checker passed the operator skip opt-out to its child (rc=$probe_rc)"
+fi
 
 [[ -f "$CHECKER" ]] || { bad "$(basename "$CHECKER") is missing; nothing to pin"; }
 
