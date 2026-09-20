@@ -99,10 +99,14 @@ probe() {
 
 POC_SRC="$(find_poc || true)"
 if [[ -z "$POC_SRC" ]]; then
-  # Not a skip: without the fixture the gate cannot observe anything, and a gate that
-  # reports success when it observed nothing is the failure mode this suite exists to stop.
-  printf '[checker-wipe-safety] fail: no file matching SIGSEGV_SHA256 under data/onnx-libfuzzer-artifact-check\n' >&2
-  printf '[checker-wipe-safety] the PoC is not committed; provide the tree or this gate cannot run\n' >&2
+  # No assertion below can run without the private fixture. An operator may explicitly
+  # accept an unverified run, but the default must keep refusing it.
+  printf '[checker-wipe-safety] skip: no file matching SIGSEGV_SHA256 under data/onnx-libfuzzer-artifact-check\n' >&2
+  if [[ "${ALLOW_SKIPPED_CASES:-0}" == 1 ]]; then
+    printf '[checker-wipe-safety] WARN: continuing with skipped cases (ALLOW_SKIPPED_CASES=1)\n' >&2
+    exit 0
+  fi
+  printf '[checker-wipe-safety] fail: the PoC is not committed; provide the tree or this gate cannot run; set ALLOW_SKIPPED_CASES=1 only if you accept an unverified run\n' >&2
   exit 1
 fi
 
