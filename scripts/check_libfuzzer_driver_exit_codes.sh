@@ -29,7 +29,11 @@ if ! command -v clang++ >/dev/null 2>&1; then
   if [ "${REQUIRE_CLANG:-0}" = "1" ]; then
     fail "clang++ not found and REQUIRE_CLANG=1"
   fi
-  log "skip: clang++ not found (set REQUIRE_CLANG=1 to make this a failure)"
+  log "skip: clang++ not found"
+  if [ "${ALLOW_SKIPPED_CASES:-0}" != "1" ]; then
+    fail "the driver exit-code contract did not run; set ALLOW_SKIPPED_CASES=1 only if you accept an unverified run"
+  fi
+  echo "[libfuzzer-driver-check] WARN: continuing with skipped cases (ALLOW_SKIPPED_CASES=1)" >&2
   exit 0
 fi
 [ -f "$SRC" ] || fail "driver source not found: $SRC"
