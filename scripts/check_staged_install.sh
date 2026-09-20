@@ -125,21 +125,25 @@ PWNPROBE="$WORK/pwned"; rm -f "$PWNPROBE"
 bash -c '. "'"$LIB"'"; staged_target "a[\$(touch '"$PWNPROBE"')]"' >/dev/null 2>&1 || true
 check "a name cannot execute commands through \${!var}" "absent" "$([[ -e "$PWNPROBE" ]] && echo created || echo absent)"
 
-# Exit status and cleanup robustness (R56). A trap whose last command fails replaces the
-# script's status, and under set -e a failing rm aborts the trap before it can restore it.
+# Exit status and cleanup robustness (R56). Force the first rm to fail regardless of uid:
+# root can remove a file from a chmod 555 directory, leaving a permission probe vacuous.
 RCDIR="$WORK/rcprobe"; mkdir -p "$RCDIR"; printf 'x' >"$RCDIR/bin"
-cat >"$WORK/rc.sh" <<RCEOF
+cat >"$WORK/rc.sh" <<'RCEOF'
 set -euo pipefail
-. "$LIB"
-staged_new "\$1" S || exit 1
-staged_new "\$1.two" T || exit 1
-chmod 555 "\$(dirname "\$1")"
+. "$STAGED_INSTALL_LIB"
+staged_new "$1" FIRST || exit 1
+staged_new "$1.two" SECOND || exit 1
+rm() {
+  if [[ "$2" == "$FIRST" ]]; then return 73; fi
+  command rm "$@"
+}
 trap staged_cleanup EXIT
 exit 101
 RCEOF
-set +e; bash "$WORK/rc.sh" "$RCDIR/bin" >/dev/null 2>&1; RCGOT=$?; set -e
-chmod 755 "$RCDIR"
+set +e; STAGED_INSTALL_LIB="$LIB" bash "$WORK/rc.sh" "$RCDIR/bin" >/dev/null 2>&1; RCGOT=$?; set -e
+check "a cleanup removal actually fails" "1" "$(find "$RCDIR" -name 'bin.new.*' | wc -l)"
 check "a failing cleanup does not replace the exit status" "101" "$RCGOT"
+check "cleanup continues after a failed removal" "0" "$(find "$RCDIR" -name 'bin.two.new.*' | wc -l)"
 
 # Sibling staging: the commit must be a same-filesystem rename.
 printf '%s' "$SENTINEL" >"$OUTP"; chmod 755 "$OUTP"
