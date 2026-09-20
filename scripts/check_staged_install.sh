@@ -21,9 +21,10 @@ REAL_CC="$(command -v cc || command -v gcc || true)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/staged-install-XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 ok()  { PASS=$((PASS + 1)); printf '  ok   %s\n' "$*"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$*"; }
+skip() { SKIP=$((SKIP + 1)); printf '  skip %s\n' "$*"; }
 check() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1 (expected '$2', got '$3')"; fi; }
 
 SENTINEL='ORIGINAL-IRREPLACEABLE-BINARY'
@@ -210,7 +211,7 @@ if command -v clang++ >/dev/null 2>&1; then
     check "tool_driver/$mode: no staging left" "0" "$(find "$TD" -name 'driver.new.*' | wc -l)"
   done
 else
-  ok "tool_driver: skipped (no clang++ on this host)"
+  skip "tool_driver: no clang++ on this host"
 fi
 
 # 2) build_libfuzzer_onnx_native.sh - fake clang++, fixture ORT tree. Covers the two-output
@@ -428,5 +429,12 @@ else bad "selftest ordering examined only $SELFTEST_SEEN builds (expected at lea
 # fires on anything that puts bytes at an output-shaped destination, whether or not the
 # script sources the helper.
 
-echo "[staged-install] passed $PASS, failed $FAIL"
+if [[ "$SKIP" -gt 0 ]]; then
+  if [[ "${ALLOW_SKIPPED_CASES:-0}" == 1 ]]; then
+    echo "[staged-install] WARN: continuing with $SKIP skipped case(s) (ALLOW_SKIPPED_CASES=1)" >&2
+  else
+    bad "$SKIP case(s) did not run; set ALLOW_SKIPPED_CASES=1 only if you accept an unverified run"
+  fi
+fi
+echo "[staged-install] passed $PASS, failed $FAIL, skipped $SKIP"
 [[ "$FAIL" -eq 0 ]]
