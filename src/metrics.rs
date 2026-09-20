@@ -373,12 +373,38 @@ mod tests {
     use super::*;
     use crate::common::{now_unix_millis, AppPaths};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn unique_tmp_data_dir(label: &str) -> PathBuf {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let mut p = std::env::temp_dir();
-        p.push(format!("v1_{}_{}", label, now_unix_millis()));
+        p.push(tmp_data_dir_name(
+            label,
+            std::process::id(),
+            now_unix_millis(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
         fs::create_dir_all(&p).expect("create tmp data dir");
         p
+    }
+
+    fn tmp_data_dir_name(
+        label: &str,
+        process_id: u32,
+        timestamp_ms: u128,
+        sequence: u64,
+    ) -> String {
+        format!("v1_{label}_{process_id}_{timestamp_ms}_{sequence}")
+    }
+
+    #[test]
+    fn tmp_data_dir_name_separates_processes_and_calls_at_the_same_millisecond() {
+        let first = tmp_data_dir_name("metrics_best_effort", 101, 5_000, 0);
+        let same_process = tmp_data_dir_name("metrics_best_effort", 101, 5_000, 1);
+        let other_process = tmp_data_dir_name("metrics_best_effort", 102, 5_000, 0);
+
+        assert_ne!(first, same_process);
+        assert_ne!(first, other_process);
     }
 
     // A23: every process wrote through the same latest.json.tmp, so two writers
