@@ -78,10 +78,10 @@ latest_status() {
 # same register as check_engine_mode_labels.sh:630 (R42); --require-poc refuses above,
 # before the opt-out is ever consulted, so the strict flag stays strictly stricter.
 #
-# The refusal deliberately avoids the phrase "this gate cannot run", which
-# check_gate_tool_precondition.sh:140 greps for to catch a gate that refuses about TOOL_BIN
-# on every run. Measured 2026-09-19: worded with that phrase, this refusal makes that gate
-# report pass=13 fail=1 skip=1 - a failure about the wrong contract.
+# Before R113, using "this gate cannot run" here made check_gate_tool_precondition.sh
+# fail an unrelated opposite-polarity assertion (measured pass=13 fail=1 skip=1).
+# That assertion now checks for the exact absent TOOL_BIN path; a PoC-only refusal
+# cannot be mistaken for a refusal about the binary by sharing the phrase.
 if [[ -z "$CRASH_POC" ]]; then
   if [[ "$REQUIRE_POC" -eq 1 ]]; then
     fail "ONNX_SIGSEGV_POC or ONNX_CRASH_POC is required"
@@ -120,8 +120,8 @@ esac
 # extracted with `git archive HEAD`, check_aflpp_asan_env.sh ends rc=1 before its sibling
 # ONNX gate runs and rc=0 after, on the same tree. It cannot even work for a caller who
 # redirected TOOL_BIN, since the build installs at target/debug/tool. Unlike the PoC refusal
-# above, this one does say "this gate cannot run": that phrase is
-# check_gate_tool_precondition.sh's tell for a refusal about TOOL_BIN, and this is one.
+# above, this one names the missing TOOL_BIN path and says "this gate cannot run";
+# both are required by check_gate_tool_precondition.sh's absent-tool verdict.
 if [[ ! -x "$TOOL_BIN" ]]; then
   printf '[onnx-libfuzzer-artifact-check] fail: tool binary not executable: %s\n' "$TOOL_BIN" >&2
   printf '[onnx-libfuzzer-artifact-check] build it with `cargo build` or point TOOL_BIN at one; this gate cannot run\n' >&2

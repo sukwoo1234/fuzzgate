@@ -5,7 +5,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && 
 TOOL_BIN="${TOOL_BIN:-$PROJECT_ROOT/target/debug/tool}"
 # Not a skip: this gate drives the real tool, so without the binary it observes nothing,
 # and a gate that reports anything other than a refusal when it observed nothing is the
-# failure mode this suite exists to stop - the shape check_checker_wipe_safety.sh:101-106
+# failure mode this suite exists to stop - the default refusal shape at check_checker_wipe_safety.sh:101-110
 # already uses. Before this guard every case launched the missing binary and failed on
 # its own, so one absent precondition was reported as 15 separate failures - which an
 # operator reads as 15 defects, not one missing build. Measured 2026-09-14. R86.

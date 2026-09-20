@@ -5,7 +5,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && 
 TOOL_BIN="${TOOL_BIN:-$PROJECT_ROOT/target/debug/tool}"
 # Not a skip: this gate drives the real tool, so without the binary it observes nothing,
 # and a gate that reports anything other than a refusal when it observed nothing is the
-# failure mode this suite exists to stop - the shape check_checker_wipe_safety.sh:101-106
+# failure mode this suite exists to stop - the default refusal shape at check_checker_wipe_safety.sh:101-110
 # already uses. Before this guard the fixture below opened the path directly, so a missing
 # binary surfaced as a python FileNotFoundError traceback, which an operator cannot tell
 # apart from a broken gate. Measured 2026-09-14. R86.

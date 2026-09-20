@@ -192,10 +192,10 @@ fi
 # refuses above, before the ledger is consulted, so the strict flag stays strictly stricter.
 #
 # Two constraints on the shape, both measured rather than assumed:
-#   - the refusal must avoid the phrase "this gate cannot run". check_gate_tool_precondition.sh
-#     greps for it (:143, :207) as the tell of a refusal about TOOL_BIN, and the run it greps -
-#     TOOL_BIN executable, PoC env unset - lands here. Worded with it, that gate reports
-#     pass=28 fail=1 skip=1: a failure about the wrong contract.
+#   - R113 removed the old generic-phrase trap: the opposite-polarity assertion now looks
+#     for the exact absent TOOL_BIN path. A PoC-only refusal may use "this gate cannot run"
+#     without being mistaken for a refusal about the binary. The historical
+#     pass=28 fail=1 skip=1 was measured before that correction.
 #   - the TOOL_BIN refusal above stays FIRST. The sibling reaches its PoC branch before its
 #     TOOL_BIN check, which is why that gate scores it `preempted rc=1` and takes it out of the
 #     score. Moving this one up the same way does NOT buy that hatch: it is granted only to a
