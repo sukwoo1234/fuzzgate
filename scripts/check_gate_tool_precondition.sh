@@ -22,8 +22,8 @@
 #      separate "refused" from "died", which is what the traceback case proves.
 #   3. it must not invent failures - no per-case FAIL lines and no "N/M passed" summary.
 #      One missing precondition is one refusal, not fifteen defects.
-#   4. the opposite polarity - with TOOL_BIN pointing at a real executable the refusal must
-#      NOT appear, so the guard cannot degrade into refusing every run.
+#   4. the opposite polarity - an executable probe records whether the gate invoked TOOL_BIN;
+#      its output must not name the absent path, so unrelated refusals do not fail this arm.
 #   5. negative controls - the verdict function must reject a stub that tracebacks, reject
 #      one that prints a passed-summary, and accept one that refuses in the right shape.
 #   6. structural - the subject's own text must route the binary through TOOL_BIN and must
@@ -43,9 +43,9 @@
 # `vacuous rc=0`, and is counted as a failure.
 #
 # Residual, named rather than papered over: a gate that reads TOOL_BIN, decides to skip
-# because of it, and prints the same thing under an executable TOOL_BIN still gets the
-# hatch. /bin/true is executable without being a working tool, so an identical outcome shows
-# only that the absent path did not change the result - not that TOOL_BIN was never read.
+# because of it, and prints the same thing under an executable TOOL_BIN used to get the
+# hatch. An executable probe now writes a marker when the gate invokes it, so an identical
+# outcome earns the hatch only when the gate did not reach TOOL_BIN at all.
 #
 # R95: discovery by one spelling is not discovery. The scan below used to match the literal
 # default assignment `TOOL_BIN:-$PROJECT_ROOT/target/debug/tool`, and e2b8a82's body claimed
@@ -91,6 +91,7 @@ skip() { SKIP=$((SKIP + 1)); printf '  skip %s\n' "$*"; }
 # code_hits <file> <pattern> - matching lines as `<lineno>:<text>`, comment lines dropped, so
 # a path or a command named in a rationale header is not read as something the gate runs.
 code_hits() { grep -n -- "$2" "$1" | grep -vE '^[0-9]+:[[:space:]]*#' || true; }
+mentions_absent_tool() { grep -qF "$2" <<<"$1"; }
 
 # The gates that drive the tool, discovered rather than listed: a new one must not be able to
 # join the suite without this contract applying to it. By the path and not by the spelling of
@@ -116,12 +117,12 @@ UNCOVERED_ON_RECORD=()
 # failure message cannot drift from the test.
 SUBJECTS_ON_RECORD=5
 
-# refusal_verdict <rc> <output> <absent-path> <rc-with-executable-tool-bin> <that-output>
-# Five words the caller decides about: died (a traceback), invented (per-case failures or a
+# refusal_verdict <rc> <output> <absent-path> <rc-with-executable-tool-bin> <that-output> <probe-invoked>
+# Six words the caller decides about: died (a traceback), invented (per-case failures or a
 # passed-summary), vacuous (observed nothing and exited 0), silent (non-zero but never named
 # the missing binary), refused.
 refusal_verdict() {
-  local rc="$1" out="$2" absent="$3" rc2="$4" out2="$5"
+  local rc="$1" out="$2" absent="$3" rc2="$4" out2="$5" probe_invoked="$6"
   if grep -q 'Traceback (most recent call last)' <<<"$out"; then printf 'died'; return; fi
   if grep -qE '^\[[a-z0-9-]+\] (FAIL|[0-9]+/[0-9]+ passed)' <<<"$out"; then printf 'invented'; return; fi
   # A gate can refuse for a DIFFERENT missing precondition before it ever reaches TOOL_BIN.
@@ -130,17 +131,18 @@ refusal_verdict() {
   # It must have REFUSED: a skip line with rc=0 is the vacuous pass this gate exists to
   # forbid, and scoring it as a skip would make the gate an instance of it. And the skip must
   # not be about TOOL_BIN: the run with an executable TOOL_BIN has to be indistinguishable
-  # from this one. That comparison licenses only the claim that the absent path did not
-  # change the outcome - /bin/true is executable without being a working tool, so it cannot
-  # show TOOL_BIN went unread. A skip that appears only when the binary is absent therefore
-  # falls through to 'silent', which is the correct verdict for it anyway: the gate refused
-  # over the missing binary without naming it.
-  if grep -qE '^\[[a-z0-9-]+\] skip: ' <<<"$out" && ! grep -qF "$absent" <<<"$out"; then
+  # from this one and must not invoke the probe. A skip that appears only when the binary is
+  # absent therefore falls through to 'silent', which is the correct verdict for it anyway:
+  # the gate refused over the missing binary without naming what was missing.
+  if grep -qE '^\[[a-z0-9-]+\] skip: ' <<<"$out" && ! mentions_absent_tool "$out" "$absent"; then
     if [[ "$rc" -eq 0 ]]; then printf 'vacuous rc=0'; return; fi
-    if [[ "$rc" -eq "$rc2" && "$out" == "$out2" ]]; then printf 'preempted rc=%s' "$rc"; return; fi
+    if [[ "$rc" -eq "$rc2" && "$out" == "$out2" ]]; then
+      if [[ "$probe_invoked" -eq 1 ]]; then printf 'tool-dependent preemption rc=%s' "$rc"; return; fi
+      printf 'preempted rc=%s' "$rc"; return
+    fi
   fi
   if [[ "$rc" -eq 0 ]]; then printf 'silent rc=0'; return; fi
-  if ! grep -qF "$absent" <<<"$out" || ! grep -q 'this gate cannot run' <<<"$out"; then
+  if ! mentions_absent_tool "$out" "$absent" || ! grep -q 'this gate cannot run' <<<"$out"; then
     printf 'silent rc=%s' "$rc"; return
   fi
   printf 'refused rc=%s' "$rc"
@@ -152,10 +154,18 @@ refusal_verdict() {
 # carry that subject straight past the branch under test into a native build.
 run_gate() { # run_gate <gate> <tool-bin>
   env -u ALLOW_SKIPPED_CASES -u ONNX_SIGSEGV_POC -u ONNX_CRASH_POC -u ONNX_SIGFPE_POC \
-    TMPDIR="$WORK" TOOL_BIN="$2" timeout 300 bash "$1" 2>&1
+    TMPDIR="$WORK" TOOL_BIN_PROBE_LOG="$TOOL_PROBE_LOG" TOOL_BIN="$2" timeout 300 bash "$1" 2>&1
 }
 
 ABSENT="$WORK/no-such-tool-binary"
+TOOL_PROBE_LOG="$WORK/executable-tool-probe.log"
+EXECUTABLE_TOOL_PROBE="$WORK/executable-tool-probe"
+cat >"$EXECUTABLE_TOOL_PROBE" <<'EOF'
+#!/usr/bin/env bash
+printf 'invoked\n' >>"$TOOL_BIN_PROBE_LOG"
+exit 0
+EOF
+chmod +x "$EXECUTABLE_TOOL_PROBE"
 
 # A floor, not just an emptiness test: R95 was a scan that found 3 where 4 drive the tool,
 # and `subjects=3 ... fail=0` exits 0. Raise it when a subject is added on purpose.
@@ -177,14 +187,16 @@ for gate in "${GATES[@]}"; do
   out=""; rc=0
   out="$(run_gate "$gate" "$ABSENT")" || rc=$?
 
-  # Opposite polarity. /bin/true is executable, so the guard must stay quiet; the gate is
-  # free to fail afterwards for its own reasons and this arm says nothing about that. It runs
-  # before the verdict because the verdict needs it: R96's narrowing asks whether the absent
-  # path changed anything, and that question takes both runs.
+  # Opposite polarity. The probe records an invocation, while leaving the gate free to fail
+  # afterwards for its own reasons. It runs before the verdict because R112 needs to know
+  # whether an otherwise identical skip reached TOOL_BIN.
+  rm -f "$TOOL_PROBE_LOG"
   out2=""; rc2=0
-  out2="$(run_gate "$gate" /bin/true)" || rc2=$?
+  out2="$(run_gate "$gate" "$EXECUTABLE_TOOL_PROBE")" || rc2=$?
+  probe_invoked=0
+  [[ -s "$TOOL_PROBE_LOG" ]] && probe_invoked=1
 
-  verdict="$(refusal_verdict "$rc" "$out" "$ABSENT" "$rc2" "$out2")"
+  verdict="$(refusal_verdict "$rc" "$out" "$ABSENT" "$rc2" "$out2" "$probe_invoked")"
   case "$verdict" in
     refused*) ok "$name refuses readably when the tool binary is absent ($verdict)" ;;
     died*)    bad "$name died on an absent tool binary instead of refusing; an operator reads a traceback as a broken gate"
@@ -196,18 +208,20 @@ for gate in "${GATES[@]}"; do
     preempted*)
               skip "$name refuses earlier for another missing precondition, so this contract could not be exercised ($verdict)"
               grep -m1 -E '^\[[a-z0-9-]+\] skip: ' <<<"$out" | sed 's/^/       /' ;;
+    tool-dependent*)
+              bad "$name invoked TOOL_BIN before an otherwise identical skip, so the skip may depend on an unusable tool ($verdict)"
+              grep -m1 -E '^\[[a-z0-9-]+\] skip: ' <<<"$out" | sed 's/^/       /' ;;
     *)        bad "$name did not refuse readably over the absent tool binary ($verdict)"
               tail -2 <<<"$out" | sed 's/^/       /' ;;
   esac
 
-  # The phrase is the whole tell here, so it is reserved for refusals about TOOL_BIN itself:
-  # a gate refusing over an unrelated missing precondition must word it differently or this
-  # arm fires for the wrong contract (measured 2026-09-19 against an ONNX refusal worded
-  # with it: pass=13 fail=1 skip=1).
-  if grep -q 'this gate cannot run' <<<"$out2"; then
-    bad "$name refuses even when TOOL_BIN is executable; the guard is not about the binary"
+  # Assertion 4 is about the missing TOOL_BIN path, not a phrase another precondition might
+  # happen to share. The R113 fixture proves that an unrelated refusal may legitimately say
+  # "this gate cannot run" without changing the absent-tool contract.
+  if mentions_absent_tool "$out2" "$ABSENT"; then
+    bad "$name names the absent tool binary even when TOOL_BIN is executable; the guard is not about the binary"
   else
-    ok "$name does not refuse when TOOL_BIN is executable"
+    ok "$name does not name the absent tool binary when TOOL_BIN is executable"
   fi
 
   # Assertion 6, on the text, because the two arms above can both be unreachable - see R95 in
@@ -242,13 +256,22 @@ printf 'Traceback (most recent call last):\n  File "x", line 1\nFileNotFoundErro
 printf '[stub] FAIL case-one: []\n[stub] 0/15 passed\n' >"$WORK/invented.out"
 printf '[stub] something went wrong\n' >"$WORK/silent.out"
 
-check_control() { # check_control <label> <file> <rc> <want-prefix> [executable-tool-bin file] [its rc]
+check_control() { # check_control <label> <file> <rc> <want-prefix> [executable-tool-bin file] [its rc] [probe-invoked]
   local label="$1" got
-  got="$(refusal_verdict "$3" "$(cat "$2")" "$ABSENT" "${6:-$3}" "$(cat "${5:-$2}")")"
+  got="$(refusal_verdict "$3" "$(cat "$2")" "$ABSENT" "${6:-$3}" "$(cat "${5:-$2}")" "${7:-0}")"
   case "$got" in
     "$4"*) ok "negative control: $label reads as '$got'" ;;
     *)     bad "negative control: $label read as '$got', wanted $4*" ;;
   esac
+}
+check_absent_path_control() { # check_absent_path_control <label> <file> <want: names|does-not-name>
+  local label="$1" got='does-not-name'
+  mentions_absent_tool "$(cat "$2")" "$ABSENT" && got='names'
+  if [[ "$got" == "$3" ]]; then
+    ok "negative control: $label $got the absent tool path"
+  else
+    bad "negative control: $label $got the absent tool path, wanted $3"
+  fi
 }
 check_control 'a readable refusal'              "$WORK/good.out"     1 refused
 check_control 'a python traceback'              "$WORK/died.out"     1 died
@@ -269,6 +292,14 @@ check_control 'a skip that only appears when the tool binary is absent' \
 # and it must not swallow a real miss: a gate that names the absent binary is never preempted
 printf '[stub] skip: something\n[stub] fail: tool binary not executable: %s\n[stub] this gate cannot run\n' "$ABSENT" >"$WORK/both.out"
 check_control 'a refusal that also logged a skip' "$WORK/both.out"    1 refused
+# R112: an unchanged skip is preempted only when the executable-tool arm did not invoke the
+# tool at all. The final `1` is the probe marker this test expects the verdict to reject.
+check_control 'a skip after invoking the executable tool probe' "$WORK/preempted.out" 1 tool-dependent \
+                                                "$WORK/preempted.out" 1 1
+# R113: a separate precondition may use the standard refusal phrase. Assertion 4 must look
+# for the absent path instead, or that unrelated refusal is scored against TOOL_BIN.
+printf '[stub] this gate cannot run because another prerequisite is missing\n' >"$WORK/unrelated-refusal.out"
+check_absent_path_control 'an unrelated refusal with the standard phrase' "$WORK/unrelated-refusal.out" does-not-name
 
 # subjects= and uncovered= are on the ledger line because that line is what the runbook asks
 # an operator to copy back (`tail -1`), and R95 was a subject count nobody could see.
