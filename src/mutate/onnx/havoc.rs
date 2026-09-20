@@ -91,10 +91,17 @@ pub(crate) fn apply(
     bytes: &[u8],
     rng: &mut DeterministicRng,
 ) -> Result<MutationOutput, OperatorError> {
+    apply_with_budget(bytes, rng, byte_budget())
+}
+
+fn apply_with_budget(
+    bytes: &[u8],
+    rng: &mut DeterministicRng,
+    budget: usize,
+) -> Result<MutationOutput, OperatorError> {
     if bytes.is_empty() {
         return Err(OperatorError::NoApplicableField);
     }
-    let budget = byte_budget();
     let mut out = bytes.to_vec();
     let mut spent = 0usize;
     let mut edits = 0usize;
@@ -154,11 +161,13 @@ mod tests {
 
     #[test]
     fn deterministic_for_same_seed() {
+        // A fixed budget, not the env-derived one, so a concurrent test setting
+        // ONNX_HAVOC_BYTE_BUDGET between two calls cannot make this flaky.
         let bytes = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
         let mut a = DeterministicRng::new(42);
         let mut b = DeterministicRng::new(42);
-        let ra = apply(&bytes, &mut a).expect("ok");
-        let rb = apply(&bytes, &mut b).expect("ok");
+        let ra = apply_with_budget(&bytes, &mut a, DEFAULT_BYTE_BUDGET).expect("ok");
+        let rb = apply_with_budget(&bytes, &mut b, DEFAULT_BYTE_BUDGET).expect("ok");
         assert_eq!(ra.bytes, rb.bytes, "same seed must give identical output");
     }
 
