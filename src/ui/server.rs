@@ -870,7 +870,7 @@ fn handle_replay_start(app_paths: &AppPaths, raw_path: &str) -> Result<Response,
         .map_err(|e| format!("failed to clone replay log handle: {e}"))?;
 
     let cwd = std::env::current_dir().map_err(|e| format!("failed to get current dir: {e}"))?;
-    let mut cmd = Command::new(tool_binary_path()?);
+    let mut cmd = tool_child_command(app_paths)?;
     cmd.current_dir(&cwd)
         .arg("triage")
         .arg("--target")
@@ -966,7 +966,7 @@ fn handle_target_prepare(app_paths: &AppPaths, raw_path: &str) -> Result<Respons
         .map_err(|e| format!("failed to clone target log handle: {e}"))?;
 
     let cwd = std::env::current_dir().map_err(|e| format!("failed to get current dir: {e}"))?;
-    let mut cmd = Command::new(tool_binary_path()?);
+    let mut cmd = tool_child_command(app_paths)?;
     cmd.current_dir(&cwd)
         .arg("prepare-target")
         .arg("--target")
@@ -1752,6 +1752,15 @@ fn target_storage_name(target: &str) -> Option<&'static str> {
         "safetensors" => Some("safetensors"),
         _ => None,
     }
+}
+
+fn tool_child_command(app_paths: &AppPaths) -> Result<Command, String> {
+    let mut cmd = Command::new(tool_binary_path()?);
+    cmd.arg("--data-dir")
+        .arg(&app_paths.data_dir)
+        .arg("--seeds-dir")
+        .arg(&app_paths.seeds_dir);
+    Ok(cmd)
 }
 
 fn tool_binary_path() -> Result<PathBuf, String> {
@@ -2755,6 +2764,61 @@ mod tests {
         assert!(run.body.contains("41"), "{}", run.body);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ui_target_prepare_passes_configured_paths_to_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_tmp_dir("target-prepare-paths");
+        let app_paths = AppPaths {
+            data_dir: root.join("configured-data"),
+            seeds_dir: root.join("configured-seeds"),
+        };
+        let argv_file = root.join("child-argv");
+        let fake_tool = root.join("fake-tool");
+        fs::write(
+            &fake_tool,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                argv_file.display()
+            ),
+        )
+        .expect("write fake tool");
+        fs::set_permissions(&fake_tool, fs::Permissions::from_mode(0o755))
+            .expect("make fake tool executable");
+
+        let previous_tool = std::env::var_os("TOOL_BIN");
+        std::env::set_var("TOOL_BIN", &fake_tool);
+        let response = super::handle_target_prepare(&app_paths, "/target/prepare?target=onnx");
+        if let Some(value) = previous_tool {
+            std::env::set_var("TOOL_BIN", value);
+        } else {
+            std::env::remove_var("TOOL_BIN");
+        }
+        assert_eq!(response.expect("prepare response").status, "200 OK");
+
+        for _ in 0..50 {
+            if argv_file.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let argv = fs::read_to_string(&argv_file).expect("child recorded argv");
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec![
+                "--data-dir",
+                app_paths.data_dir.to_str().expect("data dir is UTF-8"),
+                "--seeds-dir",
+                app_paths.seeds_dir.to_str().expect("seeds dir is UTF-8"),
+                "prepare-target",
+                "--target",
+                "onnx",
+            ]
+        );
+        reap_children();
+        fs::remove_dir_all(&root).expect("remove fake tool and output");
     }
 
     fn request(method: &str, path: &str) -> super::RequestHead {
