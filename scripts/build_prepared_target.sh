@@ -50,6 +50,42 @@ if [[ -z "$ARCHIVE_PATH" || ! -f "$ARCHIVE_PATH" ]]; then
   exit 4
 fi
 
+# A prepared archive is trusted only after it matches the recorded download.
+# Check before removing or creating the extract tree: a corrupt archive must not
+# change a prior build or leave partially extracted source behind.
+META_PATH="$VERSION_ROOT/meta.json"
+if [[ ! -f "$META_PATH" ]]; then
+  echo "[target-build] target metadata not found: $META_PATH" >&2
+  exit 4
+fi
+if ! EXPECTED_SHA="$(python3 - "$META_PATH" "$TARGET_NAME" "$VERSION" <<'PY'
+import json
+import re
+import sys
+
+path, target, version = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as stream:
+        meta = json.load(stream)
+    digest = meta["downloaded_sha256"]
+    if meta.get("target") != target or meta.get("version") != version:
+        raise ValueError("target or version does not match the prepared directory")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+        raise ValueError("downloaded_sha256 is not a SHA-256 digest")
+    print(digest.lower())
+except (OSError, ValueError, KeyError, TypeError) as exc:
+    print(f"[target-build] invalid target metadata: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+)"; then
+  exit 4
+fi
+ACTUAL_SHA="$(sha256sum "$ARCHIVE_PATH" | cut -d' ' -f1)" || exit 4
+if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+  echo "[target-build] sha256 mismatch: $ARCHIVE_PATH expected=$EXPECTED_SHA actual=$ACTUAL_SHA" >&2
+  exit 4
+fi
+
 EXTRACT_DIR="$VERSION_ROOT/build-src"
 BUILD_DIR="$VERSION_ROOT/build-out"
 # gguf gets built from the same version more than once - this plain reference build,
