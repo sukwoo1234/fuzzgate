@@ -1107,6 +1107,9 @@ try:
     with safe_open(path, framework="pt", device="cpu") as f:
         keys = list(f.keys())
         print(f"safe_open_ok:tensors={len(keys)}")
+except ModuleNotFoundError as e:
+    print(f"missing_module:{e}")
+    sys.exit(3)
 except Exception as e:
     print(f"load_fail:{e}")
     sys.exit(2)
@@ -1870,6 +1873,42 @@ mod tests {
             "err was: {err:?}"
         );
         assert_eq!(err.exit_code(), crate::EXIT_HARNESS_LIBRARY_CRASH);
+    }
+
+    #[test]
+    fn a_safetensors_python_probe_missing_its_framework_is_unavailable() {
+        use super::{safetensors_python_connect, LibraryConnectOutcome};
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = env_lock();
+        let dir = gguf_probe_dir("safetensors-python-framework");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(
+            dir.join("safetensors.py"),
+            "def safe_open(*args, **kwargs):\n    raise ModuleNotFoundError(\"No module named 'torch'\")\n",
+        )
+        .expect("write fake module");
+        let wrapper = dir.join("python.sh");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nexport PYTHONPATH='{}'\nexec python3 \"$@\"\n", dir.display()),
+        )
+        .expect("write wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+
+        std::env::set_var("TOOL_PYTHON_BIN", &wrapper);
+        let result = safetensors_python_connect(std::path::Path::new("/unused.safetensors"));
+        std::env::remove_var("TOOL_PYTHON_BIN");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(result.outcome, LibraryConnectOutcome::Unavailable),
+            "missing Python framework was treated as {}: {}",
+            result.outcome.as_str(),
+            result.step
+        );
+        assert!(result.step.contains("missing_module:"), "{}", result.step);
     }
 
     // A36: the probe looked for .venv/bin/python3 relative to the process working
