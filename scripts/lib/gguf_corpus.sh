@@ -59,14 +59,30 @@ gguf_seed_working_corpus() {
     local corpus_dir="${1%/}" fixture="$2"
     local marker="${corpus_dir}.seeded-from"
     local previous=""
+    local fixture_root previous_root=""
 
-    mkdir -p "${corpus_dir}"
     [ -f "${marker}" ] && previous="$(cat "${marker}" 2>/dev/null || true)"
+    if [ ! -d "${fixture}" ]; then
+        printf '[gguf-corpus] seed fixture not found: %s\n' "${fixture}" >&2
+        return 1
+    fi
+    fixture_root="$(realpath -e -- "${fixture}")" || return 1
+    if [ -n "${previous}" ]; then
+        # Without the previous fixture's bytes, the helper cannot distinguish its
+        # old seed copies from discoveries. Refuse rather than label stale units as
+        # if they came from the new fixture.
+        if [ ! -d "${previous}" ]; then
+            printf '[gguf-corpus] previous seed fixture not found: %s\n' "${previous}" >&2
+            return 1
+        fi
+        previous_root="$(realpath -e -- "${previous}")" || return 1
+    fi
+    mkdir -p "${corpus_dir}"
 
     local evicted=0
-    if [ -n "${previous}" ] && [ "${previous}" != "${fixture}" ] && [ -d "${previous}" ]; then
+    if [ -n "${previous_root}" ] && [ "${previous_root}" != "${fixture_root}" ]; then
         local old victim
-        for old in "${previous}"/*; do
+        for old in "${previous_root}"/*; do
             [ -f "${old}" ] || continue
             victim="${corpus_dir}/$(basename "${old}")"
             if [ -f "${victim}" ] && cmp -s "${old}" "${victim}"; then
@@ -75,9 +91,7 @@ gguf_seed_working_corpus() {
             fi
         done
     fi
-    if [ -d "${fixture}" ]; then
-        cp -n "${fixture}"/* "${corpus_dir}/" 2>/dev/null || true
-    fi
-    printf '%s\n' "${fixture}" > "${marker}"
+    cp -n "${fixture_root}"/* "${corpus_dir}/" 2>/dev/null || true
+    printf '%s\n' "${fixture_root}" > "${marker}"
     printf '%s' "${evicted}"
 }

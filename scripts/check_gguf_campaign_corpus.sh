@@ -128,4 +128,30 @@ env -u TOOL_LIBFUZZER_CMD WORKDIR="$ROOT" \
 grep -Fq 'corpus dir not found:' "$ROOT/run.log" || fail 'missing fixture error was lost'
 [[ ! -e "$ROOT/data/corpus/libfuzzer/gguf" ]] || fail 'missing fixture created an empty corpus'
 
+log 'same fixture through a path alias: do not evict and recopy seeds'
+# shellcheck source=lib/gguf_corpus.sh
+. "$PROJECT_ROOT/scripts/lib/gguf_corpus.sh"
+new_root alias
+make_derived
+[[ "$(gguf_seed_working_corpus "$CORPUS" "$DERIVED")" == 0 ]] || fail 'initial alias seed failed'
+[[ "$(gguf_seed_working_corpus "$CORPUS" "$DERIVED/./")" == 0 ]] \
+  || fail 'path alias caused a false fixture transition'
+[[ "$(cat "$CORPUS.seeded-from")" == "$DERIVED" ]] || fail 'path alias changed the marker'
+
+log 'vanished previous fixture: refuse a transition that cannot identify old seeds'
+new_root vanished_previous
+[[ "$(gguf_seed_working_corpus "$CORPUS" "$ORIGINAL")" == 0 ]] \
+  || fail 'initial fallback seed failed'
+old_marker="$(cat "$CORPUS.seeded-from")"
+rm -rf "$ORIGINAL"
+make_derived
+rc=0
+gguf_seed_working_corpus "$CORPUS" "$DERIVED" >"$ROOT/transition.stdout" \
+  2>"$ROOT/transition.stderr" || rc=$?
+[[ "$rc" -ne 0 ]] || fail 'missing old fixture was accepted as a clean transition'
+[[ "$(cat "$CORPUS.seeded-from")" == "$old_marker" ]] \
+  || fail 'failed transition changed the marker'
+cmp -s "$CORPUS/seed.gguf" <(printf 'original seed\n') \
+  || fail 'failed transition replaced an unverified old seed'
+
 log 'PASS: default isolation, seed transition, fallback, preservation and explicit overrides'
