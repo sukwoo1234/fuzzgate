@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The TOOL_COVERAGE_SAFETENSORS_CMD target. src/coverage.rs runs this as `bash -lc`
-# with OUT_DIR and CORPUS_DIR exported, and requires $OUT_DIR/coverage.json on exit 0.
+# The TOOL_COVERAGE_SAFETENSORS_CMD target. src/coverage.rs verifies this file against
+# the runner bytes embedded in the tool build, executes a private copy with bash, and
+# requires real profile evidence plus $OUT_DIR/coverage.json on exit 0.
 # Runs the instrumented replay over the corpus, merges profraw with the rustc-matched
 # llvm tools (NOT the clang-17 ones), and emits a line_function coverage.json that
 # src/coverage.rs already knows how to parse.
@@ -111,15 +112,19 @@ if stray:
              "Any percentage from this run would be fiction.")
 PYCHECK
 
-python3 - "$OUT_DIR/llvmcov.json" "$OUT_DIR/coverage.json" "${#inputs[@]}" "$replay_rc" <<'PY'
-import json, subprocess, sys
+python3 - "$OUT_DIR/llvmcov.json" "$OUT_DIR/coverage.json" "${#inputs[@]}" "$replay_rc" "$REPLAY" <<'PY'
+import hashlib, json, os, subprocess, sys
 totals = json.load(open(sys.argv[1]))["data"][0]["totals"]
 tv = subprocess.check_output(["rustc", "+nightly", "--version"]).decode().strip()
+binary_path = os.path.realpath(sys.argv[5])
+binary_sha256 = hashlib.sha256(open(binary_path, "rb").read()).hexdigest()
 out = {
     "schema_version": "2.0",
     "coverage_kind": "line_function",
     "instrumentation": "rustc-instrument-coverage",
     "toolchain_version": tv,
+    "measured_binary": binary_path,
+    "measured_binary_sha256": binary_sha256,
     "covered_lines": totals["lines"]["covered"],
     "total_lines": totals["lines"]["count"],
     "covered_functions": totals["functions"]["covered"],

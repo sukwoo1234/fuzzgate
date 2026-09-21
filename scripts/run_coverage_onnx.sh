@@ -4,8 +4,9 @@
 # Ort::Session creation, and emit REAL LLVM source coverage (line/function) of
 # onnxruntime as coverage.json + a human-readable report.
 #
-# This is the intended TOOL_COVERAGE_ONNX_CMD target. It is environment-gated and
-# fully separate from the baseline run -> triage -> report pipeline.
+# This is the intended TOOL_COVERAGE_ONNX_CMD target. src/coverage.rs verifies the
+# runner bytes embedded in the tool build before execution. It is environment-gated
+# and fully separate from the baseline run -> triage -> report pipeline.
 #
 # Prereq: scripts/build_coverage_onnx.sh has produced the instrumented .so.
 # Tools MUST be version-matched to the compiler (clang 14 -> llvm-*-14).
@@ -110,14 +111,16 @@ CLANG_VER="$("$CLANGXX" --version | head -1)"
 MACHINE_LABEL="${TOOL_MACHINE_LABEL:-}"
 python3 - "$OUT_DIR/llvm-cov-summary.json" "$OUT_DIR/coverage.json" \
   "$HARNESS_BIN" "$SOURCE_CORPUS_DIR" "$TOOL_COMMIT" "$CLANG_VER" "$HARNESS_BUILD_CMD" \
-  "${#MODELS[@]}" "$MACHINE_LABEL" "$RECORDED" "$LOADED" <<'PY'
-import json, sys
+  "${#MODELS[@]}" "$MACHINE_LABEL" "$RECORDED" "$LOADED" "$SO" <<'PY'
+import hashlib, json, os, sys
 (summ_path, out_path, harness, corpus, commit, clangver,
- buildcmd, nmodels, machine, recorded, loaded) = sys.argv[1:12]
+ buildcmd, nmodels, machine, recorded, loaded, measured_binary) = sys.argv[1:13]
 with open(summ_path) as f:
     data = json.load(f)
 tot = data["data"][0]["totals"]
 lines = tot.get("lines", {}); funcs = tot.get("functions", {}); regions = tot.get("regions", {})
+binary_path = os.path.realpath(measured_binary)
+binary_sha256 = hashlib.sha256(open(binary_path, "rb").read()).hexdigest()
 cov = {
   "schema_version": "2.0",
   "target": "onnx",
@@ -126,6 +129,8 @@ cov = {
   "toolchain": "clang",
   "toolchain_version": clangver,
   "tool_commit": commit,
+  "measured_binary": binary_path,
+  "measured_binary_sha256": binary_sha256,
   "harness_path": harness,
   "harness_build_command": buildcmd,
   "source_corpus": corpus,

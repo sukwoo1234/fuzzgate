@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The TOOL_COVERAGE_GGUF_CMD target. src/coverage.rs runs this as `bash -lc` with
-# OUT_DIR, CORPUS_DIR, and SOURCE_CORPUS_DIR exported, and requires
+# The TOOL_COVERAGE_GGUF_CMD target. src/coverage.rs verifies this file against the
+# runner bytes embedded in the tool build, executes a private copy with bash, exports
+# OUT_DIR/CORPUS_DIR/SOURCE_CORPUS_DIR, and requires real profile evidence plus
 # $OUT_DIR/coverage.json on exit 0.
 #
 # Replays the corpus through the source-instrumented gguf replay and emits real
@@ -33,9 +34,8 @@ OUT_DIR="${OUT_DIR:?OUT_DIR must be set by the coverage runner}"
 CORPUS_DIR="${CORPUS_DIR:?CORPUS_DIR must be set by the coverage runner}"
 SOURCE_CORPUS_DIR="${SOURCE_CORPUS_DIR:-$CORPUS_DIR}"
 CLANG_BUNDLE_DIR="$PROJECT_ROOT/data/toolchains/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04/bin"
-# Absolute paths on purpose: this runs under `bash -lc`, and a login shell's
-# profile can put a rustup shim (or another clang) ahead of the pinned bundle on
-# PATH. The profraw format is tied to the compiler that produced it.
+# Absolute paths keep the profile tools tied to the compiler that produced the
+# profraw format and avoid a caller PATH selecting another clang bundle.
 LLVM_PROFDATA="${LLVM_PROFDATA:-$CLANG_BUNDLE_DIR/llvm-profdata}"
 LLVM_COV="${LLVM_COV:-$CLANG_BUNDLE_DIR/llvm-cov}"
 
@@ -165,12 +165,14 @@ TOOL_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo
 CLANG_VER="$("$CLANG_BUNDLE_DIR/clang++" --version | head -1)"
 python3 - "$OUT_DIR/llvmcov.json" "$OUT_DIR/coverage.json" "$CLANG_VER" "$TOOL_COMMIT" \
   "$SOURCE_CORPUS_DIR" "${#inputs[@]}" "$DEPTH" "$LLAMA_VER" "$aborted" "$empty_profiles" \
-  "$MAPPED_SRC" <<'PY'
-import json, sys
+  "$MAPPED_SRC" "$REPLAY" <<'PY'
+import hashlib, json, os, sys
 (summ, out, clangver, commit, corpus, ninputs, depth, ver, aborted,
- empty_profiles, mapped_src) = sys.argv[1:12]
+ empty_profiles, mapped_src, replay) = sys.argv[1:13]
 tot = json.load(open(summ))["data"][0]["totals"]
 lines, funcs, regions = tot.get("lines", {}), tot.get("functions", {}), tot.get("regions", {})
+binary_path = os.path.realpath(replay)
+binary_sha256 = hashlib.sha256(open(binary_path, "rb").read()).hexdigest()
 cov = {
     "schema_version": "2.0",
     "target": "gguf",
@@ -179,6 +181,8 @@ cov = {
     "toolchain": "clang",
     "toolchain_version": clangver,
     "tool_commit": commit,
+    "measured_binary": binary_path,
+    "measured_binary_sha256": binary_sha256,
     # Provenance for the caveats in the header comment: a reader must be able to
     # tell which parser, which depth and which scope produced this number.
     # Read back from the binary's coverage mapping, never asserted: a hardcoded
