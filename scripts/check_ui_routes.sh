@@ -39,20 +39,25 @@ SEEDS_DIR="${SEEDS_DIR:-$WORK/seeds}"
 # The logs are the evidence for a failure, so they must OUTLIVE the throwaway tree.
 # Isolating the data dir is the point of R5; the logs do not need to be inside it.
 LOG_DIR="${LOG_DIR:-$(mktemp -d -t tool-ui-check-XXXXXX)}"
-case "$LOG_DIR" in
-  "$WORKDIR"/data|"$WORKDIR"/data/*)
+# Resolve existing symlinks and harmless path spelling differences before any
+# mkdir. The previous string-prefix guard ran after mkdir and could leave a new
+# directory under the operator's data tree even when it refused the test.
+OPERATOR_DATA_ROOT="$(realpath -m -- "$WORKDIR/data")"
+RESOLVED_DATA_DIR="$(realpath -m -- "$DATA_DIR")"
+RESOLVED_LOG_DIR="$(realpath -m -- "$LOG_DIR")"
+case "$RESOLVED_DATA_DIR" in
+  "$OPERATOR_DATA_ROOT"|"$OPERATOR_DATA_ROOT"/*)
+    echo "[FAIL] the check must not run against the operator data dir: $DATA_DIR" >&2
+    exit 1
+    ;;
+esac
+case "$RESOLVED_LOG_DIR" in
+  "$OPERATOR_DATA_ROOT"|"$OPERATOR_DATA_ROOT"/*)
     echo "[FAIL] the check must not write logs into the operator data dir: $LOG_DIR" >&2
     exit 1
     ;;
 esac
 mkdir -p "$DATA_DIR" "$SEEDS_DIR/onnx" "$LOG_DIR" "$WORK/run"
-
-case "$DATA_DIR" in
-  "$WORKDIR"/data|"$WORKDIR"/data/*)
-    echo "[FAIL] the check must not run against the operator data dir: $DATA_DIR" >&2
-    exit 1
-    ;;
-esac
 
 # The token file lives under XDG_RUNTIME_DIR. Point it at the throwaway tree and
 # remember the operator's own file so the run can prove it left it alone.
@@ -74,10 +79,10 @@ export XDG_RUNTIME_DIR="$WORK/run"
 # A whole-tree stamp: a directory's own mtime does not change when a file inside it
 # is rewritten, so watching one subdirectory proved much less than the message said.
 DATA_TREE_STAMP_BEFORE="$WORK/data-tree-before.txt"
-if [[ -d "$WORKDIR/data" ]]; then
-  find "$WORKDIR/data" -maxdepth 3 -printf '%p\t%T@\t%s\n' 2>/dev/null | sort > "$DATA_TREE_STAMP_BEFORE" || true
+if [[ -e "$WORKDIR/data" || -L "$WORKDIR/data" ]]; then
+  find -L "$WORKDIR/data" -printf '%p\t%T@\t%s\n' | sort > "$DATA_TREE_STAMP_BEFORE"
 else
-  : > "$DATA_TREE_STAMP_BEFORE"
+  printf 'absent\n' > "$DATA_TREE_STAMP_BEFORE"
 fi
 
 # An ephemeral port, so a running campaign dashboard on 8787 is not in the way.
@@ -332,17 +337,17 @@ else
 fi
 
 DATA_TREE_STAMP_AFTER="$WORK/data-tree-after.txt"
-if [[ -d "$WORKDIR/data" ]]; then
-  find "$WORKDIR/data" -maxdepth 3 -printf '%p\t%T@\t%s\n' 2>/dev/null | sort > "$DATA_TREE_STAMP_AFTER" || true
+if [[ -e "$WORKDIR/data" || -L "$WORKDIR/data" ]]; then
+  find -L "$WORKDIR/data" -printf '%p\t%T@\t%s\n' | sort > "$DATA_TREE_STAMP_AFTER"
 else
-  : > "$DATA_TREE_STAMP_AFTER"
+  printf 'absent\n' > "$DATA_TREE_STAMP_AFTER"
 fi
 if ! diff -q "$DATA_TREE_STAMP_BEFORE" "$DATA_TREE_STAMP_AFTER" >/dev/null; then
   echo "[FAIL] the check changed the operator data dir:" | tee -a "$CHECK_LOG"
   diff "$DATA_TREE_STAMP_BEFORE" "$DATA_TREE_STAMP_AFTER" | head -n 20 | tee -a "$CHECK_LOG"
   exit 1
 fi
-echo "[OK] the operator data dir is unchanged (name, mtime and size, 3 levels deep)" | tee -a "$CHECK_LOG"
+echo "[OK] the operator data dir is unchanged (name, mtime and size, entire tree)" | tee -a "$CHECK_LOG"
 
 echo "[ui-check] done"
 echo "server_log: $SERVER_LOG"
