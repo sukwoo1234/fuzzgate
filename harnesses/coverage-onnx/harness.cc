@@ -62,12 +62,15 @@ static std::string json_escape(const std::string& s) {
 }
 
 // Best-effort: did the model get PAST protobuf parsing into graph build?
-// onnxruntime throws "...Protobuf parsing failed..." when the wire bytes do not
+// onnxruntime throws "...protobuf parsing failed..." when the wire bytes do not
 // decode as a ModelProto. A post-parse failure (unsupported op, shape/type error,
 // missing graph) means the parser WAS reached. The raw message is recorded in the
 // JSON so the frozen analysis can refine this rule on the messages actually observed.
 static bool looks_parse_failed(const std::string& msg) {
-  return msg.find("Protobuf parsing failed") != std::string::npos;
+  // ORT versions differ in the capitalization of "protobuf". The observed
+  // v1.23.2 message starts with lowercase p.
+  return msg.find("protobuf parsing failed") != std::string::npos ||
+         msg.find("Protobuf parsing failed") != std::string::npos;
 }
 
 static GraphOptimizationLevel graph_opt_level_from_env() {
