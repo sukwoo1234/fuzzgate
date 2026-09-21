@@ -223,10 +223,13 @@
 - Job Queue는 `./data/queue`에 job 파일로 관리한다.
 - Artifact Store는 `./data/artifacts`에 크래시/재현/로그를 저장한다.
 
-## A.2) 파일 큐 무결성 (확정)
-- 파일 기반 큐로 상태 전이(pending -> processing -> done)를 관리한다.
+## A.2) 파일 큐 무결성 (설계 — 미구현)
+- 파일 기반 큐로 상태 전이(pending -> processing -> done)를 관리**하도록 설계**했다.
 - atomic rename 기반의 중복/레이스 허용 정책을 적용한다.
-- checksum, job_id, quarantine, stale recovery, sharding, history를 운영한다.
+- checksum, job_id, quarantine, stale recovery, sharding, history를 다룬다.
+- **2026-09-18 실측: 아직 구현되지 않았다.** 현재 코드는 `data/queue/{pending,processing,done,failed,quarantine}`
+  디렉터리 골격만 만들고(`src/common.rs`의 `ensure_data_layout`), 그 사이로 잡을 옮기는 코드는 없다.
+  실행은 큐를 거치지 않고 `tool run`이 입력을 직접 처리한다.
 - 세부 규칙/필드/임계값은 내부 명세에 정의한다.
 
 ## A.3) 플랫폼 인터페이스 설계 (확정)
@@ -308,7 +311,7 @@
 - 세부 규칙은 내부 명세에 둔다.
 
 ## E.4) 플랫폼 자체 테스트 (확정)
-- `tool self-test`로 파이프라인 전체를 검증한다.
+- 파이프라인 전체 검증은 `cargo test`와 `scripts/check_*.sh` 게이트로 수행한다. 별도의 `tool self-test` 서브커맨드는 없다.
 - 시나리오/규칙은 내부 명세에 둔다.
 
 # P) CLI 명령/플로우 (확정)
@@ -329,7 +332,8 @@
 - 사용자가 직접 실행해 검증할 수 있는 **재현 커맨드 제공**
 
 ## G.1) PoC 최소화 (확정)
-- triage 시작 시 LibFuzzer `-minimize_crash=1`로 최소화된 입력을 생성한다
+- 최소화는 `tool report --minimize` 옵션으로 수행한다(`tool triage`에는 최소화 옵션이 없다)
+- 기본 전략은 `copy_baseline`(원본 복사)이며, 실제 최소화기는 `TOOL_MINIMIZER_CMD`로 외부 명령을 지정했을 때만 동작한다
 - 최소화 입력은 보고서에 포함하고, 원본 입력은 별도 보관한다
 
 ## G.2) ACE 수동 검증 지원 (정책)

@@ -35,8 +35,7 @@
 
 ## 문서 가이드
 - 공개 문서: [first.md](first.md)
-- 퍼징컴 이관: [docs/fuzzing-pc-migration.md](docs/fuzzing-pc-migration.md)
-- 그 외 운영 계획, 상세 명세, 실험 기록, 후속 계획은 내부 문서로 관리한다.
+- 퍼징컴 이관 절차, 그 외 운영 계획, 상세 명세, 실험 기록, 후속 계획은 내부 문서로 관리한다.
 
 ## CLI (확정)
 - `tool run`, `tool triage`, `tool report`
@@ -89,6 +88,14 @@ Stage E로 GGUF 뮤테이터가 ONNX급으로 넓어지면서 기본 세트가 *
 - **2026-09-03 이전 GGUF 실험을 재현할 때는 위 9종을 `--operator`로 명시할 것.**
 - 매니페스트 `mutation_level`이 이제 연산자별로 기록된다(array_mutate·scalar_boundary=3,
   value_resize=2, 나머지=1) — ONNX와 같은 분류다.
+
+### safetensors 기본 세트
+
+`tool mutate --target safetensors`의 기본 연산자는 `header_length`, `metadata_value`,
+`metadata_key`, `tensor_name`, `tensor_dtype`, `tensor_shape`, `tensor_data_offsets` 7종이다.
+`byte_flip`은 `--operator byte_flip`으로 지정할 때만 사용한다. 배치에서 적용할 필드가
+없는 시드는 건너뛰므로, 재현할 때는 연산자와 시드를 명시하고 `requested`·`generated`를
+함께 확인한다.
 
 ## 기본 경로
 - 데이터: `./data`
@@ -209,12 +216,16 @@ tool campaign --mode parallel --target onnx --hours 168 --campaign-id hunt-onnx-
 | 경로 | `--timeout-sec`가 묶나 | 실제로 시간을 묶는 것 |
 |---|---|---|
 | `--backend local-harness` | **예** — 잡 1개마다 적용 | `--timeout-sec` |
-| `--backend aflpp` / `libfuzzer` | **아니오** — 엔진 실행 시간에는 적용되지 않는다 | 엔진 자신의 옵션(AFL++ `-V`, libFuzzer `-max_total_time`). 래퍼가 `--duration-seconds`에서 계산해 넘긴다 |
+| `--backend aflpp` / `libfuzzer` | **아니오** — 엔진 실행 시간에는 적용되지 않는다 | 엔진 자신의 옵션(AFL++ `-V`, libFuzzer `-max_total_time`). 명령 템플릿(`TOOL_AFLPP_CMD` / `TOOL_LIBFUZZER_CMD`)에 적은 값이 그대로 쓰이며, `--duration-seconds`에서 계산되지 않는다 |
 | 백엔드가 찾아낸 크래시의 트리아지 | **예** — 재현 시도 1회마다 적용 | `--timeout-sec` |
 
 설계상 의도된 동작이다. 엔진은 자기 루프를 스스로 관리하므로 바깥에서 한 번 더 묶으면
 코퍼스를 저장하지 못한 채 죽는다. 다만 **엔진 백엔드 블록의 총 실행 시간을 줄이려면
-`--timeout-sec`가 아니라 `--duration-seconds`(또는 캠페인의 `--block-seconds`)를 바꿔야 한다.**
+`--timeout-sec`가 아니라 `--duration-seconds`를 바꿔야 한다.** `--duration-seconds`는 엔진을
+반복 재실행하는 바깥 루프의 마감 시각을 묶는 값이고, 엔진 1회 실행 길이는 위 표대로 명령
+템플릿에 적은 `-V` / `-max_total_time`이 정한다. 주차 러너 `scripts/run_onnx_abc_week.sh`는
+`--block-seconds`를 `--duration-seconds`로, `--libfuzzer-max-total-time`을 템플릿의
+`-max_total_time`으로 각각 넘긴다(`tool campaign`에는 `--block-seconds`가 없다).
 
 엔진 명령 템플릿(`TOOL_AFLPP_CMD` / `TOOL_LIBFUZZER_CMD`)에는 `{timeout_sec}` 자리표시자가
 있으므로, 입력 1개당 상한을 엔진에 직접 넘기고 싶다면 템플릿에 명시적으로 넣으면 된다
