@@ -21,10 +21,12 @@ gitignored seeds, native harnesses, the built tool, and target data. Run this sc
 from the source tree; all check_*.sh scripts execute from DIR. DIR must contain no
 hardlinked files or symbolic links that resolve outside DIR. Logs are preserved.
 The scripts, ops scripts, Rust and fuzz source, Cargo manifests, templates,
-vendored dependencies, harnesses, debug tool, and coverage replay must match
-the source before any gate runs. Input data under data/ and seeds/ is supplied
+vendored dependencies, harnesses, and debug tool must match the source before
+any gate runs. The safetensors coverage replay is then rebuilt inside DIR from
+those verified inputs; its bytes are expected to differ because coverage maps
+contain the copy's absolute path. Input data under data/ and seeds/ is supplied
 by the caller and is not compared. Parent native executable, source-path,
-and Bash startup overrides are removed from each gate environment.
+build-output, and Bash startup overrides are removed.
 
 PASS means rc=0 with no recognized skip; SKIP means rc=0 with a recognized skip.
 FAIL means rc!=0, even if a skip was also reported. fail_with_skip is the number
@@ -113,8 +115,7 @@ done
 # running any gate; mutable data and seeds are caller-supplied test inputs.
 for dependency in scripts ops/scripts src Cargo.toml Cargo.lock \
     fuzz/Cargo.toml fuzz/Cargo.lock fuzz/src fuzz/fuzz_targets \
-    templates vendor harnesses target/debug/tool \
-    fuzz/target-cov/safetensors_loader_replay_cov; do
+    templates vendor harnesses target/debug/tool; do
   source_path="$SOURCE_ROOT/$dependency"
   copy_path="$ISOLATED_ROOT/$dependency"
   if [[ ! -e "$source_path" && ! -L "$source_path" \
@@ -147,6 +148,69 @@ else
   LOG_DIR="$(mktemp -d /tmp/check-suite-XXXXXX)"
 fi
 
+# An exported Bash function can survive the first shell and be imported by a
+# nested Bash process. Remove function exports as well as startup controls.
+shell_env_unsets=(-u BASH_ENV -u ENV -u BASHOPTS -u SHELLOPTS \
+  -u CDPATH -u GLOBIGNORE)
+while IFS= read -r -d '' assignment; do
+  name="${assignment%%=*}"
+  case "$name" in
+    BASH_FUNC_*) shell_env_unsets+=(-u "$name") ;;
+  esac
+done < <(env -0)
+
+# R117: a source-built coverage binary embeds absolute source paths, so copying
+# the source-tree binary into the isolated tree makes raw-reset filtering fail.
+# The build script is already covered by the scripts/ identity check above.
+# Rebuild from the verified copy cwd, with every supported output/compiler
+# override removed, and accept only the fixed copy-local output.
+coverage_builder_source="$SOURCE_ROOT/scripts/build_coverage_safetensors.sh"
+coverage_builder_copy="$ISOLATED_ROOT/scripts/build_coverage_safetensors.sh"
+coverage_replay_source="$SOURCE_ROOT/fuzz/target-cov/safetensors_loader_replay_cov"
+coverage_replay_copy="$ISOLATED_ROOT/fuzz/target-cov/safetensors_loader_replay_cov"
+if [[ -e "$coverage_builder_source" || -L "$coverage_builder_source" ]]; then
+  [[ -f "$coverage_builder_copy" && ! -L "$coverage_builder_copy" ]] \
+    || fail_setup 'isolated copy needs its own regular safetensors coverage builder'
+  [[ -d "$ISOLATED_ROOT/fuzz" && ! -L "$ISOLATED_ROOT/fuzz" ]] \
+    || fail_setup 'isolated copy needs its own regular fuzz directory'
+  build_target_dir="$(mktemp -d -- "$ISOLATED_ROOT/fuzz/.check-suite-target-cov-XXXXXX")" \
+    || fail_setup 'could not create a fresh copy-local coverage build directory'
+  build_log="$LOG_DIR/setup-safetensors-coverage-replay.log"
+  build_rc=0
+  (
+    cd -- "$ISOLATED_ROOT"
+    env "${shell_env_unsets[@]}" \
+      -u FUZZ_DIR -u COV_TARGET_DIR -u OUT_BIN \
+      -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR -u CARGO_BUILD_TARGET \
+      -u RUSTC -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
+      -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u LLVM_PROFILE_FILE \
+      -u PROJECT_ROOT -u WORKDIR -u TOOL_BIN \
+      PROJECT_ROOT="$ISOLATED_ROOT" COV_TARGET_DIR="$build_target_dir" \
+      OUT_BIN="$coverage_replay_copy" \
+      bash -p scripts/build_coverage_safetensors.sh
+  ) >"$build_log" 2>&1 || build_rc=$?
+  rm -rf -- "$build_target_dir" \
+    || fail_setup "could not remove temporary coverage build directory: $build_target_dir"
+  [[ "$build_rc" -eq 0 ]] \
+    || fail_setup "copy-local safetensors coverage replay build failed rc=$build_rc (log: $build_log)"
+  [[ -f "$coverage_replay_copy" && ! -L "$coverage_replay_copy" \
+     && -x "$coverage_replay_copy" ]] \
+    || fail_setup 'copy-local safetensors coverage replay is not a regular executable file'
+  replay_resolved="$(realpath -e -- "$coverage_replay_copy")" \
+    || fail_setup 'could not resolve copy-local safetensors coverage replay'
+  case "$replay_resolved/" in
+    "$ISOLATED_ROOT/"*) : ;;
+    *) fail_setup "coverage replay escaped isolated root: $replay_resolved" ;;
+  esac
+  replay_sha256="$(sha256sum -- "$coverage_replay_copy" | awk '{print $1}')" \
+    || fail_setup 'could not hash copy-local safetensors coverage replay'
+  printf '[suite] rebuilt safetensors coverage replay sha256=%s log=%s\n' \
+    "$replay_sha256" "$build_log"
+elif [[ -e "$coverage_replay_source" || -L "$coverage_replay_source" \
+     || -e "$coverage_replay_copy" || -L "$coverage_replay_copy" ]]; then
+  fail_setup 'safetensors coverage replay exists without its verified build script'
+fi
+
 printf '[suite] source=%s\n[suite] isolated=%s\n[suite] logs=%s\n' \
   "$SOURCE_ROOT" "$ISOLATED_ROOT" "$LOG_DIR"
 printf '[suite] ALLOW_SKIPPED_CASES is unset for every gate\n'
@@ -156,17 +220,6 @@ has_skip_evidence() {
   local log="$1"
   grep -Eq '^\[[^]]+\][[:space:]]+(SKIP:|skip([[:space:]:]|$)|.*skipping([[:space:](]|$)|WARN: continuing with .*skipp?ed|.*[[:space:]]skip=[1-9][0-9]*([[:space:]]|$)|.*[[:space:]]skipped[[:space:]]+[1-9][0-9]*([[:space:]]|$))' "$log"
 }
-
-# An exported Bash function can survive the first gate shell and be imported by
-# a nested Bash process. Remove function exports as well as startup controls.
-shell_env_unsets=(-u BASH_ENV -u ENV -u BASHOPTS -u SHELLOPTS \
-  -u CDPATH -u GLOBIGNORE)
-while IFS= read -r -d '' assignment; do
-  name="${assignment%%=*}"
-  case "$name" in
-    BASH_FUNC_*) shell_env_unsets+=(-u "$name") ;;
-  esac
-done < <(env -0)
 
 pass=0
 skip=0

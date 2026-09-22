@@ -269,30 +269,104 @@ REPLAY_COPY="$WORK/replay-copy"
 mkdir -p "$REPLAY_SOURCE/fuzz/target-cov"
 cp -a "$SOURCE/." "$REPLAY_SOURCE/"
 rm "$REPLAY_SOURCE/scripts/check_fail.sh" "$REPLAY_SOURCE/scripts/check_skip.sh"
+# A copy-local coverage replay is expected to differ from the source binary: its
+# coverage mapping contains the copy's absolute source path. The runner must trust
+# only an output that it rebuilt itself from already-verified scripts and sources.
+cat >"$REPLAY_SOURCE/scripts/build_coverage_safetensors.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$PWD" == "$PROJECT_ROOT" ]] || { echo 'builder ran from the wrong cwd' >&2; exit 81; }
+[[ ! ${FUZZ_DIR+x} ]] \
+  || { echo 'builder inherited a fuzz-root override' >&2; exit 82; }
+[[ "$COV_TARGET_DIR" == "$PROJECT_ROOT/fuzz/.check-suite-target-cov-"* \
+   && -d "$COV_TARGET_DIR" \
+   && "$OUT_BIN" == "$PROJECT_ROOT/fuzz/target-cov/safetensors_loader_replay_cov" ]] \
+  || { echo 'builder did not receive a fresh controlled output path' >&2; exit 84; }
+[[ ! ${CARGO_TARGET_DIR+x} && ! ${RUSTFLAGS+x} && ! ${LLVM_PROFILE_FILE+x} ]] \
+  || { echo 'builder inherited a compiler-output override' >&2; exit 83; }
+mkdir -p "$PROJECT_ROOT/fuzz/target-cov"
+cat >"$PROJECT_ROOT/fuzz/target-cov/safetensors_loader_replay_cov" <<'REPLAY'
+#!/usr/bin/env bash
+echo 'rebuilt inside verified copy'
+exit 0
+REPLAY
+chmod +x "$PROJECT_ROOT/fuzz/target-cov/safetensors_loader_replay_cov"
+printf 'copy-local build\n' >"$PROJECT_ROOT/replay-build.marker"
+echo '[fixture-build] rebuilt copy-local replay'
+EOF
+chmod +x "$REPLAY_SOURCE/scripts/build_coverage_safetensors.sh"
 printf '#!/usr/bin/env bash\nexit 1\n' \
   >"$REPLAY_SOURCE/fuzz/target-cov/safetensors_loader_replay_cov"
 chmod +x "$REPLAY_SOURCE/fuzz/target-cov/safetensors_loader_replay_cov"
 cat >"$REPLAY_SOURCE/scripts/check_replay.sh" <<'EOF'
 #!/usr/bin/env bash
-"$PROJECT_ROOT/fuzz/target-cov/safetensors_loader_replay_cov"
+output="$("$PROJECT_ROOT/fuzz/target-cov/safetensors_loader_replay_cov")"
+[[ "$output" == 'rebuilt inside verified copy' ]]
+[[ -f "$PROJECT_ROOT/replay-build.marker" ]]
 EOF
 cp -a "$REPLAY_SOURCE/." "$REPLAY_COPY/"
-printf '#!/usr/bin/env bash\nexit 0\n' \
+printf '#!/usr/bin/env bash\necho arbitrary-prebuilt\nexit 0\n' \
   >"$REPLAY_COPY/fuzz/target-cov/safetensors_loader_replay_cov"
 rc=0
 PROJECT_ROOT="$REPLAY_SOURCE" bash "$REPLAY_SOURCE/scripts/check_replay.sh" \
   >"$WORK/replay-direct.log" 2>&1 || rc=$?
 [[ "$rc" -eq 1 ]] || { echo "source replay did not fail (rc=$rc)" >&2; exit 1; }
 rc=0
+CARGO_TARGET_DIR="$SOURCE/escaped-cargo-target" \
+FUZZ_DIR="$SOURCE/escaped-fuzz" COV_TARGET_DIR="$SOURCE/escaped-cov" \
+OUT_BIN="$SOURCE/escaped-replay" RUSTFLAGS='-Copt-level=0' \
+LLVM_PROFILE_FILE="$SOURCE/escaped-%p.profraw" \
 bash "$REPLAY_SOURCE/scripts/run_check_suite.sh" --isolated-root "$REPLAY_COPY" \
   --log-dir "$WORK/replay-logs" >"$WORK/replay-drift.log" 2>&1 || rc=$?
-[[ "$rc" -eq 2 ]] || {
+[[ "$rc" -eq 0 ]] || {
   cat "$WORK/replay-drift.log"
-  echo "coverage replay drift was accepted (rc=$rc)" >&2
+  echo "copy-local coverage replay was not rebuilt (rc=$rc)" >&2
   exit 1
 }
-grep -Fq 'fuzz/target-cov/safetensors_loader_replay_cov differs from source' \
-  "$WORK/replay-drift.log"
+grep -Fq 'check_replay.sh: PASS' "$WORK/replay-drift.log"
+grep -Fq '[fixture-build] rebuilt copy-local replay' \
+  "$WORK/replay-logs/setup-safetensors-coverage-replay.log"
+grep -Fxq 'copy-local build' "$REPLAY_COPY/replay-build.marker"
+grep -Fq 'rebuilt inside verified copy' \
+  "$REPLAY_COPY/fuzz/target-cov/safetensors_loader_replay_cov"
+[[ -z "$(find "$REPLAY_COPY/fuzz" -maxdepth 1 -type d \
+  -name '.check-suite-target-cov-*' -print -quit)" ]] || {
+  echo 'runner left its temporary coverage build directory behind' >&2
+  exit 1
+}
+[[ ! -e "$SOURCE/escaped-cargo-target" && ! -e "$SOURCE/escaped-fuzz" \
+   && ! -e "$SOURCE/escaped-cov" && ! -e "$SOURCE/escaped-replay" ]] || {
+  echo 'copy-local builder wrote through an inherited output path' >&2
+  exit 1
+}
+
+# A real host can lack nightly/llvm-tools. That is a setup refusal, not a gate
+# verdict, and the runner must still remove the fresh target directory it made.
+cat >"$REPLAY_SOURCE/scripts/build_coverage_safetensors.sh" <<'EOF'
+#!/usr/bin/env bash
+echo 'fixture: nightly toolchain unavailable' >&2
+exit 77
+EOF
+cp "$REPLAY_SOURCE/scripts/build_coverage_safetensors.sh" \
+  "$REPLAY_COPY/scripts/build_coverage_safetensors.sh"
+rc=0
+bash "$REPLAY_SOURCE/scripts/run_check_suite.sh" --isolated-root "$REPLAY_COPY" \
+  --log-dir "$WORK/replay-build-failure-logs" \
+  >"$WORK/replay-build-failure.log" 2>&1 || rc=$?
+[[ "$rc" -eq 2 ]] || {
+  cat "$WORK/replay-build-failure.log"
+  echo "coverage replay build failure was not a setup refusal (rc=$rc)" >&2
+  exit 1
+}
+grep -Fq 'copy-local safetensors coverage replay build failed rc=77' \
+  "$WORK/replay-build-failure.log"
+grep -Fq 'fixture: nightly toolchain unavailable' \
+  "$WORK/replay-build-failure-logs/setup-safetensors-coverage-replay.log"
+[[ -z "$(find "$REPLAY_COPY/fuzz" -maxdepth 1 -type d \
+  -name '.check-suite-target-cov-*' -print -quit)" ]] || {
+  echo 'failed builder left its temporary coverage build directory behind' >&2
+  exit 1
+}
 
 NATIVE_SOURCE="$WORK/native-source"
 NATIVE_COPY="$WORK/native-copy"
