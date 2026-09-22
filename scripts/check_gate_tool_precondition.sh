@@ -59,8 +59,9 @@
 # path in the pattern itself - executable code, not prose.
 #
 # Assertion 6 exists because assertion 1 can be unreachable, and both ways of it were measured
-# on 2026-09-19. check_onnx_libfuzzer_crash_artifacts.sh refuses over a missing PoC before it
-# reaches TOOL_BIN, which this gate scores as a skip. And both ONNX gates ran
+# on 2026-09-19. check_onnx_libfuzzer_crash_artifacts.sh refused over a missing PoC before it
+# reached TOOL_BIN, which this gate scored as a skip until the controlled absent-tool arm
+# below made that branch observable without the private PoC. And both ONNX gates ran
 # `cargo build --offline` when the binary was missing, so there was no absent binary left to
 # refuse over - the same self-build that is R92's mechanism, one gate manufacturing another
 # gate's precondition until suite verdicts depend on run order. `cargo build` installs at
@@ -150,9 +151,22 @@ refusal_verdict() {
 
 # Both polarities go through here so that nothing the operator exported can decide the
 # verdict: ALLOW_SKIPPED_CASES=1 downgrades a subject's refusal to a warning (R42's opt-out,
-# and now check_onnx_libfuzzer_crash_artifacts.sh's too), and an exported PoC path would
-# carry that subject straight past the branch under test into a native build.
+# and now check_onnx_libfuzzer_crash_artifacts.sh's too), and an exported PoC path must not
+# decide whether this contract reaches the TOOL_BIN branch. The one subject whose PoC guard
+# comes first gets a controlled input below in the absent-tool arm: its digest check alone
+# is stubbed, so that arm reaches the refusal without making this meta-gate depend on a
+# private crash file. The executable-tool arm keeps the PoC absent; its only assertion is
+# that an unrelated refusal does not echo the absent path, and stopping there avoids running
+# a native build that is outside this contract.
 run_gate() { # run_gate <gate> <tool-bin>
+  if [[ "$(basename "$1")" == 'check_onnx_libfuzzer_crash_artifacts.sh' && "$2" == "$ABSENT" ]]; then
+    env -u ALLOW_SKIPPED_CASES -u ONNX_SIGSEGV_POC -u ONNX_CRASH_POC -u ONNX_SIGFPE_POC \
+      TMPDIR="$WORK" ONNX_SIGSEGV_POC="$CONTROLLED_POC" \
+      CONTROLLED_POC="$CONTROLLED_POC" REAL_SHA256SUM="$REAL_SHA256SUM" \
+      PATH="$CONTROLLED_BIN:$PATH" TOOL_BIN_PROBE_LOG="$TOOL_PROBE_LOG" TOOL_BIN="$2" \
+      timeout 300 bash "$1" 2>&1
+    return
+  fi
   env -u ALLOW_SKIPPED_CASES -u ONNX_SIGSEGV_POC -u ONNX_CRASH_POC -u ONNX_SIGFPE_POC \
     TMPDIR="$WORK" TOOL_BIN_PROBE_LOG="$TOOL_PROBE_LOG" TOOL_BIN="$2" timeout 300 bash "$1" 2>&1
 }
@@ -166,6 +180,26 @@ printf 'invoked\n' >>"$TOOL_BIN_PROBE_LOG"
 exit 0
 EOF
 chmod +x "$EXECUTABLE_TOOL_PROBE"
+
+# check_onnx_libfuzzer_crash_artifacts.sh authenticates its private crash PoC before it
+# checks TOOL_BIN. This gate is not a second test of that private artifact; it only needs to
+# cross that earlier guard deterministically in the absent-tool arm. The shim recognizes one
+# controlled file and delegates every other sha256sum call to the host binary.
+REAL_SHA256SUM="$(command -v sha256sum)"
+CONTROLLED_ROOT="$WORK/controlled-onnx-artifact-subject"
+CONTROLLED_BIN="$CONTROLLED_ROOT/bin"
+CONTROLLED_POC="$CONTROLLED_ROOT/private-poc-placeholder.onnx"
+mkdir -p "$CONTROLLED_BIN"
+printf 'controlled input for TOOL_BIN precondition only\n' >"$CONTROLLED_POC"
+cat >"$CONTROLLED_BIN/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$#" -eq 1 && "$1" == "$CONTROLLED_POC" ]]; then
+  printf '61d1c65cde3c8ba65433229f23704f5163708f001664c5a5cced5e28cc202ac8  %s\n' "$1"
+  exit 0
+fi
+exec "$REAL_SHA256SUM" "$@"
+EOF
+chmod +x "$CONTROLLED_BIN/sha256sum"
 
 # A floor, not just an emptiness test: R95 was a scan that found 3 where 4 drive the tool,
 # and `subjects=3 ... fail=0` exits 0. Raise it when a subject is added on purpose.
