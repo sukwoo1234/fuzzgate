@@ -67,7 +67,11 @@ make_sandbox() {
   mkdir -p "$root/scripts"
   cat >"$root/scripts/build_libfuzzer_onnx_native.sh" <<'STUB'
 #!/usr/bin/env bash
-: >"$(dirname -- "$0")/../build-was-reached"
+root="$(cd -- "$(dirname -- "$0")/.." && pwd -P)"
+: >"$root/build-was-reached"
+mkdir -p "$root/harnesses/libfuzzer"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$root/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
+chmod +x "$root/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
 STUB
   chmod +x "$root/scripts/build_libfuzzer_onnx_native.sh"
   cat >"$root/tool" <<'STUB'
@@ -152,6 +156,64 @@ if [[ -e "$DD2/stale-from-a-previous-run" ]]; then
   bad 'the checker stopped wiping DATA_DIR; stale state from a previous run survived'
 else
   ok 'the checker still wipes DATA_DIR on the path it is allowed to take'
+fi
+
+# --- 3b. an existing operational harness must be observed, not reinstalled ----------------
+# Case 2 proves the bootstrap polarity: a missing fuzzer reaches the build marker. This is
+# the R73 side that used to be absent from the gate. Plant an executable first, then require
+# both the build marker and the harness fingerprint to stay unchanged while the checker gets
+# past the PoC/data guards. The tool stub still stops the synthetic run before status parsing;
+# that later failure is irrelevant to whether the checker rewrote its precondition.
+R8="$WORK/case8"; make_sandbox "$R8"
+mkdir -p "$R8/harnesses/libfuzzer"
+printf '#!/usr/bin/env bash\nexit 77\n' >"$R8/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
+chmod +x "$R8/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
+F8="$R8/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
+F8_BEFORE="$(stat -c '%d:%i:%s:%a:%Y:%Z' "$F8"):$(sha256sum "$F8" | awk '{print $1}')"
+DD8="$R8/data/onnx-libfuzzer-artifact-check"
+mkdir -p "$DD8"
+: >"$DD8/stale-from-a-previous-run"
+res8="$(probe "$CHECKER" "$R8" "$DD8" "$OUTSIDE" "$WORK/case8.log")"
+F8_AFTER="$(stat -c '%d:%i:%s:%a:%Y:%Z' "$F8"):$(sha256sum "$F8" | awk '{print $1}')"
+case "$res8" in
+  *built=no*) ok "an existing ONNX libFuzzer harness is not rebuilt ($res8)" ;;
+  *)          bad "the checker rebuilt an existing ONNX libFuzzer harness ($res8)" ;;
+esac
+if [[ "$F8_AFTER" == "$F8_BEFORE" ]]; then
+  ok 'the existing ONNX libFuzzer harness fingerprint is unchanged'
+else
+  bad 'the existing ONNX libFuzzer harness fingerprint changed'
+fi
+if [[ -e "$DD8/stale-from-a-previous-run" ]]; then
+  bad 'the existing-harness probe stopped before the allowed DATA_DIR wipe'
+else
+  ok 'the existing-harness probe reached the allowed DATA_DIR wipe'
+fi
+
+# Opposite polarity for 3b: derive the old unguarded shape from the real checker. The same
+# existing-harness probe must now reach the build marker, or the assertion above could pass
+# merely because the synthetic run stopped before the build site.
+UNGUARDED_BUILD="$WORK/check_unguarded_build.sh"
+awk '
+  $0 == "if [[ ! -x \"$LF_FUZZER\" ]]; then" { drop_guard = 1; next }
+  drop_guard && $0 == "fi" { drop_guard = 0; next }
+  { print }
+' "$CHECKER" >"$UNGUARDED_BUILD"
+if [[ "$(grep -c '^if \[\[ ! -x \"\$LF_FUZZER\" \]\]; then$' "$UNGUARDED_BUILD")" -ne 0 ]] \
+   || [[ "$(grep -c 'build_libfuzzer_onnx_native.sh' "$UNGUARDED_BUILD")" -lt 1 ]]; then
+  bad 'could not derive the unguarded-build variant; the R73 negative control is unanchored'
+else
+  R9="$WORK/case9"; make_sandbox "$R9"
+  mkdir -p "$R9/harnesses/libfuzzer"
+  printf '#!/usr/bin/env bash\nexit 77\n' >"$R9/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
+  chmod +x "$R9/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
+  DD9="$R9/data/onnx-libfuzzer-artifact-check"
+  mkdir -p "$DD9"
+  res9="$(probe "$UNGUARDED_BUILD" "$R9" "$DD9" "$OUTSIDE" "$WORK/case9.log")"
+  case "$res9" in
+    *built=yes*) ok "negative control: the old unguarded shape rebuilds an existing harness ($res9)" ;;
+    *)           bad "negative control: the old unguarded shape was not observed rebuilding ($res9)" ;;
+  esac
 fi
 
 # --- 4. the spellings that do not look like DATA_DIR ------------------------------------

@@ -55,10 +55,16 @@ printf '%q ' -runs="$RUNS" -max_len=1048576 -artifact_prefix="$WORK/artifacts/" 
   >>"$WORK/configuration.log"
 printf '\n' >>"$WORK/configuration.log"
 
-# build the harness if missing
+# Build only when the pair is incomplete. The builder always produces both outputs, so an
+# already executable peer is routed into scratch instead of being reinstalled.
 if [[ ! -x "$FUZZER" || ! -x "$REPLAY" ]]; then
   log "harness missing; building"
-  bash "$PROJECT_ROOT/scripts/build_libfuzzer_safetensors_native.sh" >"$WORK/libfuzzer-build.log" 2>&1 \
+  BUILD_FUZZER_OUT="$FUZZER"
+  BUILD_REPLAY_OUT="$REPLAY"
+  [[ -x "$FUZZER" ]] && BUILD_FUZZER_OUT="$WORK/already-present-fuzzer"
+  [[ -x "$REPLAY" ]] && BUILD_REPLAY_OUT="$WORK/already-present-replay"
+  OUT_FUZZER="$BUILD_FUZZER_OUT" OUT_REPLAY="$BUILD_REPLAY_OUT" \
+    bash "$PROJECT_ROOT/scripts/build_libfuzzer_safetensors_native.sh" >"$WORK/libfuzzer-build.log" 2>&1 \
     || fail "native build failed; see $WORK/libfuzzer-build.log"
 fi
 [[ -x "$FUZZER" ]] || fail "libFuzzer target not built: $FUZZER"
@@ -130,10 +136,12 @@ run_aflpp_showmap() {
 if [[ -n "$AFLPP_SHOWMAP_MODE" ]]; then
   mkdir -p "$AFLPP_CHECK_DIR"
   if [[ "$AFLPP_SHOWMAP_MODE" == "cargo-afl" ]]; then
-    log "build AFL++ safetensors replay with cargo-afl"
-    OUT="$AFLPP_REPLAY" bash "$PROJECT_ROOT/scripts/build_aflpp_safetensors_native.sh" \
-      >"$AFLPP_CHECK_DIR/safetensors-aflpp-build.log" 2>&1 \
-      || fail "AFL++ Rust build failed; see $AFLPP_CHECK_DIR/safetensors-aflpp-build.log"
+    if [[ ! -x "$AFLPP_REPLAY" ]]; then
+      log "AFL++ safetensors replay missing; building with cargo-afl"
+      OUT="$AFLPP_REPLAY" bash "$PROJECT_ROOT/scripts/build_aflpp_safetensors_native.sh" \
+        >"$AFLPP_CHECK_DIR/safetensors-aflpp-build.log" 2>&1 \
+        || fail "AFL++ Rust build failed; see $AFLPP_CHECK_DIR/safetensors-aflpp-build.log"
+    fi
   fi
 
   [[ -x "$AFLPP_REPLAY" ]] \

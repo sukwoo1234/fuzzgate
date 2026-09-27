@@ -98,10 +98,10 @@ log "crate pin ok: safetensors $ST_CRATE_VER in fuzz/Cargo.lock"
 
 # R46: stage the new replay beside $OUT and only move it into place once the build and
 # the instrumentation-scope check have both passed. This script used to `rm -f "$OUT"`
-# here, before cargo ran. check_safetensors_native_engines.sh calls it on every cargo-afl
-# run whether or not the replay already exists, so any build failure - offline
-# resolution, toolchain, RAM - destroyed a replay that is the only copy on the fuzzing
-# computer. The staging file is a sibling, so the mv is a same-filesystem rename.
+# here, before cargo ran. check_safetensors_native_engines.sh now calls it only when the
+# replay is missing. Before staging, a requested replacement failure - offline resolution,
+# toolchain, or RAM - could destroy a replay that was the only copy on the fuzzing computer.
+# The staging file is a sibling, so the mv is a same-filesystem rename.
 # R49/R55: the staging discipline R46 introduced here now lives in one place, so this
 # build also gets the properties it was missing - 0755 instead of 0711, no 0-byte
 # install, symlink and directory handling. See scripts/lib/staged_install.sh.

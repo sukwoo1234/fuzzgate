@@ -13,8 +13,9 @@
 #
 # harnesses/{aflpp,libfuzzer}/ binaries are covered by .gitignore, so git cannot
 # restore them, and rebuilding needs an instrumented onnxruntime .so or an AFL++ toolchain
-# the dev machine does not have. The checkers call these builds unconditionally whenever
-# the tooling is on PATH - there is no "already exists" skip.
+# the dev machine does not have. Operational checkers now preserve each output that already
+# exists (pair builders route that peer into scratch); explicit bootstrap and build-gate
+# runs still need atomic replacement.
 #
 # Contract, in the order the helpers are meant to be used:
 #

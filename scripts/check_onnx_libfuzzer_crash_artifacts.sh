@@ -5,6 +5,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 TOOL_BIN="${TOOL_BIN:-$PROJECT_ROOT/target/debug/tool}"
 DATA_DIR="${DATA_DIR:-$PROJECT_ROOT/data/onnx-libfuzzer-artifact-check}"
 CRASH_POC="${ONNX_CRASH_POC:-${ONNX_SIGSEGV_POC:-}}"
+LF_FUZZER="$PROJECT_ROOT/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
 REQUIRE_POC=0
 
 SIGSEGV_SHA256="61d1c65cde3c8ba65433229f23704f5163708f001664c5a5cced5e28cc202ac8"
@@ -19,7 +20,7 @@ or:
   ONNX_CRASH_POC=/path/to/crash_protobuf.onnx
 
 Checks:
-  - native libFuzzer harness is built
+  - native libFuzzer harness is reused when executable, or built when missing
   - libFuzzer writes a crash artifact under artifact_prefix
   - tool run ingests backend artifacts
   - automatic backend triage reproduces at least one crash
@@ -104,8 +105,8 @@ actual_sha="$(sha256sum "$CRASH_POC" | awk '{print $1}')"
 # removes. The A11 guard next to that rm inspects DATA_DIR's *name* only, so it cannot see
 # this case: the name is exactly the dedicated one it demands. Compare resolved paths and
 # not text, because a symlink or a `..` walks straight through a string test. Refusing here,
-# before the tool and the harness are built, makes the refusal immediate instead of costing
-# a native build first.
+# before the tool precondition and harness bootstrap, makes the refusal immediate instead
+# of costing a native build first.
 poc_real="$(realpath -- "$CRASH_POC")"
 data_real="$(realpath -m -- "$DATA_DIR")"
 case "$poc_real" in
@@ -128,8 +129,12 @@ if [[ ! -x "$TOOL_BIN" ]]; then
   exit 1
 fi
 
-log "build native libFuzzer harness"
-"$PROJECT_ROOT/scripts/build_libfuzzer_onnx_native.sh" >/tmp/onnx-libfuzzer-artifact-build.log
+if [[ ! -x "$LF_FUZZER" ]]; then
+  log "native libFuzzer harness missing; building"
+  BUILD_STANDALONE=0 OUT="$LF_FUZZER" \
+    "$PROJECT_ROOT/scripts/build_libfuzzer_onnx_native.sh" >/tmp/onnx-libfuzzer-artifact-build.log
+fi
+[[ -x "$LF_FUZZER" ]] || fail "native libFuzzer harness not produced: $LF_FUZZER"
 
 # A11 guard: never wipe a caller-supplied DATA_DIR that is not the dedicated scratch
 # dir. Exporting DATA_DIR=<real data root> for a fuzzing session is a documented

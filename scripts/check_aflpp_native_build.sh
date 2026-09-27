@@ -2,10 +2,10 @@
 # R49: the AFL++ GGUF and ONNX builds must never destroy the existing replay before they
 # have a verified replacement. Both scripts compile straight onto the operational path
 # (build_aflpp_gguf_native.sh's `-o "$OUT"` link step, build_aflpp_onnx_native.sh's
-# `-o "$OUT"`), and check_{gguf,onnx}_native_engines.sh call them on every run that finds
-# AFL++ on PATH - no `[[ -x $replay ]]` skip. On the fuzzing computer
-# harnesses/aflpp/onnxruntime_loader_replay is the only copy and .gitignore keeps the whole
-# directory untracked, so git cannot restore it.
+# `-o "$OUT"`). The engine checks now call them only when their replay is missing; on the
+# fuzzing computer a requested replacement still targets the operational path.
+# harnesses/aflpp/onnxruntime_loader_replay is the only copy, and .gitignore keeps the
+# whole directory untracked, so git cannot restore it.
 #
 # The failure is narrower than R46's explicit `rm -f`, and this test pins the real
 # behaviour rather than the assumed one: a compile-stage failure leaves the -o target

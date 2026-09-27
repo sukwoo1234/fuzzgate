@@ -16,12 +16,12 @@ usage() {
 usage: check_gguf_native_engines.sh [--require-aflpp]
 
 Proves both GGUF engine arms actually run the parser:
-  - builds the native libFuzzer target and the standalone replay
+  - uses the native libFuzzer target and standalone replay, installing only missing outputs
   - RUNS the libFuzzer target on a good seed (clean) and on a known PoC (crash
     artifact). The ONNX check only builds; GGUF must run, because the libFuzzer
     entry stages input through a memfd while the replay opens a real path - two
     different code paths, so one passing says nothing about the other.
-  - when AFL++ tools exist, builds the instrumented replay and requires
+  - when AFL++ tools exist, uses the instrumented replay, building it only if missing, and requires
     afl-showmap coverage AND library-wide instrumentation scope
   - with --require-aflpp, missing AFL++ tools or driver-only scope is a failure
 EOF
@@ -74,13 +74,18 @@ SEED_ROOT="$SEED_ROOT" bash "$PROJECT_ROOT/scripts/gen_gguf_malformed_seeds.sh" 
 [[ -f "$SEED" && -s "$SEED" ]] || fail "seed missing, empty or not a regular file: $SEED"
 [[ -f "$POC"  ]] || fail "poc not found: $POC"
 
-# Build only when the harness is missing, the shape check_safetensors_native_engines.sh
-# already uses. Building unconditionally reinstalled harnesses/libfuzzer/gguf_loader_*
-# on every run of the check suite: this script observes those binaries, so rewriting
-# them is a side effect, and BASE-02 pins them by hash.
+# Build only when the pair is incomplete. The builder always produces both outputs, so an
+# already executable peer is routed into scratch instead of being reinstalled. This script
+# observes the operational binaries and BASE-02 pins them by hash; rewriting either peer is
+# a side effect even when the other one really does need bootstrap.
 if [[ ! -x "$FUZZER" || ! -x "$REPLAY" ]]; then
   log "harness missing; building native libFuzzer target and standalone replay"
-  bash "$PROJECT_ROOT/scripts/build_libfuzzer_gguf_native.sh" >"$OUT_DIR/libfuzzer-build.log" 2>&1 \
+  BUILD_FUZZER_OUT="$FUZZER"
+  BUILD_REPLAY_OUT="$REPLAY"
+  [[ -x "$FUZZER" ]] && BUILD_FUZZER_OUT="$WORK/already-present-fuzzer"
+  [[ -x "$REPLAY" ]] && BUILD_REPLAY_OUT="$WORK/already-present-replay"
+  OUT_FUZZER="$BUILD_FUZZER_OUT" OUT_REPLAY="$BUILD_REPLAY_OUT" \
+    bash "$PROJECT_ROOT/scripts/build_libfuzzer_gguf_native.sh" >"$OUT_DIR/libfuzzer-build.log" 2>&1 \
     || fail "native build failed; see $OUT_DIR/libfuzzer-build.log"
 fi
 [[ -x "$FUZZER" ]] || fail "libFuzzer target not produced: $FUZZER"
@@ -144,9 +149,12 @@ log "OK   poc in corpus: artifact written, replay reproduces it (134)"
 . "$PROJECT_ROOT/scripts/lib/engine_mode.sh"
 
 if command -v afl-clang-fast++ >/dev/null 2>&1 && command -v afl-showmap >/dev/null 2>&1; then
-  log "build AFL++ replay with the parser instrumented"
-  bash "$PROJECT_ROOT/scripts/build_aflpp_gguf_native.sh" >"$OUT_DIR/aflpp-build.log" 2>&1 \
-    || fail "AFL++ build failed; see $OUT_DIR/aflpp-build.log"
+  if [[ ! -x "$AFLPP_REPLAY" ]]; then
+    log "AFL++ replay missing; building with the parser instrumented"
+    OUT="$AFLPP_REPLAY" bash "$PROJECT_ROOT/scripts/build_aflpp_gguf_native.sh" \
+      >"$OUT_DIR/aflpp-build.log" 2>&1 \
+      || fail "AFL++ build failed; see $OUT_DIR/aflpp-build.log"
+  fi
   [[ -x "$AFLPP_REPLAY" ]] || fail "AFL++ replay not produced: $AFLPP_REPLAY"
 
   scope="$(instrumentation_scope "$AFLPP_REPLAY")"

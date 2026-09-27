@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # R46: the AFL++ safetensors build must never destroy the existing replay before it has
-# a verified replacement. scripts/check_safetensors_native_engines.sh calls the build on
-# every cargo-afl run regardless of whether the replay already exists, and on the fuzzing
+# a verified replacement. scripts/check_safetensors_native_engines.sh now calls the build
+# only when its replay is missing, and on the fuzzing
 # computer that replay is the only copy (it is the binary behind R21's tuples=612
 # evidence). A build that fails for any reason - offline resolution, toolchain, RAM -
 # must leave it byte-identical.

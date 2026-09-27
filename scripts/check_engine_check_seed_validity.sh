@@ -41,8 +41,8 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ok   %s\n' "$*"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$*"; }
 
-# The AFL++ arm of both checkers builds, so this gate hides afl-clang-fast++ and afl-showmap
-# and lets that arm take its documented skip branch - on a machine with AFL++ installed just
+# The AFL++ arms may bootstrap a missing replay, so this gate hides afl-clang-fast++ and
+# afl-showmap and lets them take their documented skip branch - on an AFL++ host just
 # as on one without. The gate must not mean something different depending on the machine.
 #
 # Dropping the whole PATH entry is not good enough: `apt install afl++` puts afl-showmap in
@@ -73,7 +73,7 @@ SAFE_PATH="$(afl_free_path)"
 
 # Said out loud rather than assumed: if the shimmed PATH lost a tool the checkers need, every
 # "refuses without running anything" below would be true because nothing could start. And if
-# it still finds the AFL++ tools, the arm this gate means to skip would build.
+# it still finds the AFL++ tools, an absent replay could make the arm build.
 # Asked in a fresh shell with PATH in its ENVIRONMENT: a `PATH=... command -v` prefix does
 # not change the lookup the current shell performs, and bash answers `command -v` from its
 # hash table, so both spellings would report on the gate's own PATH instead of the sandbox's.

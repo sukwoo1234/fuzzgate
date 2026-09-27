@@ -11,10 +11,10 @@ usage() {
 usage: check_onnx_native_engines.sh [--require-aflpp]
 
 Checks native ONNX fuzz engine plumbing without committing PoCs:
-  - builds native libFuzzer ONNX harness
-  - builds native standalone replay
+  - uses the native libFuzzer ONNX harness, installing it only if missing
+  - uses the native standalone replay, installing it only if missing
   - runs a known-good seed through both
-  - when AFL++ tools exist, builds AFL++ native replay and verifies afl-showmap coverage
+  - when AFL++ tools exist, uses the AFL++ native replay, building it only if missing, and verifies afl-showmap coverage
   - with --require-aflpp, missing AFL++ tools or zero coverage is a hard failure
 EOF
 }
@@ -68,23 +68,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Build only when the harness is missing, the shape check_safetensors_native_engines.sh
-# already uses. Building unconditionally reinstalled harnesses/libfuzzer/onnxruntime_*
-# on every run of the check suite: this script observes those binaries, so rewriting
-# them is a side effect, and SO_DIR auto-detection can pick a differently instrumented
-# build than the one that was originally installed.
+# Build only when the pair is incomplete. The builder always produces the fuzzer and can
+# produce the replay in the same call, so an already executable peer is routed into scratch
+# instead of being reinstalled. SO_DIR auto-detection can pick a differently instrumented
+# build than the one that was originally installed, making partial-pair preservation part
+# of the same no-rewrite contract as the complete-pair case.
 LF_FUZZER="$PROJECT_ROOT/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
 LF_REPLAY="$PROJECT_ROOT/harnesses/libfuzzer/onnxruntime_loader_replay"
+AFLPP_REPLAY="$PROJECT_ROOT/harnesses/aflpp/onnxruntime_loader_replay"
 
-if [[ ! -x "$LF_FUZZER" ]]; then
-  log "libFuzzer harness missing; building"
-  "$PROJECT_ROOT/scripts/build_libfuzzer_onnx_native.sh" >/tmp/onnx-native-libfuzzer-build.log
+if [[ ! -x "$LF_FUZZER" || ! -x "$LF_REPLAY" ]]; then
+  log "libFuzzer harness pair incomplete; building missing output(s)"
+  BUILD_FUZZER_OUT="$LF_FUZZER"
+  BUILD_REPLAY_OUT="$LF_REPLAY"
+  [[ -x "$LF_FUZZER" ]] && BUILD_FUZZER_OUT="$WORK/already-present-fuzzer"
+  [[ -x "$LF_REPLAY" ]] && BUILD_REPLAY_OUT="$WORK/already-present-replay"
+  BUILD_STANDALONE=1 OUT="$BUILD_FUZZER_OUT" STANDALONE_OUT="$BUILD_REPLAY_OUT" \
+    "$PROJECT_ROOT/scripts/build_libfuzzer_onnx_native.sh" >/tmp/onnx-native-libfuzzer-build.log
 fi
-
-if [[ ! -x "$LF_REPLAY" ]]; then
-  log "standalone replay missing; building"
-  BUILD_STANDALONE=1 "$PROJECT_ROOT/scripts/build_libfuzzer_onnx_native.sh" >/tmp/onnx-native-standalone-build.log
-fi
+[[ -x "$LF_FUZZER" ]] || fail "libFuzzer harness not produced: $LF_FUZZER"
+[[ -x "$LF_REPLAY" ]] || fail "standalone replay not produced: $LF_REPLAY"
 
 log "run libFuzzer fixed-input smoke"
 LLVM_PROFILE_FILE="$WORK/libfuzzer-%p.profraw" \
@@ -100,10 +103,11 @@ LLVM_PROFILE_FILE="$WORK/replay-%p.profraw" \
 . "$PROJECT_ROOT/scripts/lib/engine_mode.sh"
 
 if command -v afl-clang-fast++ >/dev/null 2>&1 && command -v afl-showmap >/dev/null 2>&1; then
-  log "build AFL++ native replay"
-  "$PROJECT_ROOT/scripts/build_aflpp_onnx_native.sh" >"$OUT_DIR/aflpp-build.log" 2>&1
+  if [[ ! -x "$AFLPP_REPLAY" ]]; then
+    log "AFL++ native replay missing; building"
+    "$PROJECT_ROOT/scripts/build_aflpp_onnx_native.sh" >"$OUT_DIR/aflpp-build.log" 2>&1
+  fi
 
-  AFLPP_REPLAY="$PROJECT_ROOT/harnesses/aflpp/onnxruntime_loader_replay"
   [[ -x "$AFLPP_REPLAY" ]] || fail "AFL++ replay not produced: $AFLPP_REPLAY"
 
   # driver_only, not library: onnxruntime is a separate .so, so AFL++ instruments this

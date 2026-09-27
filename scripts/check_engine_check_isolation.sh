@@ -6,8 +6,10 @@
 # (harnesses/libfuzzer/*) were rewritten each time the check suite ran. Running the
 # suite is supposed to be an observation; it was silently reinstalling the artifacts
 # that BASE-02 pins by hash, and it burned a full native build doing it.
-# check_safetensors_native_engines.sh:59 already had the right shape - build only when
-# the harness is missing - so this is the odd-one-out class, not a new contract.
+# check_safetensors_native_engines.sh already skipped the libFuzzer build when the complete
+# pair existed, but partial-pair preservation was still missing. R73 extends the same
+# no-rewrite contract to partial pairs, every AFL++ arm, and the private ONNX artifact
+# checker; it is still an existing contract, not a new one.
 #
 # The assertion is behavioural and deliberately uses mtime, not just content. Back to
 # back rebuilds of these harnesses are byte-identical, so a content-only check passes
@@ -16,9 +18,10 @@
 # so content is unreliable in both directions. mtime always moves when a build runs,
 # which is the signal this gate actually needs.
 #
-# Skips (not fails) a checker whose harness is absent: with nothing built there is
-# nothing to protect, and building one here to create the precondition would be the
-# very side effect this gate exists to forbid.
+# Skips (not fails) a full checker run whose pair is incomplete: with both outputs absent
+# there is nothing to protect, while a one-present/one-absent pair is exercised separately
+# below with stub builders. Building a real peer here to create the full-run precondition
+# would be the very side effect this gate exists to forbid.
 #
 # The child's exit status is part of the verdict, not noise. A checker that never ran -
 # refused by a guard, no seeds, build tools missing, an early fail - leaves harnesses/
@@ -170,12 +173,20 @@ run_isolated() { # run_isolated <checker> <label> <completion-pattern> <required
     skip "$label: $checker not present"
     return
   fi
-  local missing=0 b
+  local missing=0 present=0 b
   for b in "$@"; do
-    [[ -x "$b" ]] || missing=1
+    if [[ -x "$b" ]]; then
+      present=$((present + 1))
+    else
+      missing=$((missing + 1))
+    fi
   done
-  if [[ "$missing" -eq 1 ]]; then
-    skip "$label: harness not built, nothing to protect"
+  if [[ "$missing" -gt 0 ]]; then
+    if [[ "$present" -gt 0 ]]; then
+      skip "$label: harness pair incomplete; partial-pair routing is covered by fixtures"
+    else
+      skip "$label: harness not built, nothing to protect"
+    fi
     return
   fi
 
@@ -220,6 +231,522 @@ run_isolated check_onnx_native_engines.sh onnx '\[onnx-native-check\] done: ' \
   "$HARNESS_DIR/libfuzzer/onnxruntime_loader_fuzzer" "$HARNESS_DIR/libfuzzer/onnxruntime_loader_replay"
 run_isolated check_safetensors_native_engines.sh safetensors '\[st-engines\] ok' \
   "$HARNESS_DIR/libfuzzer/safetensors_loader_fuzzer" "$HARNESS_DIR/libfuzzer/safetensors_loader_replay"
+
+# A complete pair is not the only operational state. If just one libFuzzer output is
+# missing, the pair builders still produce two files; sending both to their defaults
+# rewrites the executable that was already present. The full-pair probes above skip that
+# state because one required binary is absent. Exercise both partial states with the real
+# checker prefix and a builder stub that honours the builders' documented output variables.
+write_pair_builder() { # write_pair_builder <format> <sandbox-root> [ignore-overrides]
+  local format="$1" root="$2" ignore_overrides="${3:-0}"
+  local builder="$root/scripts/build_libfuzzer_${format}_native.sh"
+  case "$format" in
+    gguf|safetensors)
+      cat >"$builder" <<PAIR_BUILDER
+#!/usr/bin/env bash
+set -euo pipefail
+root="\${PROJECT_ROOT:?}"
+if [[ "$ignore_overrides" == 1 ]]; then
+  out_f="\$root/harnesses/libfuzzer/${format}_loader_fuzzer"
+  out_r="\$root/harnesses/libfuzzer/${format}_loader_replay"
+else
+  out_f="\${OUT_FUZZER:-\$root/harnesses/libfuzzer/${format}_loader_fuzzer}"
+  out_r="\${OUT_REPLAY:-\$root/harnesses/libfuzzer/${format}_loader_replay}"
+fi
+for out in "\$out_f" "\$out_r"; do
+  mkdir -p "\$(dirname -- "\$out")"
+  printf '#!/usr/bin/env bash\\nexit 0\\n' >"\$out"
+  chmod +x "\$out"
+done
+printf 'built\\n' >>"\$root/build-was-run"
+PAIR_BUILDER
+      ;;
+    onnx)
+      cat >"$builder" <<PAIR_BUILDER
+#!/usr/bin/env bash
+set -euo pipefail
+root="\${PROJECT_ROOT:?}"
+if [[ "$ignore_overrides" == 1 ]]; then
+  out="\$root/harnesses/libfuzzer/onnxruntime_loader_fuzzer"
+  standalone="\$root/harnesses/libfuzzer/onnxruntime_loader_replay"
+else
+  out="\${OUT:-\$root/harnesses/libfuzzer/onnxruntime_loader_fuzzer}"
+  standalone="\${STANDALONE_OUT:-\$root/harnesses/libfuzzer/onnxruntime_loader_replay}"
+fi
+mkdir -p "\$(dirname -- "\$out")"
+printf '#!/usr/bin/env bash\\nexit 0\\n' >"\$out"
+chmod +x "\$out"
+if [[ "\${BUILD_STANDALONE:-0}" == 1 ]]; then
+  mkdir -p "\$(dirname -- "\$standalone")"
+  printf '#!/usr/bin/env bash\\nexit 0\\n' >"\$standalone"
+  chmod +x "\$standalone"
+fi
+printf 'built\\n' >>"\$root/build-was-run"
+PAIR_BUILDER
+      ;;
+  esac
+  chmod +x "$builder"
+}
+
+make_pair_probe() { # make_pair_probe <format> <sandbox-root> [ignore-overrides]
+  local format="$1" root="$2" ignore_overrides="${3:-0}"
+  local source="$PROJECT_ROOT/scripts/check_${format}_native_engines.sh"
+  local checker="$root/check_${format}_native_engines.sh"
+  mkdir -p "$root/scripts" "$root/harnesses/libfuzzer" "$root/tmp" "$root/out"
+  case "$format" in
+    gguf)
+      awk '/^# -rss_limit_mb / { print "exit 0"; exit } { print }' "$source" >"$checker"
+      mkdir -p "$root/seeds/gguf" "$root/seeds/gguf-malformed"
+      printf 'seed' >"$root/seeds/gguf/align_ok.gguf"
+      printf 'poc' >"$root/seeds/gguf-malformed/align_wrongtype.gguf"
+      printf '#!/usr/bin/env bash\nexit 0\n' >"$root/scripts/gen_gguf_malformed_seeds.sh"
+      chmod +x "$root/scripts/gen_gguf_malformed_seeds.sh"
+      ;;
+    onnx)
+      awk '/^log "run libFuzzer fixed-input smoke"/ { print "exit 0"; exit } { print }' \
+        "$source" >"$checker"
+      mkdir -p "$root/seeds/onnx"
+      printf 'seed' >"$root/seeds/onnx/onnx_5_mul_1.onnx"
+      ;;
+    safetensors)
+      awk '/^# 1\. Run the real corpus cleanly/ { print "exit 0"; exit } { print }' \
+        "$source" >"$checker"
+      ;;
+  esac
+  chmod +x "$checker"
+  write_pair_builder "$format" "$root" "$ignore_overrides"
+}
+
+pair_names() { # pair_names <format> -> fuzzer-name replay-name
+  case "$1" in
+    onnx) printf '%s %s\n' onnxruntime_loader_fuzzer onnxruntime_loader_replay ;;
+    *) printf '%s %s\n' "${1}_loader_fuzzer" "${1}_loader_replay" ;;
+  esac
+}
+
+probe_partial_pair() { # probe_partial_pair <format> <existing-side> [ignore-overrides]
+  local format="$1" existing_side="$2" ignore_overrides="${3:-0}"
+  local root="$WORK/r73-pair-${format}-${existing_side}-${ignore_overrides}"
+  local fuzzer_name replay_name existing missing before after rc=0
+  read -r fuzzer_name replay_name < <(pair_names "$format")
+  make_pair_probe "$format" "$root" "$ignore_overrides"
+  if [[ "$existing_side" == fuzzer ]]; then
+    existing="$root/harnesses/libfuzzer/$fuzzer_name"
+    missing="$root/harnesses/libfuzzer/$replay_name"
+  else
+    existing="$root/harnesses/libfuzzer/$replay_name"
+    missing="$root/harnesses/libfuzzer/$fuzzer_name"
+  fi
+  printf '#!/usr/bin/env bash\n# existing-%s-%s\nexit 0\n' "$format" "$existing_side" \
+    >"$existing"
+  chmod +x "$existing"
+  before="$(stat -c '%d:%i:%s:%a:%Y:%Z' "$existing"):$(sha256sum "$existing" | awk '{print $1}')"
+  (
+    cd "$root"
+    env PROJECT_ROOT="$root" TMPDIR="$root/tmp" OUT_DIR="$root/out" \
+      timeout 30 bash "$root/check_${format}_native_engines.sh"
+  ) >"$root/probe.log" 2>&1 || rc=$?
+  after="$(stat -c '%d:%i:%s:%a:%Y:%Z' "$existing"):$(sha256sum "$existing" | awk '{print $1}')"
+  printf 'rc=%s built=%s preserved=%s missing_created=%s' "$rc" \
+    "$([[ -s "$root/build-was-run" ]] && echo yes || echo no)" \
+    "$([[ "$before" == "$after" ]] && echo yes || echo no)" \
+    "$([[ -x "$missing" ]] && echo yes || echo no)"
+}
+
+for format in gguf onnx safetensors; do
+  for existing_side in fuzzer replay; do
+    partial="$(probe_partial_pair "$format" "$existing_side")"
+    case "$partial" in
+      'rc=0 built=yes preserved=yes missing_created=yes')
+        ok "$format partial pair preserves the existing $existing_side and installs only the missing peer" ;;
+      *)
+        bad "$format partial pair is not preservation-safe ($partial)" ;;
+    esac
+  done
+done
+
+# Negative control: the same probe must notice a pair builder that ignores the selected
+# scratch output and writes its defaults, which is the operational shape fixed by R73.
+partial="$(probe_partial_pair onnx fuzzer 1)"
+case "$partial" in
+  *preserved=no*) ok "negative control: partial-pair probe catches a builder that overwrites the existing peer ($partial)" ;;
+  *) bad "negative control: partial-pair probe missed an overwrite of the existing peer ($partial)" ;;
+esac
+
+# GGUF was the only affected AFL++ checker that accepted an AFLPP_REPLAY override without
+# forwarding it to the builder. Guarding that selected path is not enough: the builder must
+# receive the same path as OUT. Otherwise a missing custom path replaces the already-present
+# default output, after which the checker still fails because the custom path was not created.
+write_gguf_afl_builder() { # write_gguf_afl_builder <sandbox-root> [ignore-out]
+  local root="$1" ignore_out="${2:-0}"
+  cat >"$root/scripts/build_aflpp_gguf_native.sh" <<AFL_BUILDER
+#!/usr/bin/env bash
+set -euo pipefail
+root="\${PROJECT_ROOT:?}"
+if [[ "$ignore_out" == 1 ]]; then
+  out="\$root/harnesses/aflpp/gguf_loader_replay"
+else
+  out="\${OUT:-\$root/harnesses/aflpp/gguf_loader_replay}"
+fi
+mkdir -p "\$(dirname -- "\$out")"
+printf '#!/usr/bin/env bash\n# rebuilt-default\nexit 0\n' >"\$out"
+chmod +x "\$out"
+printf 'built\n' >>"\$root/afl-build-was-run"
+AFL_BUILDER
+  chmod +x "$root/scripts/build_aflpp_gguf_native.sh"
+}
+
+probe_gguf_afl_output() { # probe_gguf_afl_output [ignore-out]
+  local ignore_out="${1:-0}"
+  local root="$WORK/r73-gguf-afl-output-$ignore_out"
+  local checker="$root/check_gguf_native_engines.sh"
+  local default_replay="$root/harnesses/aflpp/gguf_loader_replay"
+  local custom_replay="$root/custom/gguf_loader_replay"
+  local before after rc=0
+  mkdir -p "$root/scripts/lib" "$root/harnesses/libfuzzer" \
+    "$root/harnesses/aflpp" "$root/seeds/gguf" "$root/seeds/gguf-malformed" \
+    "$root/tmp" "$root/out" "$root/bin"
+
+  # Run the actual checker, not an extracted code fragment. Small harness and tool stubs
+  # make every GGUF oracle execute while keeping the probe bounded.
+  cp "$PROJECT_ROOT/scripts/check_gguf_native_engines.sh" "$checker"
+  chmod +x "$checker"
+  cat >"$root/scripts/gen_gguf_malformed_seeds.sh" <<'GGUF_GENERATOR'
+#!/usr/bin/env bash
+exit 0
+GGUF_GENERATOR
+  cat >"$root/scripts/lib/engine_mode.sh" <<'ENGINE_MODE'
+instrumentation_scope() { printf 'library\n'; }
+ENGINE_MODE
+  cat >"$root/harnesses/libfuzzer/gguf_loader_fuzzer" <<'GGUF_FUZZER'
+#!/usr/bin/env bash
+set -euo pipefail
+artifact_prefix=''
+for arg in "$@"; do
+  case "$arg" in -artifact_prefix=*) artifact_prefix="${arg#*=}" ;; esac
+done
+input="${!#}"
+if [[ -d "$input" ]]; then
+  printf 'crash bytes\n' >"${artifact_prefix}crash-stub"
+  printf 'ERROR: AddressSanitizer\n' >&2
+  exit 1
+fi
+if [[ "$input" == *align_wrongtype.gguf ]]; then
+  printf 'ERROR: AddressSanitizer\n' >&2
+  exit 1
+fi
+printf 'Executed %s\n' "$input" >&2
+GGUF_FUZZER
+  cat >"$root/harnesses/libfuzzer/gguf_loader_replay" <<'GGUF_REPLAY'
+#!/usr/bin/env bash
+exit 134
+GGUF_REPLAY
+  cat >"$root/bin/afl-clang-fast++" <<'AFL_TOOL'
+#!/usr/bin/env bash
+exit 0
+AFL_TOOL
+  cat >"$root/bin/afl-showmap" <<'AFL_TOOL'
+#!/usr/bin/env bash
+set -euo pipefail
+out=''
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ -n "$out" ]]
+printf '1:1\n' >"$out"
+exit 0
+AFL_TOOL
+  chmod +x "$root/scripts/gen_gguf_malformed_seeds.sh" \
+    "$root/harnesses/libfuzzer/gguf_loader_fuzzer" \
+    "$root/harnesses/libfuzzer/gguf_loader_replay" "$root/bin/afl-clang-fast++" \
+    "$root/bin/afl-showmap"
+  printf 'seed\n' >"$root/seeds/gguf/align_ok.gguf"
+  printf 'poc\n' >"$root/seeds/gguf-malformed/align_wrongtype.gguf"
+  printf '#!/usr/bin/env bash\n# original-default\nexit 0\n' >"$default_replay"
+  chmod +x "$default_replay"
+  write_gguf_afl_builder "$root" "$ignore_out"
+
+  before="$(stat -c '%d:%i:%s:%a:%Y:%Z' "$default_replay"):$(sha256sum "$default_replay" | awk '{print $1}')"
+  (
+    cd "$root"
+    env PROJECT_ROOT="$root" SEED_ROOT="$root/seeds" \
+      AFLPP_REPLAY="$custom_replay" OUT_DIR="$root/out" TMPDIR="$root/tmp" \
+      PATH="$root/bin:$PATH" timeout 30 bash "$checker"
+  ) >"$root/probe.log" 2>&1 || rc=$?
+  after="$(stat -c '%d:%i:%s:%a:%Y:%Z' "$default_replay"):$(sha256sum "$default_replay" | awk '{print $1}')"
+  printf 'rc=%s built=%s default_preserved=%s custom_created=%s completed=%s' "$rc" \
+    "$([[ -s "$root/afl-build-was-run" ]] && echo yes || echo no)" \
+    "$([[ "$before" == "$after" ]] && echo yes || echo no)" \
+    "$([[ -x "$custom_replay" ]] && echo yes || echo no)" \
+    "$(grep -Fq '[gguf-engines] done:' "$root/probe.log" && echo yes || echo no)"
+}
+
+if [[ -z "${ENGINE_CHECK_ISOLATION_SELFTEST:-}" ]]; then
+  gguf_afl="$(probe_gguf_afl_output)"
+  case "$gguf_afl" in
+    'rc=0 built=yes default_preserved=yes custom_created=yes completed=yes')
+      ok "gguf AFL++ bootstrap installs the selected missing replay without replacing its default ($gguf_afl)" ;;
+    *)
+      bad "gguf AFL++ bootstrap did not honour the selected replay path ($gguf_afl)" ;;
+  esac
+
+  # Opposite polarity: if the builder ignores OUT, the same behavioural probe must fail the
+  # checker and observe the overwrite. This keeps the success arm from passing vacuously.
+  gguf_afl="$(probe_gguf_afl_output 1)"
+  case "$gguf_afl" in
+    'rc=1 built=yes default_preserved=no custom_created=no completed=no')
+      ok "negative control: GGUF AFL output probe catches a builder that ignores OUT ($gguf_afl)" ;;
+    *)
+      bad "negative control: GGUF AFL output probe failed for an unrelated reason ($gguf_afl)" ;;
+  esac
+fi
+
+# Inventory every direct native-builder invocation and every variable assignment that can
+# hide one. The four R73 guards below are intentionally explicit because each output
+# variable is part of the contract, but that list alone would silently miss a fifth caller.
+# This lightweight lexer skips comments and heredoc bodies, joins continued lines, and
+# records the executable call/assignment surface. It is not a general shell parser: any
+# new shape changes the inventory and fails closed until it is classified here.
+discover_native_build_surface() { # discover_native_build_surface <scripts-dir>
+  local scripts_dir="$1"
+  python3 - "$scripts_dir" <<'PY'
+from collections import Counter
+from pathlib import Path
+import re
+import shlex
+import sys
+
+scripts_dir = Path(sys.argv[1])
+builder = re.compile(r"(?:^|/)(build_(?:aflpp|libfuzzer)_[A-Za-z0-9_]+_native\.sh)$")
+assignment = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=(.*)$")
+heredoc_start = re.compile(
+    r"<<(-?)(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
+)
+separators = {";", "&&", "||", "|", "(", ")"}
+calls = Counter()
+
+for path in sorted(scripts_dir.glob("check_*.sh")):
+    pending = ""
+    heredoc = None
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if heredoc is not None:
+            delimiter, strip_tabs = heredoc
+            probe = raw.lstrip("\t") if strip_tabs else raw
+            if probe == delimiter:
+                heredoc = None
+            continue
+
+        logical = pending + raw
+        if logical.endswith("\\"):
+            pending = logical[:-1] + " "
+            continue
+        pending = ""
+
+        marker = heredoc_start.search(logical)
+        if marker:
+            heredoc = (
+                marker.group(2) or marker.group(3) or marker.group(4),
+                bool(marker.group(1)),
+            )
+
+        # Most shell source is irrelevant, and shlex is intentionally not a full Bash
+        # parser (notably for nested command substitutions). Every in-repository builder
+        # reference uses a scripts/build_*_native.sh path, so narrow before tokenizing.
+        if "scripts/build_" not in logical or "_native.sh" not in logical:
+            continue
+
+        try:
+            lexer = shlex.shlex(logical, posix=True, punctuation_chars=";&|()")
+            lexer.whitespace_split = True
+            lexer.commenters = "#"
+            tokens = list(lexer)
+        except ValueError as exc:
+            raise SystemExit(f"cannot tokenize {path}: {exc}")
+
+        for index, token in enumerate(tokens):
+            assigned = assignment.match(token)
+            if assigned:
+                match = builder.search(assigned.group(1))
+                if match:
+                    calls[(path.name, "assign", match.group(1))] += 1
+                continue
+
+            match = builder.search(token)
+            if not match:
+                continue
+            basename = match.group(1)
+            if token != basename and not token.endswith("/" + basename):
+                continue
+
+            segment = 0
+            for prior in range(index - 1, -1, -1):
+                if tokens[prior] in separators:
+                    segment = prior + 1
+                    break
+            first = segment
+            while first < index and assignment.match(tokens[first]):
+                first += 1
+            if first == index or (index > first and tokens[index - 1] in {"bash", "sh"}):
+                calls[(path.name, "call", basename)] += 1
+
+for (name, kind, basename), count in sorted(calls.items()):
+    print(f"{name}|{kind}|{basename}|{count}")
+PY
+}
+
+cat >"$WORK/r73-build-surface.expected" <<'R73_SURFACE'
+check_aflpp_native_build.sh|assign|build_aflpp_gguf_native.sh|1
+check_aflpp_native_build.sh|assign|build_aflpp_onnx_native.sh|1
+check_engine_mode_labels.sh|assign|build_aflpp_safetensors_native.sh|1
+check_gguf_native_engines.sh|call|build_aflpp_gguf_native.sh|1
+check_gguf_native_engines.sh|call|build_libfuzzer_gguf_native.sh|1
+check_onnx_libfuzzer_crash_artifacts.sh|call|build_libfuzzer_onnx_native.sh|1
+check_onnx_native_engines.sh|call|build_aflpp_onnx_native.sh|1
+check_onnx_native_engines.sh|call|build_libfuzzer_onnx_native.sh|1
+check_safetensors_aflpp_build.sh|assign|build_aflpp_safetensors_native.sh|1
+check_safetensors_native_engines.sh|call|build_aflpp_safetensors_native.sh|1
+check_safetensors_native_engines.sh|call|build_libfuzzer_safetensors_native.sh|1
+check_staged_install.sh|call|build_libfuzzer_onnx_native.sh|1
+R73_SURFACE
+
+if ! command -v python3 >/dev/null 2>&1; then
+  bad 'native-build caller inventory cannot run: python3 is missing'
+elif ! discover_native_build_surface "$PROJECT_ROOT/scripts" >"$WORK/r73-build-surface.actual"; then
+  bad 'native-build caller inventory could not parse scripts/check_*.sh'
+elif cmp -s "$WORK/r73-build-surface.expected" "$WORK/r73-build-surface.actual"; then
+  ok 'native-build caller inventory has no unclassified call or indirection'
+else
+  bad 'native-build caller inventory changed; classify every new call or indirection'
+  { diff -u "$WORK/r73-build-surface.expected" "$WORK/r73-build-surface.actual" || true; } \
+    | sed -n '1,24p' | sed 's/^/       /'
+fi
+
+# Scanner polarity: a future direct caller and a future variable indirection must both
+# appear in the inventory. Otherwise the real-tree equality above could pass because the
+# scanner found nothing.
+mkdir "$WORK/r73-discovery-fixture"
+cat >"$WORK/r73-discovery-fixture/check_future_direct.sh" <<'R73_FUTURE'
+#!/usr/bin/env bash
+bash "$PROJECT_ROOT/scripts/build_aflpp_onnx_native.sh"
+R73_FUTURE
+cat >"$WORK/r73-discovery-fixture/check_future_indirect.sh" <<'R73_FUTURE'
+#!/usr/bin/env bash
+FUTURE_BUILD="$PROJECT_ROOT/scripts/build_aflpp_onnx_native.sh"
+bash "$FUTURE_BUILD"
+R73_FUTURE
+discover_native_build_surface "$WORK/r73-discovery-fixture" \
+  >"$WORK/r73-discovery-fixture.actual"
+if grep -Fqx 'check_future_direct.sh|call|build_aflpp_onnx_native.sh|1' \
+     "$WORK/r73-discovery-fixture.actual"; then
+  ok 'negative control: native-build inventory discovers a new direct caller'
+else
+  bad 'negative control: native-build inventory missed a new direct caller'
+fi
+if grep -Fqx 'check_future_indirect.sh|assign|build_aflpp_onnx_native.sh|1' \
+     "$WORK/r73-discovery-fixture.actual"; then
+  ok 'negative control: native-build inventory discovers a new builder indirection'
+else
+  bad 'negative control: native-build inventory missed a new builder indirection'
+fi
+
+# R73: the behavioural probes above see only the three native-engine checkers, and their
+# AFL++ arms run only on hosts that have the relevant tools. That left four unconditional
+# installs invisible on the dev host: the three AFL++ arms plus the private ONNX artifact
+# checker. Pin the class as source structure too. Each operational build call must sit in
+# an executable-missing guard for the selected replay/harness variable. Output routing is a
+# separate behavioural assertion above for the one caller that accepts a custom path.
+# Reformatting the guard into a shape this small scanner cannot prove fails closed; these
+# are four call sites, not a general shell parser.
+guarded_build_call() { # guarded_build_call <file> <output-var> <build-script-basename>
+  local file="$1" output_var="$2" build_name="$3"
+  awk -v output_var="$output_var" -v build_name="$build_name" '
+    BEGIN { in_guard = 0; calls = 0; guarded = 0 }
+    {
+      line = $0
+      trimmed = line
+      sub(/^[[:space:]]*/, "", trimmed)
+      if (trimmed ~ /^#/) next
+
+      guard = "if [[ ! -x \"$" output_var "\" ]]; then"
+      if (trimmed == guard) {
+        in_guard = 1
+        next
+      }
+
+      # This is deliberately an exact-shape proof, not a shell parser. A call in
+      # else/elif (or after fi on the same line) is outside the missing-output arm.
+      if (in_guard && trimmed ~ /^(else|elif|fi)([[:space:];]|$)/) in_guard = 0
+
+      if (index(trimmed, build_name) > 0) {
+        calls++
+        if (in_guard) guarded++
+      }
+    }
+    END { exit(calls == 1 && guarded == 1 ? 0 : 1) }
+  ' "$file"
+}
+
+while IFS='|' read -r checker output_var build_name; do
+  checker_path="$PROJECT_ROOT/scripts/$checker"
+  if [[ ! -f "$checker_path" ]]; then
+    bad "R73 guard target is missing: $checker"
+  elif guarded_build_call "$checker_path" "$output_var" "$build_name"; then
+    ok "$checker builds $build_name only when \$$output_var is missing"
+  else
+    bad "$checker can run $build_name without an executable-missing guard for \$$output_var"
+  fi
+done <<'R73_GUARDS'
+check_gguf_native_engines.sh|AFLPP_REPLAY|build_aflpp_gguf_native.sh
+check_onnx_native_engines.sh|AFLPP_REPLAY|build_aflpp_onnx_native.sh
+check_safetensors_native_engines.sh|AFLPP_REPLAY|build_aflpp_safetensors_native.sh
+check_onnx_libfuzzer_crash_artifacts.sh|LF_FUZZER|build_libfuzzer_onnx_native.sh
+R73_GUARDS
+
+# Opposite polarity for the structural arm: one unguarded call and one guard for the wrong
+# output must both be rejected. Without these, a typo in the scanner could bless all four
+# real scripts without reading their control flow.
+cat >"$WORK/r73-unguarded.sh" <<'R73_BAD'
+#!/usr/bin/env bash
+AFLPP_REPLAY=/tmp/replay
+bash "$PROJECT_ROOT/scripts/build_aflpp_onnx_native.sh"
+R73_BAD
+if guarded_build_call "$WORK/r73-unguarded.sh" AFLPP_REPLAY build_aflpp_onnx_native.sh; then
+  bad 'negative control: R73 scan accepted an unguarded native build'
+else
+  ok 'negative control: R73 scan rejects an unguarded native build'
+fi
+
+cat >"$WORK/r73-wrong-output.sh" <<'R73_BAD'
+#!/usr/bin/env bash
+AFLPP_REPLAY=/tmp/replay
+OTHER_REPLAY=/tmp/other
+if [[ ! -x "$OTHER_REPLAY" ]]; then
+  bash "$PROJECT_ROOT/scripts/build_aflpp_onnx_native.sh"
+fi
+R73_BAD
+if guarded_build_call "$WORK/r73-wrong-output.sh" AFLPP_REPLAY build_aflpp_onnx_native.sh; then
+  bad 'negative control: R73 scan accepted a guard for the wrong output'
+else
+  ok 'negative control: R73 scan rejects a guard for the wrong output'
+fi
+
+cat >"$WORK/r73-opposite-branch.sh" <<'R73_BAD'
+#!/usr/bin/env bash
+AFLPP_REPLAY=/tmp/replay
+if [[ ! -x "$AFLPP_REPLAY" ]]; then
+  :
+else
+  bash "$PROJECT_ROOT/scripts/build_aflpp_onnx_native.sh"
+fi
+R73_BAD
+if guarded_build_call "$WORK/r73-opposite-branch.sh" AFLPP_REPLAY build_aflpp_onnx_native.sh; then
+  bad 'negative control: R73 scan accepted a build in the opposite branch of the missing-output guard'
+else
+  ok 'negative control: R73 scan rejects a build in the opposite branch of the missing-output guard'
+fi
 
 # Negative controls for the half the snapshot cannot see. Both stubs leave harnesses/
 # untouched, which is exactly why "untouched" alone was never evidence.
