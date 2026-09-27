@@ -1,27 +1,40 @@
 # Bug Bounty Fuzzing Platform (v2 Renewal)
 
-> "퍼징으로 찾았다"에서 끝내지 않고, **재현·검증·리포트까지 자동화**하는 버그바운티용 퍼징 플랫폼.
+> "퍼징으로 찾았다"에서 끝내지 않고, **재현·검증·리포트까지 연결하는 자동화**를 목표로 하는 버그바운티용 퍼징 플랫폼.
+
+## 구현 상태 (2026-09-27)
+
+아래 상태는 공개 개발 브랜치의 [검증 기준 커밋 `12123c7`](https://github.com/sukwoo1234/fuzzgate/tree/12123c71196d05c02a22f59673ca1ccc14c1367f)을 기준으로 한다. 기본 `main`은 구현 범위가 다르다.
+
+| 기능 | 현재 상태 |
+| --- | --- |
+| 포맷 구조/필드 기반 corpus mutator | ONNX·GGUF·safetensors용 `tool mutate` 구현. 완전한 문법 보존 인프로세스 custom mutator와는 구분 |
+| 3회 triage·스택 서명 비교 | 코드 구현. 2026-09-27 사용자 WSL 실행에서 정상 ONNX 입력은 `clean_count=3`, `crashed_count=0`, `not_reproduced`. 비공개 크래시 PoC 검증은 남음 |
+| crash severity·CVSS 후보 | 규칙 기반 제안 구현. 최종 등급은 사람이 확인 |
+| 레지스터·PC 제어 기반 RCE 등급화 | 계획 단계 |
+| LLM 보조 | 정책·설계 단계. 실행 경로에는 연결되지 않음 |
+| Fuzz Manager / Job Queue / Artifact Store 책임 분리 | 목표 아키텍처 및 부분 구현 |
 
 ## 먼저 읽기
 - 설계/결정: [first.md](first.md)
 
-## 기존 툴 대비 차별점 (Differentiators)
-- **Deep & Structured Fuzzing**: 구조 인지형 mutator/harness로 얕은 파싱 에러가 아니라 깊은 경로의 메모리 오염을 겨냥한다.
-- **Auto-Verification**: 동일 컨테이너에서 3회 재현 검증하고, 증거 번들/리포트를 자동 생성해 제출 품질을 보장한다.
-- **Exploitability Triage**: ASan/Release 교차 검증과 스택/레지스터 분석으로 RCE 가능성을 등급화한다.
-- **Reproducibility by Design**: 환경 고정/해시 기록으로 재현성을 강화한다.
-- **LLM Assist (Out of Loop)**: 퍼징 루프 외부에서 Seed/Dictionary/Mutation guide를 보조한다.
+## 차별점과 남은 검증
+- **Deep & Structured Fuzzing**: 구조/필드 기반 corpus mutator를 구현했다. 깊은 파싱 경로 도달과 기존 방식 대비 효과는 실험 지표로 확인해야 한다.
+- **Auto-Verification**: 3회 triage와 스택 서명 비교를 구현했다. 비공개 크래시 PoC로 재현성과 증거 묶음을 추가 검증해야 한다.
+- **Exploitability Triage**: 규칙 기반 severity·CVSS 후보를 제안한다. 레지스터·PC 분석을 통한 RCE 등급화는 계획 단계다.
+- **Reproducibility by Design**: 환경과 입력 해시를 기록한다. 재현률 개선은 비교 실험으로 확인해야 한다.
+- **LLM Assist (Out of Loop)**: 퍼징 루프 밖의 보조 기능으로 설계 중이며 실행 경로에는 연결되지 않았다.
 
 ### 목표 (Goals)
 - 구조 인지형 mutator/harness로 더 깊은 경로를 타겟한다.
 - 기존 툴 대비 재현 성공률/제출 승인률을 수치로 개선한다.
 - 차별점 근거 지표 체크리스트는 내부 문서에서 관리한다.
 
-## RCE 탐지 방법론 (요약)
+## RCE 후보 검토 범위
 - 핵심 본체는 **하네스/뮤테이터/triage**이며, 공개 방향은 [first.md](first.md)에 정리한다.
-- **Format-Aware Mutator**: 헤더/메타/오프셋/길이 필드를 의도적으로 변조해 깊은 경로를 자극한다.
-- **Targeted Harness**: mmap/텐서 디코딩/메모리 할당 경로를 직접 통과하도록 하네스를 설계한다.
-- **Exploitability Triage**: 레지스터/스택/PC 오염 여부를 분석해 RCE 후보 등급을 부여한다.
+- **Format-Aware Mutator**: ONNX·GGUF·safetensors의 구조와 필드를 인식하는 corpus mutation CLI를 구현했다.
+- **Targeted Harness**: 포맷 검사와 로더 호출 경로가 있다. 세부 경로 도달 여부는 실행 결과로 확인한다.
+- **Exploitability Triage**: 규칙 기반 severity·CVSS 후보를 제안한다. 레지스터·스택·PC 오염에 따른 RCE 등급 부여는 향후 범위다.
 
 ## 핵심 목표
 - 대상 포맷: **GGUF / ONNX / safetensors**
@@ -29,8 +42,9 @@
 - 자동화 범위: **퍼징 실행 → 크래시 감지 → 재현 검증 → 리포트 초안 생성**
 
 ## 시스템 아키텍처
-- Fuzz Manager: 컨테이너 실행/헬스/재시작 관리
-- Job Queue: 파일 기반 작업 분배/상태 전이
+아래는 목표 책임 분리이며 현재 부분 구현 상태다.
+- Fuzz Manager: 실행/상태/재시작 관리
+- Job Queue: 작업 분배/상태 전이
 - Artifact Store: 크래시/재현/증거 번들 저장
 
 ## 문서 가이드
