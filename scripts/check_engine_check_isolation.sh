@@ -130,6 +130,7 @@ stamp_repo() {
 # run.
 probe_isolated() {
   local script="$1" label="$2" done_re="$3" rc=0
+  local gguf_aflpp_default="$PROJECT_ROOT/harnesses/aflpp/gguf_loader_replay"
   # Every target these checkers default into the repository, pointed into this gate's
   # scratch alongside the OUT_DIR it always redirected: SEED_ROOT for the gguf checker's
   # seed generator, MAL_DIR and VALID_DIR for the safetensors one's, AFLPP_CHECK_DIR for
@@ -142,6 +143,19 @@ probe_isolated() {
   # contract. R97.
   local redirect=(OUT_DIR="$WORK/$label-out")
   redirect+=(SEED_ROOT="$WORK/$label-seeds" MAL_DIR="$WORK/$label-mal" VALID_DIR="$WORK/$label-valid" AFLPP_CHECK_DIR="$WORK/$label-aflpp")
+  # GGUF is the one AFL++ checker whose selected replay is overridable. On an AFL++ host,
+  # a fresh tree can have its libFuzzer pair but no AFL++ replay; letting that default
+  # makes this observation gate create harnesses/aflpp/gguf_loader_replay and then accuse
+  # the checker of changing harnesses/. Build the missing output in gate scratch instead.
+  # When the operational replay exists, select it explicitly so the snapshot still proves
+  # it was not replaced and a hostile parent AFLPP_REPLAY cannot bypass that assertion.
+  if [[ "$label" == gguf ]]; then
+    if [[ -x "$gguf_aflpp_default" ]]; then
+      redirect+=(AFLPP_REPLAY="$gguf_aflpp_default")
+    else
+      redirect+=(AFLPP_REPLAY="$WORK/$label-aflpp/gguf_loader_replay")
+    fi
+  fi
   snapshot "$WORK/$label.before"
   stamp_repo "$WORK/$label.repo-before"
   env "${redirect[@]}" timeout 600 bash "$script" >"$WORK/$label.log" 2>&1 || rc=$?

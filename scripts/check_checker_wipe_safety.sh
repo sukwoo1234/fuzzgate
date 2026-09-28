@@ -93,7 +93,12 @@ probe() {
   local script="$1" root="$2" data_dir="$3" poc="$4" log="$5"
   local survivor="${6:-$poc}" cwd="${7:-$root}" rc=0
   rm -f "$root/build-was-reached"
-  ( cd "$cwd" && env PROJECT_ROOT="$root" TOOL_BIN="$root/tool" DATA_DIR="$data_dir" \
+  # The real checker gives ONNX_CRASH_POC precedence over ONNX_SIGSEGV_POC. A suite run
+  # supplies both, so merely assigning the latter lets the parent's real PoC escape this
+  # fixture and turns every path-safety arm into a test of the wrong file.
+  ( cd "$cwd" && env \
+      -u ONNX_CRASH_POC -u ONNX_SIGFPE_POC -u ONNX_SIGSEGV_POC \
+      PROJECT_ROOT="$root" TOOL_BIN="$root/tool" DATA_DIR="$data_dir" \
       ONNX_SIGSEGV_POC="$poc" \
       timeout 120 bash "$script" ) >"$log" 2>&1 || rc=$?
   printf 'rc=%s survived=%s built=%s' "$rc" \
