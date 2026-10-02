@@ -119,10 +119,10 @@ CARGO_NET_OFFLINE=true RUSTFLAGS="$BUILD_RUSTFLAGS" \
     --bin safetensors_loader_replay \
     --target-dir "$AFLPP_TARGET_DIR"
 
-REPLAY_BIN="$(find "$AFLPP_TARGET_DIR" -type f \
-  -path '*/release/safetensors_loader_replay' ! -path '*/build/*' \
-  -print -quit)"
-[[ -n "$REPLAY_BIN" ]] || fail "could not locate cargo-afl replay under $AFLPP_TARGET_DIR"
+# Cargo writes this binary at a deterministic path when no --target triple is set.
+# Do not filter on ancestor names: evidence roots intentionally contain build/.
+REPLAY_BIN="$AFLPP_TARGET_DIR/release/safetensors_loader_replay"
+[[ -f "$REPLAY_BIN" ]] || fail "could not locate cargo-afl replay at $REPLAY_BIN"
 cp "$REPLAY_BIN" "$STAGED"
 
 # shellcheck source=lib/engine_mode.sh

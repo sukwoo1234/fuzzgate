@@ -78,6 +78,7 @@ expect() {
 # mode | prior OUT contents ('' = no prior file) | allow_uninstrumented | expected rc
 run_case() {
   local name="$1" mode="$2" prior="$3" allow="$4" want_rc="$5"
+  local target_subdir="${6:-target-aflpp}"
   local root="$WORK/$name"
   mkdir -p "$root"
   local out="$root/safetensors_loader_replay"
@@ -92,7 +93,7 @@ run_case() {
       CARGO="$BIN/fake-cargo" \
       CARGO_AFL_TOOLCHAIN="fixturechain" \
       FAKE_CARGO_MODE="$mode" \
-      AFLPP_TARGET_DIR="$root/target-aflpp" \
+      AFLPP_TARGET_DIR="$root/$target_subdir" \
       OUT="$out" \
       ${allow:+ALLOW_UNINSTRUMENTED=1} \
       bash "$BUILD" >"$root/log.txt" 2>&1 || rc=$?
@@ -129,6 +130,10 @@ fi
 note "case 6: a first-time accepted build must create the replay"
 run_case create-on-first-build ok '' 1 0
 expect "create-on-first-build created" "FRESH-REPLAY-FIXTURE" "$CASE_STATE"
+
+note "case 7: an accepted build under a build/ parent must install the replay"
+run_case build-parent-success ok '' 1 0 build/safetensors-afl/target
+expect "build-parent-success created" "FRESH-REPLAY-FIXTURE" "$CASE_STATE"
 
 if ((${#failures[@]})); then
   printf '[st-aflpp-build] FAIL %d/%d\n' "${#failures[@]}" "$((passed + ${#failures[@]}))" >&2

@@ -12,7 +12,7 @@
 # engine sees edges.
 #
 # An odd-one-out, not a new contract. check_gguf_native_engines.sh:152-169 and
-# check_safetensors_native_engines.sh:142-153 both assert instrumentation_scope and both
+# check_safetensors_native_engines.sh:167-189 both assert instrumentation_scope and both
 # `rm -f "$AFL_MAP"` before the run, gguf saying why in a comment: "`|| true` over a map
 # file left by an earlier run means a completely failed afl-showmap still counts its
 # tuples." ONNX was the one checker that did neither.
@@ -293,7 +293,7 @@ GROUP = re.compile(r'^\s*\{(?:\s|$)')
 BRACE_CLOSE = re.compile(r'^\s*\}\s*$')
 LEADIN = re.compile(r'^\s*(?:then|else|do)\s+')
 
-# run_aflpp_showmap is check_safetensors_native_engines.sh:117's wrapper over the cargo-afl
+# run_aflpp_showmap is check_safetensors_native_engines.sh:141-152's wrapper over the cargo-afl
 # and standalone spellings. Only an invocation that names an output file writes a map: the
 # `command -v afl-showmap` probes and the wrapper's own inner calls carry no -o.
 SHOWMAP = re.compile(r'(?:^|[\s;&|(])(?:afl-showmap|run_aflpp_showmap|cargo(?:\s+\+\S+)?\s+afl\s+showmap)(?:\s|$)')

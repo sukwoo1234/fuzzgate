@@ -22,19 +22,24 @@ def executable(path, body):
     path.write_text(f'#!{sys.executable}\n' + body)
     path.chmod(0o755)
 
-def check(name, mode='clean', options=None, *, empty=False, require_aflpp=False):
+def check(name, mode='clean', options=None, *, empty=False, invalid_first=False,
+          require_aflpp=False):
     root = work / name
     root.mkdir()
     for directory in ('bin', 'seeds', 'malformed', 'tmp with spaces'):
         (root / directory).mkdir()
     # Tool discovery must not depend on whether the host has cargo-afl installed.
-    for command in ('bash', 'mktemp', 'cp', 'ls', 'find', 'wc', 'grep', 'rm',
+    for command in ('bash', 'mktemp', 'cp', 'ls', 'find', 'sort', 'wc', 'grep', 'rm',
                     'mkdir', 'head', 'tr', 'cat'):
         source = shutil.which(command)
         assert source, f'missing test dependency: {command}'
         (root / 'bin' / command).symlink_to(source)
     if not empty:
-        (root / 'seeds/good.safetensors').write_bytes(b'good fixture')
+        if invalid_first:
+            (root / 'seeds/00-invalid.safetensors').write_bytes(b'rejected fixture')
+            (root / 'seeds/99-good.safetensors').write_bytes(b'good fixture')
+        else:
+            (root / 'seeds/good.safetensors').write_bytes(b'good fixture')
     (root / 'malformed/bad.safetensors').write_bytes(b'malformed fixture')
     executable(root / 'fuzzer', '''import json, os, sys
 from pathlib import Path
@@ -55,7 +60,7 @@ sys.exit(77 if mode in ('crash', 'empty-crash', 'lsan') else 42 if mode == 'exit
 ''')
     executable(root / 'replay', '''import os, sys
 from pathlib import Path
-good = Path(sys.argv[1]).name == 'good.safetensors'
+good = Path(sys.argv[1]).read_bytes() == b'good fixture'
 print('fixture replay diagnostic', flush=True)
 mode = os.environ['CHECK_MODE']
 sys.exit(10 if good and mode == 'good-replay-fail' else
@@ -78,7 +83,9 @@ sys.exit(10 if good and mode == 'good-replay-fail' else
     expected_failure = mode != 'clean' or empty or require_aflpp
     assert result.returncode == (1 if expected_failure else 0), (result.returncode, result.stdout)
     if seen:
-        assert seen['inputs'] == ['good.safetensors'], seen
+        expected_inputs = (['00-invalid.safetensors', '99-good.safetensors']
+                           if invalid_first else ['good.safetensors'])
+        assert seen['inputs'] == expected_inputs, seen
     if not expected_failure:
         assert seen['lsan'] == ('detect_leaks=0' if options is None else options), seen
         assert not list((root / 'tmp with spaces').iterdir()), 'successful check left temp data'
@@ -123,6 +130,7 @@ cases = [
     ('artifact-despite-success', dict(mode='artifact-success')),
     ('good-replay-failure', dict(mode='good-replay-fail')),
     ('bad-replay-failure', dict(mode='bad-replay-fail')),
+    ('reject-first-valid-later', dict(invalid_first=True)),
     ('no-seeds', dict(empty=True)),
     ('required-aflpp-missing', dict(require_aflpp=True)),
 ]

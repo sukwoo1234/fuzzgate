@@ -95,11 +95,29 @@ if [[ ! -d "$MAL_DIR" ]] || [[ -z "$(ls -A "$MAL_DIR" 2>/dev/null)" ]]; then
   bash "$PROJECT_ROOT/scripts/gen_safetensors_malformed_seeds.sh" >"$WORK/malformed-seeds.log" 2>&1 \
     || fail "malformed seed generation failed; see $WORK/malformed-seeds.log"
 fi
-GOOD="$(find "$SEED_DIR" -name '*.safetensors' | head -1)"
-[[ -n "$GOOD" ]] || fail "no valid safetensors seed under $SEED_DIR"
+# A fuzz corpus may legitimately include rejected inputs. Select a seed by the parser's
+# actual exit contract instead of trusting filesystem enumeration order.
+mapfile -d '' -t GOOD_CANDIDATES < <(
+  find "$SEED_DIR" -type f -name '*.safetensors' -print0 | sort -z
+)
+[[ "${#GOOD_CANDIDATES[@]}" -gt 0 ]] || fail "no safetensors seeds under $SEED_DIR"
+GOOD=""
+: >"$WORK/replay-good.log"
+for candidate in "${GOOD_CANDIDATES[@]}"; do
+  printf 'candidate=%q\n' "$candidate" >>"$WORK/replay-good.log"
+  candidate_rc=0
+  "$REPLAY" "$candidate" >>"$WORK/replay-good.log" 2>&1 || candidate_rc=$?
+  printf 'exit=%s\n' "$candidate_rc" >>"$WORK/replay-good.log"
+  case "$candidate_rc" in
+    0) GOOD="$candidate"; break ;;
+    9) ;;
+    *) fail "replay exited $candidate_rc while selecting a valid seed; see $WORK/replay-good.log" ;;
+  esac
+done
+[[ -n "$GOOD" ]] || fail "no parser-accepted safetensors seed under $SEED_DIR; see $WORK/replay-good.log"
 cp "$GOOD" "$WORK/replay-inputs/good.safetensors"
 GOOD="$WORK/replay-inputs/good.safetensors"
-"$REPLAY" "$GOOD" >"$WORK/replay-good.log" 2>&1 || fail "replay rejected a valid seed; see $WORK/replay-good.log"
+"$REPLAY" "$GOOD" >>"$WORK/replay-good.log" 2>&1 || fail "replay rejected the selected valid seed; see $WORK/replay-good.log"
 POC="$(find "$MAL_DIR" -name '*.safetensors' | head -1)"
 [[ -n "$POC" ]] || fail "no malformed safetensors seed under $MAL_DIR"
 cp "$POC" "$WORK/replay-inputs/bad.safetensors"
