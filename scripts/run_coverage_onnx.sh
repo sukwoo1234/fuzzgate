@@ -97,13 +97,73 @@ EMPTY=$(( ${#PROFS[@]} - ${#USABLE[@]} ))
   || { echo "[run-cov-onnx] fail: every profraw is empty; no model produced a profile, so any percentage here would be fiction"; exit 1; }
 "$LLVM_PROFDATA" merge -sparse "${USABLE[@]}" -o "$OUT_DIR/cov.profdata"
 
-# onnxruntime sources only: exclude fetched deps / generated build files.
-IGNORE='(_deps/|/build/|/external/|/test/)'
+# Do not derive the source filter from ORT_SRC.  llvm-cov's positional filter fails open
+# when it does not byte-match the absolute filename stored in the binary, and ORT_SRC may
+# be a relocated/symlinked evidence view.  Also do not ignore a generic `/build/`: the
+# instrumented source itself can legitimately live below an evidence build directory.
+# Ask the binary for its mapped filenames and derive the ONNX Runtime implementation
+# root plus its optional public-header root.  Both contain /onnxruntime/core/ mappings.
+ALL_SUMMARY="$OUT_DIR/llvm-cov-all-summary.json"
+"$LLVM_COV" export "$SO" -instr-profile="$OUT_DIR/cov.profdata" -summary-only \
+  > "$ALL_SUMMARY"
+MAPPED_ORT_ROOTS_TEXT="$(python3 - "$ALL_SUMMARY" <<'PYMAP'
+import json, sys
+
+files = json.load(open(sys.argv[1]))["data"][0]["files"]
+needle = "/onnxruntime/core/"
+roots = set()
+for item in files:
+    name = item["filename"]
+    if needle in name:
+        roots.add(name[:name.index(needle)] + "/onnxruntime")
+source_roots = sorted(root for root in roots
+                      if not root.endswith("/include/onnxruntime"))
+if len(source_roots) != 1:
+    sys.exit("[run-cov-onnx] fail: coverage mapping names "
+             f"{len(source_roots)} ONNX Runtime implementation roots, expected 1")
+source_root = source_roots[0]
+dist_root = source_root[:-len("/onnxruntime")]
+include_root = dist_root + "/include/onnxruntime"
+allowed = {source_root, include_root}
+unexpected = sorted(roots - allowed)
+if unexpected:
+    sys.exit("[run-cov-onnx] fail: coverage mapping names unexpected ONNX Runtime "
+             f"roots: {unexpected}")
+print(source_root)
+if include_root in roots:
+    print(include_root)
+PYMAP
+)"
+mapfile -t MAPPED_ORT_ROOTS < <(printf '%s\n' "$MAPPED_ORT_ROOTS_TEXT")
 echo "[run-cov-onnx] llvm-cov report"
 "$LLVM_COV" report "$SO" -instr-profile="$OUT_DIR/cov.profdata" \
-  -ignore-filename-regex="$IGNORE" | tee "$OUT_DIR/llvm-cov-report.txt"
+  "${MAPPED_ORT_ROOTS[@]}" | tee "$OUT_DIR/llvm-cov-report.txt"
 "$LLVM_COV" export "$SO" -instr-profile="$OUT_DIR/cov.profdata" -summary-only \
-  -ignore-filename-regex="$IGNORE" > "$OUT_DIR/llvm-cov-summary.json"
+  "${MAPPED_ORT_ROOTS[@]}" > "$OUT_DIR/llvm-cov-summary.json"
+
+# A non-matching positional filter is silently ignored by llvm-cov.  Refuse both that
+# fail-open shape and another all-zero artifact before coverage.json can be published.
+python3 - "$OUT_DIR/llvm-cov-summary.json" "${MAPPED_ORT_ROOTS[@]}" <<'PYSCOPE'
+import json, os, sys
+
+data = json.load(open(sys.argv[1]))["data"][0]
+roots = [os.path.normpath(root) + os.sep for root in sys.argv[2:]]
+files = data["files"]
+if not files:
+    sys.exit("[run-cov-onnx] fail: llvm-cov matched no ONNX Runtime source file")
+stray = [item["filename"] for item in files
+         if not any(os.path.normpath(item["filename"]).startswith(root)
+                    for root in roots)]
+if stray:
+    sys.exit("[run-cov-onnx] fail: the source filter fell back to the whole binary - "
+             f"{len(stray)} file(s) outside the mapped roots, e.g. {stray[0]}")
+totals = data["totals"]
+for kind in ("lines", "functions", "regions"):
+    values = totals.get(kind, {})
+    if values.get("count", 0) <= 0 or values.get("covered", 0) <= 0:
+        sys.exit(f"[run-cov-onnx] fail: scoped {kind} coverage is not positive: "
+                 f"{values.get('covered', 0)}/{values.get('count', 0)}")
+PYSCOPE
 
 echo "[run-cov-onnx] writing coverage.json (V2 schema fields; missing fields omitted, no fake values)"
 TOOL_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo not_available)"
