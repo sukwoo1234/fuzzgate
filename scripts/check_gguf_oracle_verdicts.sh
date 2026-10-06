@@ -32,9 +32,12 @@
 #      staging diagnostic when starved must PASS, so the fix does not reject everything.
 #   5. the probe must reach the case at all; a run whose output has no fd-starvation
 #      verdict line judges nothing.
+#   6. an unrelated descriptor inherited from a paste/heredoc wrapper must not consume the
+#      only spare descriptor and kill the dynamic loader before the harness can diagnose
+#      staging. The checker must establish its own descriptor baseline first.
 #
-# The four fuzzers are stubs, deliberately. The real target cannot be asked to fail in
-# three different ways on demand, and this gate must mean the same thing on a host where
+# The five fuzzers are stubs, deliberately. The real target cannot be asked to fail in
+# several different ways on demand, and this gate must mean the same thing on a host where
 # harnesses/ was never built - which is every freshly prepared fuzzing host, since
 # harnesses/ is gitignored.
 #
@@ -112,6 +115,14 @@ verdict() { # verdict <fuzzer> <log>
   grep -m1 'fd-starv' "$log" || true
 }
 
+verdict_with_inherited_fd() { # verdict_with_inherited_fd <fuzzer> <log>
+  local fuzzer="$1" log="$2"
+  (
+    exec 3</dev/null
+    verdict "$fuzzer" "$log"
+  )
+}
+
 if [[ ! -f "$CHECKER" ]]; then
   bad "$(basename "$CHECKER") is missing; nothing to pin"
 else
@@ -136,6 +147,13 @@ else
     case "$line" in
       *OK*) ok "a fuzzer that runs clean unstarved and diagnoses the starved open passes ($line)" ;;
       *)    bad "the honest fuzzer was rejected; the verdict refuses everything ($line)" ;;
+    esac
+
+    inherited="$(fuzzer_stub inherited-fd 77 0 "$DIAG")"
+    line="$(verdict_with_inherited_fd "$inherited" "$WORK/inherited-fd.log")"
+    case "$line" in
+      *OK*) ok "an inherited non-stdio descriptor cannot preempt the staging probe ($line)" ;;
+      *)    bad "an inherited descriptor killed the starved child before its staging diagnostic ($line)" ;;
     esac
 
     # 1. the shape the real target had: dies the same way either way.

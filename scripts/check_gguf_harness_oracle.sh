@@ -73,6 +73,25 @@ rc_of() {
   echo "$rc"
 }
 
+run_fd_starved_fuzzer() {
+  # A caller may itself be running from a heredoc or supervisor and leave fd 3 (or
+  # another non-stdio descriptor) open. With a fixed RLIMIT_NOFILE=4 that consumes the
+  # only descriptor the dynamic loader needs, so the process exits 127 before the
+  # harness can exercise its staging guard. Establish the intended 0/1/2 baseline in a
+  # fresh `bash -c` process, then lower the limit and exec the target.
+  local fuzzer="$1" seed="$2"
+  FUZZ_FD_STARVE_FUZZER="$fuzzer" FUZZ_FD_STARVE_SEED="$seed" bash -c '
+    for fd_path in /proc/$$/fd/*; do
+      fd="${fd_path##*/}"
+      [[ "$fd" =~ ^[0-9]+$ ]] || continue
+      (( fd >= 3 )) || continue
+      eval "exec ${fd}>&-" 2>/dev/null || true
+    done
+    ulimit -n 4
+    exec "$FUZZ_FD_STARVE_FUZZER" -runs=1 "$FUZZ_FD_STARVE_SEED"
+  '
+}
+
 if [[ ! -x "$REPLAY" ]]; then
   msg="native replay binary not found: $REPLAY"
   if [[ "$REQUIRE_NATIVE" -eq 1 ]]; then
@@ -219,7 +238,7 @@ if [[ -x "$FUZZER" ]]; then
     "$FUZZER" -runs=1 "$starve_seed" >>"$RUN_LOG" 2>&1 || baseline_rc=$?
     starved_err="$tmp_dir/fd-starved.err"
     starved_rc=0
-    bash -c "ulimit -n 4; exec '$FUZZER' -runs=1 '$starve_seed'" >"$starved_err" 2>&1 \
+    run_fd_starved_fuzzer "$FUZZER" "$starve_seed" >"$starved_err" 2>&1 \
       || starved_rc=$?
     cat "$starved_err" >>"$RUN_LOG"
     # Non-zero is not enough either: a death from an unrelated cause is not evidence that
