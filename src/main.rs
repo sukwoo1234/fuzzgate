@@ -11,6 +11,7 @@ mod coverage;
 mod dashboard_charts;
 mod dashboard_data;
 mod dashboard_discovery;
+mod execution_context;
 mod json_utils;
 mod metrics;
 mod mutate;
@@ -19,11 +20,13 @@ mod retention;
 mod run;
 mod seed;
 mod target;
+mod target_profiles;
 mod triage;
 mod ui;
 
 use common::{command_exists, AppPaths};
 use dashboard_data::collect_dashboard_snapshot;
+use execution_context::ExecutionContext;
 use run::RunBackend;
 use target::{target_label, TargetKind};
 
@@ -56,6 +59,14 @@ struct Cli {
     /// Seeds directory (default: ./seeds)
     #[arg(long, default_value = "./seeds")]
     seeds_dir: PathBuf,
+
+    /// Absolute typed target profile path
+    #[arg(long, global = true)]
+    target_profile: Option<PathBuf>,
+
+    /// Evidence ID for an explicitly unqualified validation run
+    #[arg(long, global = true)]
+    validation_run: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -376,7 +387,11 @@ struct MutateArgs {
     operator: Vec<String>,
 }
 
-fn run_campaign_command(app_paths: &AppPaths, args: &CampaignArgs) -> Result<(), String> {
+fn run_campaign_command(
+    app_paths: &AppPaths,
+    args: &CampaignArgs,
+    execution_context: Option<&ExecutionContext>,
+) -> Result<(), String> {
     if args.hours.is_none() && args.duration_seconds.is_none() {
         return Err("either --hours or --duration-seconds is required".to_string());
     }
@@ -420,6 +435,9 @@ fn run_campaign_command(app_paths: &AppPaths, args: &CampaignArgs) -> Result<(),
         c.arg(script);
         c
     };
+    if let Some(context) = execution_context {
+        context.apply_to_command(&mut cmd, false)?;
+    }
     cmd.current_dir(&cwd)
         .env("WORKDIR", cwd.as_os_str())
         .env("TOOL_BIN", tool_bin.as_os_str())
@@ -550,8 +568,52 @@ fn run_backend_cli_label(backend: &RunBackend) -> &'static str {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let app_paths = match AppPaths::prepare(&cli.data_dir, &cli.seeds_dir) {
+    let Cli {
+        data_dir,
+        seeds_dir,
+        target_profile,
+        validation_run,
+        command,
+    } = Cli::parse();
+    let profile_requested = target_profile.is_some()
+        || validation_run.is_some()
+        || std::env::var_os(execution_context::TARGET_PROFILE_ENV).is_some();
+    let execution_context = match &command {
+        Commands::Run(args) => execution_context::resolve_execution_context(
+            target_profile.as_deref(),
+            validation_run.as_deref(),
+            &args.target,
+        ),
+        Commands::Campaign(args) => execution_context::resolve_execution_context(
+            target_profile.as_deref(),
+            validation_run.as_deref(),
+            &args.target,
+        ),
+        Commands::Triage(args) => execution_context::resolve_execution_context(
+            target_profile.as_deref(),
+            validation_run.as_deref(),
+            &args.target,
+        ),
+        Commands::Harness(args) => execution_context::resolve_execution_context(
+            target_profile.as_deref(),
+            validation_run.as_deref(),
+            &args.target,
+        ),
+        _ if profile_requested => Err(
+            "target profiles are currently supported by run, campaign, triage, and harness"
+                .to_string(),
+        ),
+        _ => Ok(None),
+    };
+    let execution_context = match execution_context {
+        Ok(context) => context,
+        Err(err) => {
+            eprintln!("[{E_CONFIG_PREPARE}] profile error: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let app_paths = match AppPaths::prepare(&data_dir, &seeds_dir) {
         Ok(paths) => paths,
         Err(err) => {
             eprintln!("[{E_CONFIG_PREPARE}] config error: {err}");
@@ -559,7 +621,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match cli.command {
+    match command {
         Commands::Run(args) => {
             if let Err(err) = run::run_fuzz_pipeline(
                 &app_paths,
@@ -572,25 +634,48 @@ fn main() -> ExitCode {
                 args.timeout_sec,
                 args.restart_limit,
                 args.max_jobs,
+                execution_context.as_ref(),
             ) {
                 eprintln!("[{E_RUN_PIPELINE}] run error: {err}");
                 return ExitCode::from(5);
             }
         }
         Commands::Campaign(args) => {
-            if let Err(err) = run_campaign_command(&app_paths, &args) {
+            if let Err(err) = run_campaign_command(&app_paths, &args, execution_context.as_ref()) {
                 eprintln!("[{E_RUN_PIPELINE}] campaign error: {err}");
                 return ExitCode::from(5);
             }
         }
         Commands::Triage(args) => {
-            if let Err(err) = triage::run_triage_pipeline(
-                &app_paths,
-                &args.target,
-                &args.input,
-                args.repro_retries,
-                args.timeout_sec,
-            ) {
+            let result = if let Some(context) = execution_context.as_ref() {
+                if execution_context::is_profile_child() {
+                    triage::run_triage_pipeline(
+                        &app_paths,
+                        &args.target,
+                        &args.input,
+                        args.repro_retries,
+                        args.timeout_sec,
+                    )
+                } else {
+                    execution_context::run_profiled_triage(
+                        context,
+                        &app_paths,
+                        &args.target,
+                        &args.input,
+                        args.repro_retries,
+                        args.timeout_sec,
+                    )
+                }
+            } else {
+                triage::run_triage_pipeline(
+                    &app_paths,
+                    &args.target,
+                    &args.input,
+                    args.repro_retries,
+                    args.timeout_sec,
+                )
+            };
+            if let Err(err) = result {
                 eprintln!("[{E_TRIAGE_PIPELINE}] triage error: {err}");
                 return ExitCode::from(6);
             }
@@ -727,7 +812,12 @@ fn main() -> ExitCode {
             }
         }
         Commands::Harness(args) => {
-            if let Err(err) = target::run_harness(&args.target, &args.input) {
+            let result = if let Some(context) = execution_context.as_ref() {
+                execution_context::run_profiled_harness(context, &args.target, &args.input)
+            } else {
+                target::run_harness(&args.target, &args.input)
+            };
+            if let Err(err) = result {
                 eprintln!("[{E_HARNESS_EXEC}] harness error: {err}");
                 return ExitCode::from(err.exit_code());
             }

@@ -1,5 +1,6 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
+    ffi::OsString,
     fs,
     fs::OpenOptions,
     io::Write,
@@ -7,14 +8,15 @@ use std::{
     process::Command,
     sync::{Arc, Mutex},
     thread,
+    time::Instant,
 };
 
 use crate::common::{
     artifact_contract, command_exists, command_with_core_dump_off, first_line, now_unix,
     now_unix_millis, output_with_deadline, shell_escape, validate_max_jobs, validate_timeout_sec,
-    AppPaths,
-    ArtifactContract, HarnessExecResult,
+    AppPaths, ArtifactContract, HarnessExecResult,
 };
+use crate::execution_context::{self, CommandSpec, ExecutionContext};
 use crate::json_utils::json_escape;
 use crate::metrics::{self, MetricEvent};
 use crate::target::{
@@ -79,8 +81,17 @@ struct RunStatusCounts {
 struct EngineWorkerPlan {
     worker_id: usize,
     backend: RunBackend,
-    engine_cmd: String,
+    launch: EngineLaunch,
+    command_display: String,
     worker_log_path: PathBuf,
+}
+
+enum EngineLaunch {
+    LegacyShell(String),
+    Profiled {
+        spec: CommandSpec,
+        context: Arc<ExecutionContext>,
+    },
 }
 
 struct EngineWorkerResult {
@@ -134,10 +145,15 @@ pub(crate) fn run_fuzz_pipeline(
     timeout_sec: u64,
     restart_limit: u32,
     max_jobs: Option<usize>,
+    execution_context: Option<&ExecutionContext>,
 ) -> Result<(), String> {
     // A29: `timeout 0s` means "no limit", so a zero budget silently unbounded every job.
     let timeout_sec = validate_timeout_sec(timeout_sec)?;
     let max_jobs = validate_max_jobs(max_jobs)?;
+    if let Some(context) = execution_context {
+        context.validate_run_limits(run_backend_label(backend), workers, timeout_sec)?;
+        context.ensure_unchanged()?;
+    }
 
     let artifact = artifact_contract(app_paths);
     if *backend != RunBackend::LocalHarness {
@@ -152,6 +168,7 @@ pub(crate) fn run_fuzz_pipeline(
             workers,
             timeout_sec,
             restart_limit,
+            execution_context,
         );
     }
 
@@ -178,11 +195,28 @@ pub(crate) fn run_fuzz_pipeline(
         inputs.truncate(max_jobs);
     }
 
+    let corpus_snapshot_sha256 = execution_context
+        .map(|_| execution_context::corpus_snapshot_sha256(&inputs))
+        .transpose()?;
+    let execution_started_unix_ms = crate::common::now_unix_millis();
+    let execution_started = Instant::now();
+
     let run_id = now_unix_millis();
     let run_dir = artifact.runs_root.join(format!("run-{run_id}"));
     let logs_dir = run_dir.join("logs");
     fs::create_dir_all(&logs_dir)
         .map_err(|e| format!("failed to create run log dir '{}': {e}", logs_dir.display()))?;
+    if let Some(context) = execution_context {
+        context.write_execution_record(
+            &run_dir,
+            run_backend_label(backend),
+            corpus_snapshot_sha256.as_deref(),
+            execution_started_unix_ms,
+            0,
+            "running",
+            &current_argv(),
+        )?;
+    }
     // A10: durable home for crashing/hanging reproducers, outside the mutation batch
     // dir that retention prunes. Created lazily on the first failed/timeout job.
     let crash_inputs_dir = run_dir.join("crash-inputs");
@@ -229,6 +263,7 @@ pub(crate) fn run_fuzz_pipeline(
         let logs_dir = logs_dir.clone();
         let crash_inputs_dir = crash_inputs_dir.clone();
         let target = target.clone();
+        let execution_context = execution_context.cloned();
 
         handles.push(thread::spawn(move || {
             let exec = |job: &RunJob| {
@@ -239,6 +274,7 @@ pub(crate) fn run_fuzz_pipeline(
                     restart_limit,
                     timeout_available,
                     &logs_dir,
+                    execution_context.as_ref(),
                 )
             };
             drain_job_queue(&queue, &stats, &crash_inputs_dir, &exec)
@@ -318,7 +354,16 @@ pub(crate) fn run_fuzz_pipeline(
         },
     );
 
-    local_run_verdict(&s, worker_error)
+    let verdict = local_run_verdict(&s, worker_error);
+    finish_profiled_run(
+        execution_context,
+        &run_dir,
+        run_backend_label(backend),
+        corpus_snapshot_sha256.as_deref(),
+        execution_started_unix_ms,
+        execution_started.elapsed().as_millis(),
+        verdict,
+    )
 }
 
 /// Whether a finished local-harness run counts as successful.
@@ -352,7 +397,9 @@ fn drain_job_queue(
 ) -> Result<(), String> {
     loop {
         let job = {
-            let mut guard = queue.lock().map_err(|_| "queue lock poisoned".to_string())?;
+            let mut guard = queue
+                .lock()
+                .map_err(|_| "queue lock poisoned".to_string())?;
             guard.pop_front()
         };
 
@@ -371,13 +418,17 @@ fn drain_job_queue(
                     job.id,
                     job.input.display()
                 );
-                let mut s = stats.lock().map_err(|_| "stats lock poisoned".to_string())?;
+                let mut s = stats
+                    .lock()
+                    .map_err(|_| "stats lock poisoned".to_string())?;
                 s.job_errors += 1;
                 continue;
             }
         };
 
-        let mut s = stats.lock().map_err(|_| "stats lock poisoned".to_string())?;
+        let mut s = stats
+            .lock()
+            .map_err(|_| "stats lock poisoned".to_string())?;
         s.retries += retries_used;
         if is_session_ok {
             s.library_session_ok += 1;
@@ -413,6 +464,7 @@ fn run_engine_backend(
     workers: usize,
     timeout_sec: u64,
     restart_limit: u32,
+    execution_context: Option<&ExecutionContext>,
 ) -> Result<(), String> {
     if workers == 0 {
         return Err("workers must be >= 1".to_string());
@@ -427,15 +479,48 @@ fn run_engine_backend(
         return Err(format!("corpus_dir is invalid: {}", corpus_dir.display()));
     }
 
+    let corpus_snapshot_sha256 = if execution_context.is_some() {
+        let inputs = collect_corpus_inputs(&corpus_dir, target)?;
+        if inputs.is_empty() {
+            return Err(format!(
+                "no input files found for target '{}' in {}",
+                target_label(target),
+                corpus_dir.display()
+            ));
+        }
+        Some(execution_context::corpus_snapshot_sha256(&inputs)?)
+    } else {
+        None
+    };
+    let execution_started_unix_ms = crate::common::now_unix_millis();
+    let execution_started = Instant::now();
+
     let run_id = now_unix_millis();
     let run_dir = artifact.runs_root.join(format!("run-{run_id}"));
     let logs_dir = run_dir.join("logs");
     fs::create_dir_all(&logs_dir)
         .map_err(|e| format!("failed to create run dir '{}': {e}", run_dir.display()))?;
-    let engine_mode = engine_mode_label(
-        backend,
-        engine_mode_env_key(backend).and_then(|key| std::env::var(key).ok()),
-    );
+    let engine_mode = if let Some(context) = execution_context {
+        context
+            .required_mode(run_backend_label(backend))?
+            .to_string()
+    } else {
+        engine_mode_label(
+            backend,
+            engine_mode_env_key(backend).and_then(|key| std::env::var(key).ok()),
+        )
+    };
+    if let Some(context) = execution_context {
+        context.write_execution_record(
+            &run_dir,
+            run_backend_label(backend),
+            corpus_snapshot_sha256.as_deref(),
+            execution_started_unix_ms,
+            0,
+            "running",
+            &current_argv(),
+        )?;
+    }
 
     println!("[run] start");
     println!("target: {}", target_label(target));
@@ -449,24 +534,55 @@ fn run_engine_backend(
     println!("run_dir: {}", run_dir.display());
 
     let mut worker_plans = Vec::with_capacity(workers);
+    let profiled_context = execution_context.cloned().map(Arc::new);
     for worker_id in 1..=workers {
         let worker_log_path = logs_dir.join(format!("backend-engine-w{worker_id}.log"));
-        let engine_cmd = build_engine_command(
-            target,
-            backend,
-            &corpus_dir,
-            &run_dir,
-            workers,
-            worker_id,
-            timeout_sec,
-            restart_limit,
-            &worker_log_path,
-        )?;
-        println!("backend_engine_cmd[w{worker_id}]: {engine_cmd}");
+        let launch = if let Some(context) = profiled_context.as_ref() {
+            let artifact_dir = run_dir
+                .join("backend-artifacts")
+                .join(format!("w{worker_id}"));
+            fs::create_dir_all(&artifact_dir).map_err(|e| {
+                format!(
+                    "failed to create backend artifact dir '{}': {e}",
+                    artifact_dir.display()
+                )
+            })?;
+            let mut values = BTreeMap::new();
+            values.insert("corpus_dir", absolute_path(&corpus_dir).into_os_string());
+            values.insert(
+                "artifact_dir",
+                absolute_path(&artifact_dir).into_os_string(),
+            );
+            values.insert("run_dir", absolute_path(&run_dir).into_os_string());
+            values.insert("workers", OsString::from(workers.to_string()));
+            values.insert("worker_id", OsString::from(worker_id.to_string()));
+            values.insert("timeout_sec", OsString::from(timeout_sec.to_string()));
+            values.insert("restart_limit", OsString::from(restart_limit.to_string()));
+            let spec = context.engine_command(run_backend_label(backend), &values)?;
+            EngineLaunch::Profiled {
+                spec,
+                context: Arc::clone(context),
+            }
+        } else {
+            EngineLaunch::LegacyShell(build_engine_command(
+                target,
+                backend,
+                &corpus_dir,
+                &run_dir,
+                workers,
+                worker_id,
+                timeout_sec,
+                restart_limit,
+                &worker_log_path,
+            )?)
+        };
+        let command_display = engine_launch_display(&launch);
+        println!("backend_engine_cmd[w{worker_id}]: {command_display}");
         worker_plans.push(EngineWorkerPlan {
             worker_id,
             backend: backend.clone(),
-            engine_cmd,
+            launch,
+            command_display,
             worker_log_path,
         });
     }
@@ -493,8 +609,15 @@ fn run_engine_backend(
     timeout += totals.timeout;
     let worker_errors = totals.worker_errors;
 
-    let ingest =
-        ingest_backend_crash_artifacts(app_paths, &run_dir, run_id, target, backend, timeout_sec);
+    let ingest = ingest_backend_crash_artifacts(
+        app_paths,
+        &run_dir,
+        run_id,
+        target,
+        backend,
+        timeout_sec,
+        execution_context,
+    );
 
     let status_path = write_run_status(
         &run_dir,
@@ -557,7 +680,7 @@ fn run_engine_backend(
         },
     );
 
-    if failed == 0
+    let verdict = if failed == 0
         && timeout == 0
         && worker_errors == 0
         && ingest.scan_errors == 0
@@ -575,7 +698,16 @@ fn run_engine_backend(
             ingest.manifest_error,
             run_dir.display()
         ))
-    }
+    };
+    finish_profiled_run(
+        execution_context,
+        &run_dir,
+        run_backend_label(backend),
+        corpus_snapshot_sha256.as_deref(),
+        execution_started_unix_ms,
+        execution_started.elapsed().as_millis(),
+        verdict,
+    )
 }
 
 struct EngineWorkerTotals {
@@ -614,7 +746,10 @@ fn summarize_engine_workers(
                 totals.worker_errors += 1;
             }
             Err(()) => {
-                eprintln!("[run] warning: backend engine worker {} panicked", index + 1);
+                eprintln!(
+                    "[run] warning: backend engine worker {} panicked",
+                    index + 1
+                );
                 totals.worker_errors += 1;
             }
         }
@@ -623,21 +758,31 @@ fn summarize_engine_workers(
 }
 
 fn run_engine_worker(plan: EngineWorkerPlan) -> Result<EngineWorkerResult, String> {
-    let mut cmd = command_with_core_dump_off("bash");
-    // The common wrapper supplies disable_coredump alone, which AFL++ rejects
-    // as an incomplete custom ASAN_OPTIONS. Supply compatible defaults only for
-    // AFL++ and only when the caller has no options; preserve explicit settings
-    // (including incompatible ones, which AFL++ must report as startup errors).
-    if plan.backend == RunBackend::Aflpp
-        && std::env::var_os("ASAN_OPTIONS")
-            .is_none_or(|value| value.to_str().is_some_and(|text| text.trim().is_empty()))
-    {
-        cmd.env(
-            "ASAN_OPTIONS",
-            "abort_on_error=1:symbolize=0:disable_coredump=1",
-        );
-    }
-    cmd.arg("-lc").arg(&plan.engine_cmd);
+    let mut cmd = match &plan.launch {
+        EngineLaunch::LegacyShell(engine_cmd) => {
+            let mut cmd = command_with_core_dump_off("bash");
+            // The common wrapper supplies disable_coredump alone, which AFL++ rejects
+            // as an incomplete custom ASAN_OPTIONS. Supply compatible defaults only for
+            // AFL++ and only when the caller has no options; preserve explicit settings.
+            if plan.backend == RunBackend::Aflpp
+                && std::env::var_os("ASAN_OPTIONS")
+                    .is_none_or(|value| value.to_str().is_some_and(|text| text.trim().is_empty()))
+            {
+                cmd.env(
+                    "ASAN_OPTIONS",
+                    "abort_on_error=1:symbolize=0:disable_coredump=1",
+                );
+            }
+            cmd.arg("-lc").arg(engine_cmd);
+            cmd
+        }
+        EngineLaunch::Profiled { spec, context } => {
+            let mut cmd = command_with_core_dump_off(&spec.program);
+            cmd.args(&spec.args);
+            context.apply_to_command(&mut cmd, false)?;
+            cmd
+        }
+    };
     let output = cmd.output().map_err(|e| {
         format!(
             "failed to execute backend engine command for worker {}: {e}",
@@ -647,7 +792,7 @@ fn run_engine_worker(plan: EngineWorkerPlan) -> Result<EngineWorkerResult, Strin
     let log_body = format!(
         "worker_id: {}\ncmd: {}\nexit_code: {:?}\n\n[stdout]\n{}\n\n[stderr]\n{}\n",
         plan.worker_id,
-        plan.engine_cmd,
+        plan.command_display,
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -679,6 +824,7 @@ fn ingest_backend_crash_artifacts(
     target: &TargetKind,
     backend: &RunBackend,
     timeout_sec: u64,
+    execution_context: Option<&ExecutionContext>,
 ) -> BackendCrashIngest {
     let scan = collect_backend_crash_artifacts(run_dir, backend);
     let artifacts = scan.artifacts;
@@ -699,7 +845,19 @@ fn ingest_backend_crash_artifacts(
     let mut entries = Vec::with_capacity(artifacts.len());
     for (idx, artifact) in artifacts.iter().enumerate() {
         let (triage_status, triage_error) = if idx < triage_limit {
-            match triage::run_triage_pipeline(app_paths, target, &artifact.path, 1, timeout_sec) {
+            let result = if let Some(context) = execution_context {
+                execution_context::run_profiled_triage(
+                    context,
+                    app_paths,
+                    target,
+                    &artifact.path,
+                    1,
+                    timeout_sec,
+                )
+            } else {
+                triage::run_triage_pipeline(app_paths, target, &artifact.path, 1, timeout_sec)
+            };
+            match result {
                 Ok(()) => {
                     triaged += 1;
                     ("triaged", String::new())
@@ -1047,6 +1205,7 @@ fn run_job_with_retry(
     restart_limit: u32,
     timeout_available: bool,
     logs_dir: &Path,
+    execution_context: Option<&ExecutionContext>,
 ) -> Result<JobOutcome, String> {
     let attempts = restart_limit + 1;
     let mut last = HarnessExecResult::Failed("not executed".to_string());
@@ -1054,8 +1213,13 @@ fn run_job_with_retry(
     let mut retries_used = 0usize;
 
     for attempt in 1..=attempts {
-        let (result, is_session_ok) =
-            execute_harness_subprocess(job, target, timeout_sec, timeout_available)?;
+        let (result, is_session_ok) = execute_harness_subprocess(
+            job,
+            target,
+            timeout_sec,
+            timeout_available,
+            execution_context,
+        )?;
         last_session_ok = is_session_ok;
         // Review follow-up: the harness has already run and its verdict is in hand.
         // Failing here on a full disk or an fd limit threw that verdict away - and
@@ -1100,6 +1264,7 @@ pub(crate) fn execute_harness_subprocess(
     target: &TargetKind,
     timeout_sec: u64,
     timeout_available: bool,
+    execution_context: Option<&ExecutionContext>,
 ) -> Result<(HarnessExecResult, bool), String> {
     let exe = std::env::current_exe().map_err(|e| format!("failed to resolve current exe: {e}"))?;
     let target_name = target_label(target).to_string();
@@ -1122,6 +1287,9 @@ pub(crate) fn execute_harness_subprocess(
         .env("OPENBLAS_NUM_THREADS", "1")
         .env("NUMEXPR_NUM_THREADS", "1")
         .env("VECLIB_MAXIMUM_THREADS", "1");
+    if let Some(context) = execution_context {
+        context.apply_to_command(&mut cmd, true)?;
+    }
 
     // A9: the external `timeout` bounds the run where it exists; where it does not, the
     // child used to run unbounded, so enforce the same budget in-process instead.
@@ -1259,6 +1427,56 @@ fn run_backend_label(backend: &RunBackend) -> &'static str {
         RunBackend::LocalHarness => "local-harness",
         RunBackend::Aflpp => "aflpp",
         RunBackend::Libfuzzer => "libfuzzer",
+    }
+}
+
+fn current_argv() -> Vec<String> {
+    std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn engine_launch_display(launch: &EngineLaunch) -> String {
+    match launch {
+        EngineLaunch::LegacyShell(command) => command.clone(),
+        EngineLaunch::Profiled { spec, .. } => std::iter::once(spec.program.as_os_str())
+            .chain(spec.args.iter().map(OsString::as_os_str))
+            .map(|value| format!("{:?}", value))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_profiled_run(
+    context: Option<&ExecutionContext>,
+    run_dir: &Path,
+    backend: &str,
+    corpus_snapshot_sha256: Option<&str>,
+    started_unix_ms: u128,
+    elapsed_ms: u128,
+    verdict: Result<(), String>,
+) -> Result<(), String> {
+    let Some(context) = context else {
+        return verdict;
+    };
+    let outcome = if verdict.is_ok() { "success" } else { "failed" };
+    let record = context.write_execution_record(
+        run_dir,
+        backend,
+        corpus_snapshot_sha256,
+        started_unix_ms,
+        elapsed_ms,
+        outcome,
+        &current_argv(),
+    );
+    match (verdict, record) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(run_error), Ok(_)) => Err(run_error),
+        (Ok(()), Err(record_error)) => Err(record_error),
+        (Err(run_error), Err(record_error)) => Err(format!(
+            "{run_error}; additionally failed to finalize execution record: {record_error}"
+        )),
     }
 }
 
@@ -1486,6 +1704,7 @@ mod tests {
             0,
             1,
             None,
+            None,
         )
         .expect_err("timeout_sec=0 must be rejected");
 
@@ -1648,10 +1867,7 @@ mod tests {
         .expect("write status");
 
         let status = fs::read_to_string(&status_path).expect("read status");
-        assert!(
-            status.contains("\"job_errors\": 1"),
-            "status was: {status}"
-        );
+        assert!(status.contains("\"job_errors\": 1"), "status was: {status}");
         let _ = fs::remove_dir_all(&run_dir);
     }
 
@@ -1666,7 +1882,9 @@ mod tests {
             Ok(Ok(EngineWorkerResult {
                 outcome: EngineWorkerOutcome::Success,
             })),
-            Ok(Err("failed to execute backend engine command for worker 2".to_string())),
+            Ok(Err(
+                "failed to execute backend engine command for worker 2".to_string()
+            )),
             Ok(Ok(EngineWorkerResult {
                 outcome: EngineWorkerOutcome::Timeout,
             })),
@@ -1675,8 +1893,14 @@ mod tests {
 
         assert_eq!(totals.success, 1);
         assert_eq!(totals.timeout, 1);
-        assert_eq!(totals.failed, 0, "a worker that never ran is not a failed run");
-        assert_eq!(totals.worker_errors, 2, "the error and the panic both count");
+        assert_eq!(
+            totals.failed, 0,
+            "a worker that never ran is not a failed run"
+        );
+        assert_eq!(
+            totals.worker_errors, 2,
+            "the error and the panic both count"
+        );
     }
 
     #[test]
@@ -1758,7 +1982,10 @@ mod tests {
         }
 
         let scan = collect_backend_crash_artifacts(&run_dir, &RunBackend::Aflpp);
-        assert_eq!(scan.scan_errors, 1, "the unreadable directory must be counted");
+        assert_eq!(
+            scan.scan_errors, 1,
+            "the unreadable directory must be counted"
+        );
         assert!(scan.artifacts.is_empty());
 
         let _ = fs::set_permissions(&crashes, fs::Permissions::from_mode(0o755));
