@@ -1272,9 +1272,16 @@ const SIGSEGV: i32 = 11;
 /// nothing at all. Skip blank lines and rules made only of '=' or '-', and fall back
 /// to first_line() when the text holds nothing else.
 fn first_evidence_line(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.chars().all(|c| c == '=' || c == '-'))
+    let candidates = || {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| {
+                !line.is_empty() && !line.chars().all(|c| c == '=' || c == '-')
+            })
+    };
+    candidates()
+        .find(|line| !line.eq_ignore_ascii_case("AddressSanitizer:DEADLYSIGNAL"))
+        .or_else(|| candidates().next())
         .map(str::to_string)
         .unwrap_or_else(|| first_line(text))
 }
@@ -2229,6 +2236,19 @@ mod tests {
         assert_eq!(
             super::first_evidence_line(text),
             "==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x60200000eff0"
+        );
+        let deadly_signal = "AddressSanitizer:DEADLYSIGNAL\n\
+                             =================================================================\n\
+                             ==12345==ERROR: AddressSanitizer: FPE on unknown address 0x60200000eff0\n";
+        assert_eq!(
+            super::first_evidence_line(deadly_signal),
+            "==12345==ERROR: AddressSanitizer: FPE on unknown address 0x60200000eff0",
+            "the generic DEADLYSIGNAL banner must not hide the diagnostic line"
+        );
+        assert_eq!(
+            super::first_evidence_line("AddressSanitizer:DEADLYSIGNAL\n"),
+            "AddressSanitizer:DEADLYSIGNAL",
+            "a lone banner is still evidence and must not disappear"
         );
         // Nothing but rules and blanks: behave exactly like first_line().
         assert_eq!(super::first_evidence_line("=====\n\n"), "=====");

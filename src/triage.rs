@@ -681,7 +681,11 @@ fn parse_crash_log(
         top_frames.iter().take(3).cloned().collect()
     };
     let normalized_frame_hash = if normalized_frames.is_empty() {
-        stable_hash_hex(&signature_top3.join("\n"))
+        let normalized_hints = signature_top3
+            .iter()
+            .map(|hint| normalize_fallback_signature_hint(hint))
+            .collect::<Vec<_>>();
+        stable_hash_hex(&normalized_hints.join("\n"))
     } else {
         stable_hash_hex(&normalized_frames.join("\n"))
     };
@@ -1003,6 +1007,48 @@ fn normalize_stack_frame(line: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn normalize_fallback_signature_hint(line: &str) -> String {
+    strip_hex_addresses(line)
+        .split_whitespace()
+        .map(|token| {
+            let token = normalize_sanitizer_process_id(token);
+            let Some(path_start) = token.find('/') else {
+                return token;
+            };
+            let prefix = &token[..path_start];
+            if !prefix
+                .chars()
+                .all(|ch| matches!(ch, '\'' | '"' | '(' | '[' | '{' | '=' | ':'))
+            {
+                return token;
+            }
+            let components = token[path_start + 1..]
+                .split('/')
+                .filter(|component| !component.is_empty())
+                .collect::<Vec<_>>();
+            if components.len() < 2 {
+                return token;
+            }
+            let suffix_start = components.len().saturating_sub(4);
+            format!("{prefix}<ABS>/{}", components[suffix_start..].join("/"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_sanitizer_process_id(token: &str) -> String {
+    let Some(rest) = token.strip_prefix("==") else {
+        return token.to_string();
+    };
+    let Some(pid_end) = rest.find("==") else {
+        return token.to_string();
+    };
+    if pid_end == 0 || !rest[..pid_end].chars().all(|ch| ch.is_ascii_digit()) {
+        return token.to_string();
+    }
+    format!("==PID=={}", &rest[pid_end + 2..])
+}
+
 fn strip_hex_addresses(input: &str) -> String {
     input
         .split_whitespace()
@@ -1199,6 +1245,76 @@ library_step: onnxruntime loader crashed (SIGFPE (signal: 8); stdout: no output;
         assert_eq!(
             extract_signature_top3(output).first().map(String::as_str),
             Some("library_step: onnxruntime loader crashed (SIGFPE (signal: 8); stdout: no output; stderr: no output)")
+        );
+    }
+
+    #[test]
+    fn fallback_signature_hash_ignores_machine_specific_absolute_roots() {
+        let crash_log = |root: &str, line: u32| {
+            format!(
+                "library_step: gguf parser native harness crashed (SIGABRT (signal: 6); \
+                 stdout: no output; stderr: {root}/data/targets/llama.cpp/b7921/fuzz-build/\
+                 src/ggml/src/gguf.cpp:{line}: GGML_ASSERT(!key.empty()) failed)"
+            )
+        };
+        let dev = parse_crash_log(
+            &crash_log("/home/ssw/bugbounty", 132),
+            Some(4),
+            None,
+            "crashed",
+        );
+        let fuzz_pc = parse_crash_log(
+            &crash_log("/home/fuzz/bugbounty", 132),
+            Some(4),
+            None,
+            "crashed",
+        );
+        let different_assert = parse_crash_log(
+            &crash_log("/home/fuzz/bugbounty", 133),
+            Some(4),
+            None,
+            "crashed",
+        );
+
+        assert!(dev.normalized_frames.is_empty());
+        assert!(fuzz_pc.normalized_frames.is_empty());
+        assert_ne!(dev.signature_top3, fuzz_pc.signature_top3);
+        assert_eq!(
+            dev.normalized_frame_hash, fuzz_pc.normalized_frame_hash,
+            "an absolute checkout root must not split one crash across hosts"
+        );
+        assert_ne!(
+            fuzz_pc.normalized_frame_hash, different_assert.normalized_frame_hash,
+            "the source line must remain part of the fallback signature"
+        );
+    }
+
+    #[test]
+    fn fallback_signature_hash_ignores_sanitizer_pid_and_addresses() {
+        let crash_log = |pid: u32, address: &str| {
+            format!(
+                "library_step: gguf parser native harness crashed (SIGABRT (signal: 6); \
+                 stdout: no output; stderr: =={pid}==ERROR: AddressSanitizer: FPE on \
+                 unknown address {address} (pc {address} bp {address} sp {address} T0)"
+            )
+        };
+        let first = parse_crash_log(
+            &crash_log(10, "0x60fa95634694"),
+            Some(4),
+            None,
+            "crashed",
+        );
+        let second = parse_crash_log(
+            &crash_log(999, "0x5aa228fdc694"),
+            Some(4),
+            None,
+            "crashed",
+        );
+
+        assert_ne!(first.signature_top3, second.signature_top3);
+        assert_eq!(
+            first.normalized_frame_hash, second.normalized_frame_hash,
+            "sanitizer process IDs and addresses must not split one crash"
         );
     }
 
