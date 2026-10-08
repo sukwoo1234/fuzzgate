@@ -14,6 +14,8 @@ mod dashboard_discovery;
 mod execution_context;
 mod json_utils;
 mod metrics;
+#[allow(dead_code)]
+mod model_bundle;
 mod mutate;
 mod report;
 mod retention;
