@@ -1130,7 +1130,10 @@ class AcceptanceSelftest:
             for number in range(1, 13)
         ]
         requirements = self.fixture.requirements(case, requirement_map, tasks)
-        completed = self.invoke(case, profile, requirements)
+        # Twelve sequential tasks declare 24 seconds of child budget and publish
+        # fsync-backed evidence.  Keep this outer deadlock watchdog above that
+        # legitimate budget without relaxing any product-runner timeout.
+        completed = self.invoke(case, profile, requirements, outer_timeout=60.0)
         self.expect_rc(completed, 0)
         self.expect_summary(case / "evidence", "pass", **{"pass": 12})
         require(
