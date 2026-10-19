@@ -58,7 +58,9 @@ pub(crate) fn apply(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_fixtures::{encode_length_delimited, encode_string_field, encode_varint_field};
+    use super::super::test_fixtures::{
+        encode_length_delimited, encode_string_field, encode_varint_field,
+    };
     use super::*;
 
     fn fixture_with_initializer() -> Vec<u8> {

@@ -226,7 +226,7 @@
 <p class="hint">일반 모니터링에는 필요 없습니다. 새 대상 버전을 준비할 때만 실행하세요.</p>
 <div class="rows">
 <div class="row"><div class="m">상태</div><div><span id="target-badge" class="badge badge-neutral">대기 중</span></div></div>
-<div class="row"><div class="m">대상 종류</div><div><select id="target-kind" class="form-control"><option value="onnx">onnx</option><option value="gguf">gguf</option><option value="safetensors">safetensors</option></select></div></div>
+<div class="row"><div class="m">대상 종류</div><div><select id="target-kind" class="form-control">{{target_prepare_options}}</select></div></div>
 <div class="row"><div class="m">버전</div><div><input id="target-version" class="form-control" type="text" placeholder="비우면 기본 버전을 사용"></div></div>
 <div class="row"><div class="m">공식 다운로드 URL</div><div><input id="target-source-url" class="form-control" type="text" placeholder="선택 사항 · 공식 릴리스 URL"></div></div>
 <div class="row"><div class="m">동작</div><div class="control-actions"><button id="target-prepare-start" class="ctl-btn" type="button">대상 준비 시작</button><button id="target-prepare-stop" class="ctl-btn ctl-btn-stop" type="button">중지</button></div></div>
@@ -243,7 +243,7 @@
 <p class="hint">빌드는 시간이 걸릴 수 있습니다. 퍼징 실행 중에는 자원 충돌 여부를 먼저 확인하세요.</p>
 <div class="rows">
 <div class="row"><div class="m">상태</div><div><span id="target-build-badge" class="badge badge-neutral">대기 중</span></div></div>
-<div class="row"><div class="m">대상 종류</div><div><select id="target-build-kind" class="form-control"><option value="gguf">gguf</option><option value="onnx">onnx</option><option value="safetensors">safetensors</option></select></div></div>
+<div class="row"><div class="m">대상 종류</div><div><select id="target-build-kind" class="form-control">{{target_build_options}}</select></div></div>
 <div class="row"><div class="m">버전</div><div><input id="target-build-version" class="form-control" type="text" placeholder="비우면 최근 준비된 버전을 사용"></div></div>
 <div class="row"><div class="m">동작</div><div class="control-actions"><button id="target-build-start" class="ctl-btn" type="button">빌드 시작</button><button id="target-build-stop" class="ctl-btn ctl-btn-stop" type="button">중지</button></div></div>
 <div class="row"><div class="m">메시지</div><div id="target-build-message" class="mono-text">준비됨</div></div>
@@ -315,6 +315,7 @@
 </div>
 <div class="rows">
 <div class="row"><div class="m">최근 판정 목록</div><div><ul class="mini-list">{{recent_triage_rows}}</ul></div></div>
+<div class="row"><div class="m">미분류 진단 목록</div><div><ul class="mini-list">{{recent_diagnostic_rows}}</ul></div></div>
 <div class="row"><div class="m">최근 재현 후보</div><div id="latest-crash-cell">{{latest_valid_triage}}</div></div>
 <div class="row"><div class="m">입력 경로</div><div>{{latest_valid_input}}</div></div>
 <div class="row"><div class="m">크래시 유형</div><div>{{latest_valid_crash_kind}}</div></div>
@@ -773,15 +774,15 @@
       if (!confirmAction("선택된 입력을 다시 실행해 재현 여부를 확인합니다. 계속할까요?")) return;
       setReplayMessage("시작 중...");
       try {
-        const target = input.endsWith(".gguf") ? "gguf" : input.endsWith(".safetensors") ? "safetensors" : "onnx";
-        // Name the triage record rather than the path: the server reads the input back out of the
-        // summary it wrote itself, so a crash triaged from outside the data dir still replays.
+        // Name the triage record rather than guessing its target from the extension: the server
+        // binds both the input and target to the summary it wrote itself.
         const triageId = (replayStart.dataset.triageId || "").trim();
         const params = new URLSearchParams();
-        params.set("target", target);
         if (triageId && triageId !== "not_available") {
           params.set("triage_id", triageId);
         } else {
+          const target = input.endsWith(".gguf") ? "gguf" : input.endsWith(".safetensors") ? "safetensors" : "onnx";
+          params.set("target", target);
           params.set("input", input);
         }
         params.set("repro_retries", "3");

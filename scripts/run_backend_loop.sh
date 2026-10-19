@@ -6,7 +6,22 @@ DATA_DIR="${DATA_DIR:-$WORKDIR/data}"
 TOOL_BIN="${TOOL_BIN:-$WORKDIR/target/debug/tool}"
 TARGET="${TARGET:-onnx}"
 BACKEND="${BACKEND:-local-harness}"
-CORPUS_DIR="${CORPUS_DIR:-seeds/${TARGET}}"
+TARGET_SPEC="$("$TOOL_BIN" target-spec --target "$TARGET" --format shell)" || {
+  printf 'failed to resolve target spec for %s\n' "$TARGET" >&2
+  exit 2
+}
+if ! grep -Fqx 'campaign_supported=1' <<<"$TARGET_SPEC"; then
+  printf 'target is registered but campaign dispatch is unavailable: %s\n' "$TARGET" >&2
+  exit 2
+fi
+SEED_SUBDIR="$(printf '%s\n' "$TARGET_SPEC" | sed -n 's/^seed_subdir=//p')"
+if [[ ! "$SEED_SUBDIR" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  printf 'target spec for %s has an unsafe seed_subdir\n' "$TARGET" >&2
+  exit 2
+fi
+if [[ -z "${CORPUS_DIR:-}" ]]; then
+  CORPUS_DIR="seeds/${SEED_SUBDIR}"
+fi
 # Optional source metadata from the launcher; an unlabelled corpus stays unknown.
 SEED_FIXTURE="${SEED_FIXTURE:-}"
 WORKERS="${WORKERS:-2}"

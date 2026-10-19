@@ -4,9 +4,10 @@ use std::{
 };
 
 use crate::mutate::common::{
-    operator_set, print_batch_mutation_report, unproductive_inputs, print_mutation_report, select_operator,
-    single_manifest_path, write_mutation_manifest, write_output, BatchMutationReport,
-    DeterministicRng, MutationManifestEntry, MutationOutput, MutationReport, OperatorError,
+    operator_set, print_batch_mutation_report, print_mutation_report, select_operator,
+    single_manifest_path, unproductive_inputs, write_mutation_manifest, write_output,
+    BatchMutationReport, DeterministicRng, MutationManifestEntry, MutationOutput, MutationReport,
+    OperatorError,
 };
 use crate::{common::sha256_file, target::TargetKind};
 
@@ -392,7 +393,6 @@ pub(crate) mod test_fixtures {
         buf
     }
 
-
     /// A fixture with NO `general.alignment` key. This is the realistic shape: none of
     /// the 18 gguf seeds carries that key, and ggml rejects a file that carries it
     /// twice (gguf.cpp:431), so an insert operator has to start from a file without it.
@@ -511,14 +511,34 @@ pub(crate) mod test_fixtures {
             buf.extend_from_slice(&(vt as u32).to_le_bytes());
             buf.extend_from_slice(payload);
         };
-        kv(b"general.name", GgufValueType::String, &{
-            let mut v = (4u64).to_le_bytes().to_vec();
-            v.extend_from_slice(b"test");
-            v
-        }, &mut buf);
-        kv(b"llama.block_count", GgufValueType::U32, &12u32.to_le_bytes(), &mut buf);
-        kv(b"llama.context_length", GgufValueType::I32, &2048i32.to_le_bytes(), &mut buf);
-        kv(b"llama.rope.freq_base", GgufValueType::F32, &10000f32.to_le_bytes(), &mut buf);
+        kv(
+            b"general.name",
+            GgufValueType::String,
+            &{
+                let mut v = (4u64).to_le_bytes().to_vec();
+                v.extend_from_slice(b"test");
+                v
+            },
+            &mut buf,
+        );
+        kv(
+            b"llama.block_count",
+            GgufValueType::U32,
+            &12u32.to_le_bytes(),
+            &mut buf,
+        );
+        kv(
+            b"llama.context_length",
+            GgufValueType::I32,
+            &2048i32.to_le_bytes(),
+            &mut buf,
+        );
+        kv(
+            b"llama.rope.freq_base",
+            GgufValueType::F32,
+            &10000f32.to_le_bytes(),
+            &mut buf,
+        );
         buf
     }
 
@@ -781,7 +801,10 @@ mod tests {
         assert_ne!(result.bytes, bytes);
         let layout_before = parse_gguf(&bytes).expect("parse before");
         let layout_after = parse_gguf(&result.bytes).expect("parse after");
-        assert_eq!(layout_before.tensors[0].n_dims, layout_after.tensors[0].n_dims);
+        assert_eq!(
+            layout_before.tensors[0].n_dims,
+            layout_after.tensors[0].n_dims
+        );
     }
 
     #[test]
@@ -791,8 +814,8 @@ mod tests {
         let layout = parse_gguf(&bytes).expect("parse");
         let alignment = layout.alignment;
         let result = tensor_offset::apply(&bytes, &mut rng).expect("apply");
-        let new_offset_arr: [u8; 8] = result.bytes[layout.tensors[0].offset_start
-            ..layout.tensors[0].offset_start + 8]
+        let new_offset_arr: [u8; 8] = result.bytes
+            [layout.tensors[0].offset_start..layout.tensors[0].offset_start + 8]
             .try_into()
             .unwrap();
         let new_offset = u64::from_le_bytes(new_offset_arr);
@@ -941,7 +964,11 @@ mod tests {
             let mut rng = DeterministicRng::new(s);
             let result = metadata_type::apply(&bytes, &mut rng).expect("apply");
             assert_ne!(result.bytes, bytes);
-            assert_eq!(result.bytes.len(), bytes.len(), "seed {s}: a retype never resizes");
+            assert_eq!(
+                result.bytes.len(),
+                bytes.len(),
+                "seed {s}: a retype never resizes"
+            );
             let parses = parse_gguf(&result.bytes).is_ok();
             assert_eq!(
                 result.parse_preserving,
@@ -954,7 +981,10 @@ mod tests {
                 breaking += 1;
             }
         }
-        assert!(preserving > 0, "no seed produced a layout-preserving retype");
+        assert!(
+            preserving > 0,
+            "no seed produced a layout-preserving retype"
+        );
         assert!(breaking > 0, "no seed produced a layout-breaking retype");
     }
 
@@ -964,12 +994,19 @@ mod tests {
     // 세트 변경", which also names the nine operators a pre-2026-09-03 run used.
     #[test]
     fn default_set_includes_the_structural_ops() {
-        for op in [array_mutate::NAME, scalar_boundary::NAME, value_resize::NAME] {
+        for op in [
+            array_mutate::NAME,
+            scalar_boundary::NAME,
+            value_resize::NAME,
+        ] {
             assert!(
                 DEFAULT_OPERATORS.contains(&op),
                 "{op} must be in the default set"
             );
-            assert!(KNOWN_OPERATORS.contains(&op), "{op} must be a known operator");
+            assert!(
+                KNOWN_OPERATORS.contains(&op),
+                "{op} must be a known operator"
+            );
         }
     }
 
@@ -1132,8 +1169,8 @@ pub(crate) fn parse_gguf(bytes: &[u8]) -> Result<GgufLayout, ParseError> {
         cursor = cursor
             .checked_add(8)
             .ok_or(ParseError::Truncated("kv:key_len"))?;
-        let key_len_usize = usize::try_from(key_len)
-            .map_err(|_| ParseError::OversizedCount("kv:key_len"))?;
+        let key_len_usize =
+            usize::try_from(key_len).map_err(|_| ParseError::OversizedCount("kv:key_len"))?;
         let key_str_start = cursor;
         let key_str_end = cursor
             .checked_add(key_len_usize)
@@ -1183,8 +1220,8 @@ pub(crate) fn parse_gguf(bytes: &[u8]) -> Result<GgufLayout, ParseError> {
         cursor = cursor
             .checked_add(8)
             .ok_or(ParseError::Truncated("tensor:name_len"))?;
-        let name_len_usize = usize::try_from(name_len)
-            .map_err(|_| ParseError::OversizedCount("tensor:name_len"))?;
+        let name_len_usize =
+            usize::try_from(name_len).map_err(|_| ParseError::OversizedCount("tensor:name_len"))?;
         let name_str_start = cursor;
         let name_str_end = cursor
             .checked_add(name_len_usize)
@@ -1282,8 +1319,8 @@ fn skip_value_depth(
             let after_len = start
                 .checked_add(8)
                 .ok_or(ParseError::Truncated("value:string_len"))?;
-            let len_usize = usize::try_from(len)
-                .map_err(|_| ParseError::OversizedCount("value:string_len"))?;
+            let len_usize =
+                usize::try_from(len).map_err(|_| ParseError::OversizedCount("value:string_len"))?;
             let end = after_len
                 .checked_add(len_usize)
                 .ok_or(ParseError::Truncated("value:string"))?;

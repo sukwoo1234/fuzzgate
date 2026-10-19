@@ -78,7 +78,11 @@ fn count_amplify(
 
     let mut out = bytes.to_vec();
     write_u64(&mut out, count_off, new_count);
-    let parse_preserving = if parse_gguf(&out).is_ok() { "yes" } else { "no" };
+    let parse_preserving = if parse_gguf(&out).is_ok() {
+        "yes"
+    } else {
+        "no"
+    };
     Ok(MutationOutput {
         bytes: out,
         operator_params: vec![
@@ -92,10 +96,7 @@ fn count_amplify(
 
 /// Rewrite a scalar KV as a two-element array of the same scalar type, then rebuild the
 /// alignment padding in front of the tensor data - the section behind the KV moved.
-fn force_arity(
-    bytes: &[u8],
-    rng: &mut DeterministicRng,
-) -> Result<MutationOutput, OperatorError> {
+fn force_arity(bytes: &[u8], rng: &mut DeterministicRng) -> Result<MutationOutput, OperatorError> {
     let layout = parse_gguf(bytes).map_err(|_| OperatorError::NoApplicableField)?;
     let candidates: Vec<usize> = (0..layout.kvs.len())
         .filter(|&i| layout.kvs[i].value_type.scalar_size().is_some())
@@ -136,14 +137,22 @@ fn force_arity(
     meta.extend_from_slice(&entry);
     meta.extend_from_slice(&bytes[kv.entry_end..tensor_info_end]);
 
-    let (padding, alignment_used) =
-        padding_for(&meta, data, layout.alignment, bytes.len() + PADDING_HEADROOM)
-            .ok_or(OperatorError::NoApplicableField)?;
+    let (padding, alignment_used) = padding_for(
+        &meta,
+        data,
+        layout.alignment,
+        bytes.len() + PADDING_HEADROOM,
+    )
+    .ok_or(OperatorError::NoApplicableField)?;
     let mut out = meta;
     out.resize(out.len() + padding, 0);
     out.extend_from_slice(data);
 
-    let parse_preserving = if parse_gguf(&out).is_ok() { "yes" } else { "no" };
+    let parse_preserving = if parse_gguf(&out).is_ok() {
+        "yes"
+    } else {
+        "no"
+    };
     Ok(MutationOutput {
         bytes: out,
         operator_params: vec![
@@ -214,7 +223,11 @@ fn mutate_element(
         "boundary"
     };
 
-    let parse_preserving = if parse_gguf(&out).is_ok() { "yes" } else { "no" };
+    let parse_preserving = if parse_gguf(&out).is_ok() {
+        "yes"
+    } else {
+        "no"
+    };
     Ok(MutationOutput {
         bytes: out,
         operator_params: vec![
@@ -311,7 +324,10 @@ mod tests {
             );
             let ne = read_u64(&out.bytes, align.value_payload_start + 4).expect("array count");
             assert_eq!(ne, 2, "seed {s}: the forced arity is 2");
-            assert_eq!(out.parse_preserving, "yes", "seed {s}: a well-formed array parses");
+            assert_eq!(
+                out.parse_preserving, "yes",
+                "seed {s}: a well-formed array parses"
+            );
         }
     }
 

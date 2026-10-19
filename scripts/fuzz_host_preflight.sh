@@ -3,11 +3,12 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: fuzz_host_preflight.sh [--target <onnx|gguf|safetensors>] [--backends <local-harness,libfuzzer,aflpp>] [--data-dir <dir>] [--seeds-dir <dir>] [--min-free-gb <n>]
+usage: fuzz_host_preflight.sh [--target <registered-target>] [--backends <local-harness,libfuzzer,aflpp>] [--data-dir <dir>] [--seeds-dir <dir>] [--min-free-gb <n>]
 EOF
 }
 
 WORKDIR="${WORKDIR:-$PWD}"
+TOOL_BIN="${TOOL_BIN:-$WORKDIR/target/debug/tool}"
 TARGET="onnx"
 BACKENDS="local-harness,libfuzzer,aflpp"
 DATA_DIR="$WORKDIR/data"
@@ -26,10 +27,35 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-case "$TARGET" in
-  onnx|gguf|safetensors) ;;
-  *) echo "[preflight] unsupported target: $TARGET" >&2; exit 2 ;;
-esac
+if [[ ! -x "$TOOL_BIN" ]]; then
+  echo "[preflight] tool binary missing or not executable: $TOOL_BIN" >&2
+  exit 2
+fi
+TARGET_SPEC="$("$TOOL_BIN" target-spec --target "$TARGET" --format shell 2>/dev/null)" || {
+  echo "[preflight] unsupported target: $TARGET" >&2
+  exit 2
+}
+TARGET_ID="$(sed -n 's/^target_id=//p' <<<"$TARGET_SPEC")"
+SEED_SUBDIR="$(sed -n 's/^seed_subdir=//p' <<<"$TARGET_SPEC")"
+INPUT_EXT="$(sed -n 's/^input_ext=//p' <<<"$TARGET_SPEC")"
+if [[ "$TARGET_ID" != "$TARGET" \
+  || ! "$TARGET_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "[preflight] registered target has an invalid or mismatched target_id: $TARGET" >&2
+  exit 2
+fi
+if [[ ! "$SEED_SUBDIR" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "[preflight] registered target has an invalid seed_subdir: $TARGET" >&2
+  exit 2
+fi
+if [[ ! "$INPUT_EXT" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+  echo "[preflight] registered target has an invalid input_ext: $TARGET" >&2
+  exit 2
+fi
+if ! grep -Fqx 'campaign_supported=1' <<<"$TARGET_SPEC"; then
+  echo "[preflight] target is registered but campaign dispatch is unavailable: $TARGET" >&2
+  exit 2
+fi
+TARGET="$TARGET_ID"
 if [[ ! "$MIN_FREE_GB" =~ ^[0-9]+$ ]]; then
   echo "[preflight] min-free-gb must be an integer" >&2
   exit 2
@@ -88,14 +114,6 @@ has_backend() {
   return 1
 }
 
-seed_ext() {
-  case "$TARGET" in
-    onnx) printf 'onnx' ;;
-    gguf) printf 'gguf' ;;
-    safetensors) printf 'safetensors' ;;
-  esac
-}
-
 free_gb_for_path() {
   local path="$1"
   local probe="$path"
@@ -118,19 +136,15 @@ else
   fail "Cargo.toml not found; run from repo root"
 fi
 
-if [[ -x "$WORKDIR/target/debug/tool" ]]; then
-  ok "tool binary: target/debug/tool"
-else
-  fail "target/debug/tool missing; run: cargo build --offline"
-fi
+ok "tool binary: $TOOL_BIN"
 
-target_seed_dir="$SEEDS_DIR/$TARGET"
+target_seed_dir="$SEEDS_DIR/$SEED_SUBDIR"
 if [[ -d "$target_seed_dir" ]]; then
-  count="$(find "$target_seed_dir" -maxdepth 1 -type f -name "*.$(seed_ext)" | wc -l | tr -d ' ')"
+  count="$(find "$target_seed_dir" -maxdepth 1 -type f -name "*.${INPUT_EXT}" | wc -l | tr -d ' ')"
   if [[ "$count" -gt 0 ]]; then
     ok "seeds: $target_seed_dir ($count files)"
   else
-    fail "no .$TARGET seed files in $target_seed_dir"
+    fail "no .$INPUT_EXT seed files in $target_seed_dir"
   fi
 else
   fail "seed dir not found: $target_seed_dir"
@@ -151,7 +165,7 @@ fi
 
 if has_backend libfuzzer; then
   need_cmd clang++
-  if [[ "$TARGET" == "onnx" && -x "$WORKDIR/harnesses/libfuzzer/onnxruntime_loader_fuzzer" ]]; then
+  if [[ "$TARGET_ID" == "onnx" && -x "$WORKDIR/harnesses/libfuzzer/onnxruntime_loader_fuzzer" ]]; then
     ok "libFuzzer native ONNX driver: harnesses/libfuzzer/onnxruntime_loader_fuzzer"
   elif [[ -x "$WORKDIR/harnesses/libfuzzer/tool_harness_driver" ]]; then
     ok "libFuzzer driver: harnesses/libfuzzer/tool_harness_driver"

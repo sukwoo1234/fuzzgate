@@ -11,8 +11,8 @@ use std::{
 
 use crate::{
     common::{
-        command_with_core_dump_off, first_line, now_unix_millis, output_with_deadline, sha256_file,
-        AppPaths,
+        command_with_core_dump_off, first_line, now_unix_millis, output_with_deadline,
+        output_with_deadline_ms, sha256_file, AppPaths,
     },
     target::{target_label, HarnessError, TargetKind},
     target_profiles::{
@@ -294,7 +294,7 @@ impl ExecutionContext {
         Ok(())
     }
 
-    pub(crate) fn replay_command(&self, input: &Path) -> Result<CommandSpec, String> {
+    pub(crate) fn validate_input(&self, input: &Path) -> Result<(), String> {
         self.ensure_unchanged()?;
         let metadata = std::fs::symlink_metadata(input).map_err(|e| {
             format!(
@@ -330,6 +330,11 @@ impl ExecutionContext {
                 extension, self.profile.loaded.profile.target_id
             ));
         }
+        Ok(())
+    }
+
+    pub(crate) fn replay_command(&self, input: &Path) -> Result<CommandSpec, String> {
+        self.validate_input(input)?;
         let replay = self
             .profile
             .binary("replay")
@@ -440,6 +445,37 @@ impl ExecutionContext {
             .ok_or_else(|| format!("profile does not authorize backend '{backend}'"))
     }
 
+    pub(crate) fn backend_contract_json(&self, backend: &str) -> Result<String, String> {
+        self.ensure_unchanged()?;
+        let capability = self
+            .profile
+            .loaded
+            .profile
+            .engine_capabilities
+            .iter()
+            .find(|capability| capability.backend == backend)
+            .ok_or_else(|| format!("profile does not authorize backend '{backend}'"))?;
+        let binary = self
+            .profile
+            .binary(&capability.binary_role)
+            .ok_or_else(|| {
+                format!(
+                    "profile backend '{backend}' names missing binary role '{}'",
+                    capability.binary_role
+                )
+            })?;
+        serde_json::to_string(&serde_json::json!({
+            "profile_sha256": self.profile.loaded.sha256,
+            "backend": backend,
+            "required_mode": capability.required_mode,
+            "instrumentation_scope": capability.instrumentation_scope,
+            "binary_role": capability.binary_role,
+            "program": binary.path,
+            "argv_template": binary.argv,
+        }))
+        .map_err(|e| format!("failed to render backend contract: {e}"))
+    }
+
     pub(crate) fn apply_to_command(
         &self,
         command: &mut Command,
@@ -472,12 +508,24 @@ impl ExecutionContext {
         }
     }
 
+    pub(crate) fn qualification_snapshot(&self) -> Option<(&Path, &str, &[u8])> {
+        match &self.authorization {
+            ProfileAuthorization::Qualified(qualification) => Some((
+                qualification.path.as_path(),
+                qualification.sha256.as_str(),
+                qualification.bytes.as_slice(),
+            )),
+            ProfileAuthorization::Validation { .. } => None,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_execution_record(
         &self,
         directory: &Path,
         backend: &str,
         corpus_snapshot_sha256: Option<&str>,
+        input_manifest_sha256: Option<&str>,
         started_unix_ms: u128,
         elapsed_ms: u128,
         outcome: &str,
@@ -491,12 +539,36 @@ impl ExecutionContext {
         if let Some(hash) = corpus_snapshot_sha256 {
             validate_sha256_reference("corpus_snapshot_sha256", hash)?;
         }
+        if let Some(hash) = input_manifest_sha256 {
+            validate_sha256_reference("input_manifest_sha256", hash)?;
+        }
         fs::create_dir_all(directory).map_err(|e| {
             format!(
                 "failed to create execution record directory '{}': {e}",
                 directory.display()
             )
         })?;
+
+        let record_directory = fs::canonicalize(directory).map_err(|e| {
+            format!(
+                "failed to resolve execution record directory '{}': {e}",
+                directory.display()
+            )
+        })?;
+        let profile_path = record_directory.join("profile.json");
+        ensure_identity_snapshot(
+            &profile_path,
+            &self.profile.loaded.bytes,
+            "profile snapshot",
+        )?;
+        let qualification_path = match &self.authorization {
+            ProfileAuthorization::Qualified(qualification) => {
+                let path = record_directory.join("qualification.json");
+                ensure_identity_snapshot(&path, &qualification.bytes, "qualification snapshot")?;
+                Some(path)
+            }
+            ProfileAuthorization::Validation { .. } => None,
+        };
 
         let identity_error = self.ensure_unchanged().err();
         let profile_unchanged = identity_error.is_none();
@@ -510,20 +582,22 @@ impl ExecutionContext {
                 )
             })
             .collect::<serde_json::Map<_, _>>();
-        let (qualification_path, qualification_sha256, validation_run) = match &self.authorization {
-            ProfileAuthorization::Qualified(qualification) => (
-                Some(qualification.path.display().to_string()),
-                Some(qualification.sha256.clone()),
-                None,
-            ),
-            ProfileAuthorization::Validation { evidence_id } => {
-                (None, None, Some(evidence_id.clone()))
+        let (qualification_sha256, validation_run) = match &self.authorization {
+            ProfileAuthorization::Qualified(qualification) => {
+                (Some(qualification.sha256.clone()), None)
             }
+            ProfileAuthorization::Validation { evidence_id } => (None, Some(evidence_id.clone())),
         };
+        ensure_profiled_result_marker(
+            directory,
+            &self.profile.loaded.profile.target_id,
+            &self.profile.loaded.sha256,
+            self.mode_label(),
+        )?;
         let (tool_commit, tool_dirty) = tool_git_identity();
         let record = serde_json::json!({
             "schema_version": "1",
-            "profile_path": self.profile.loaded.path,
+            "profile_path": profile_path,
             "profile_sha256": self.profile.loaded.sha256,
             "authorization": self.mode_label(),
             "qualification_path": qualification_path,
@@ -538,6 +612,7 @@ impl ExecutionContext {
             "argv": argv,
             "allowed_env": allowed_env,
             "corpus_snapshot_sha256": corpus_snapshot_sha256,
+            "input_manifest_sha256": input_manifest_sha256,
             "tool_commit": tool_commit,
             "tool_dirty": tool_dirty,
             "started_unix_ms": started_unix_ms,
@@ -585,6 +660,79 @@ impl ExecutionContext {
     }
 }
 
+fn ensure_identity_snapshot(path: &Path, expected: &[u8], label: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(format!("{label} is not a regular file: {}", path.display()));
+            }
+            let observed = fs::read(path)
+                .map_err(|e| format!("failed to read {label} '{}': {e}", path.display()))?;
+            if observed != expected {
+                return Err(format!("{label} changed or belongs to another execution"));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| format!("failed to create {label} '{}': {e}", path.display()))?;
+            file.write_all(expected)
+                .and_then(|_| file.sync_all())
+                .map_err(|e| format!("failed to write {label} '{}': {e}", path.display()))
+        }
+        Err(error) => Err(format!(
+            "failed to inspect {label} '{}': {error}",
+            path.display()
+        )),
+    }
+}
+
+fn ensure_profiled_result_marker(
+    directory: &Path,
+    target_id: &str,
+    profile_sha256: &str,
+    authorization: &str,
+) -> Result<(), String> {
+    let marker = serde_json::json!({
+        "schema_version": "1",
+        "target_id": target_id,
+        "profile_sha256": profile_sha256,
+        "authorization": authorization,
+    });
+    let mut expected = serde_json::to_vec_pretty(&marker)
+        .map_err(|e| format!("failed to serialize profiled result marker: {e}"))?;
+    expected.push(b'\n');
+    let path = directory.join("profiled-result.json");
+    match fs::read(&path) {
+        Ok(observed) => {
+            if observed != expected {
+                return Err(format!(
+                    "profiled result marker changed or belongs to another profile: {}",
+                    path.display()
+                ));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .map_err(|e| format!("failed to create '{}': {e}", path.display()))?;
+            file.write_all(&expected)
+                .and_then(|_| file.sync_all())
+                .map_err(|e| format!("failed to write '{}': {e}", path.display()))
+        }
+        Err(error) => Err(format!(
+            "failed to read profiled result marker '{}': {error}",
+            path.display()
+        )),
+    }
+}
+
 fn validate_sha256_reference(label: &str, value: &str) -> Result<(), String> {
     if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return Err(format!("{label} must be a 64-digit sha256"));
@@ -629,15 +777,8 @@ pub(crate) fn run_profiled_harness(
     context
         .apply_to_command(&mut command, false)
         .map_err(HarnessError::Unavailable)?;
-    let timeout_sec = context
-        .profile
-        .loaded
-        .profile
-        .limits
-        .input_timeout_ms
-        .saturating_add(999)
-        / 1000;
-    let (output, timed_out) = output_with_deadline(command, timeout_sec.max(1)).map_err(|e| {
+    let timeout_ms = context.profile.loaded.profile.limits.input_timeout_ms;
+    let (output, timed_out) = output_with_deadline_ms(command, timeout_ms).map_err(|e| {
         HarnessError::Unavailable(format!("profile replay could not be executed: {e}"))
     })?;
     let _ = std::io::stdout().write_all(&output.stdout);
@@ -676,10 +817,25 @@ pub(crate) fn run_profiled_harness(
                 "profile replay unavailable: {detail}"
             )))
         }
-        _ => Err(HarnessError::LibraryCrash(format!(
-            "profile replay crashed or failed (status {}): {detail}",
-            output.status
-        ))),
+        Some(code) if code == i32::from(crate::EXIT_HARNESS_UNCLASSIFIED) => {
+            let traceback = if stderr.trim().is_empty() {
+                stdout.into_owned()
+            } else {
+                stderr.into_owned()
+            };
+            Err(HarnessError::Unclassified(traceback))
+        }
+        _ => {
+            let (stream, evidence) = if stderr.trim().is_empty() {
+                ("stdout", stdout.into_owned())
+            } else {
+                ("stderr", stderr.into_owned())
+            };
+            Err(HarnessError::LibraryCrash(format!(
+                "profile replay crashed or failed (status {}); {stream}:\n{evidence}",
+                output.status
+            )))
+        }
     }
 }
 
@@ -691,7 +847,49 @@ pub(crate) fn run_profiled_triage(
     repro_retries: u32,
     timeout_sec: u64,
 ) -> Result<(), String> {
+    run_profiled_triage_with_summary(
+        context,
+        app_paths,
+        target,
+        input,
+        repro_retries,
+        timeout_sec,
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn run_profiled_triage_with_summary(
+    context: &ExecutionContext,
+    app_paths: &AppPaths,
+    target: &TargetKind,
+    input: &Path,
+    repro_retries: u32,
+    timeout_sec: u64,
+) -> Result<PathBuf, String> {
     context.validate_run_limits("local-harness", 1, timeout_sec)?;
+    let staged_input =
+        crate::profile_results::stage_input(input).map_err(|error| error.to_string())?;
+    match run_profiled_harness(context, target, staged_input.path()) {
+        Err(crate::target::HarnessError::Unclassified(traceback)) => {
+            let location = crate::profile_results::preserve_unclassified(
+                app_paths,
+                context,
+                target,
+                staged_input.evidence_path(),
+                &traceback,
+            )?;
+            return Err(format!(
+                "profiled triage stopped at unclassified replay; diagnostic_id: {}",
+                location.id
+            ));
+        }
+        Err(crate::target::HarnessError::Unavailable(message)) => {
+            return Err(format!("profiled triage preflight unavailable: {message}"));
+        }
+        Ok(())
+        | Err(crate::target::HarnessError::InputRejected(_))
+        | Err(crate::target::HarnessError::LibraryCrash(_)) => {}
+    }
     let executable = std::env::current_exe()
         .map_err(|e| format!("failed to resolve current executable: {e}"))?;
     let argv = vec![
@@ -704,7 +902,7 @@ pub(crate) fn run_profiled_triage(
         "--target".to_string(),
         target_label(target).to_string(),
         "--input".to_string(),
-        input.display().to_string(),
+        staged_input.path().display().to_string(),
         "--repro-retries".to_string(),
         repro_retries.to_string(),
         "--timeout-sec".to_string(),
@@ -720,12 +918,13 @@ pub(crate) fn run_profiled_triage(
         .arg("--target")
         .arg(target_label(target))
         .arg("--input")
-        .arg(input)
+        .arg(staged_input.path())
         .arg("--repro-retries")
         .arg(repro_retries.to_string())
         .arg("--timeout-sec")
         .arg(timeout_sec.to_string());
     context.apply_to_command(&mut command, true)?;
+    command.env(crate::profile_results::DIAGNOSTIC_SUPERVISOR_ENV, "triage");
 
     let started_unix_ms = now_unix_millis();
     let started = Instant::now();
@@ -744,6 +943,20 @@ pub(crate) fn run_profiled_triage(
         ));
     }
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(traceback) = crate::profile_results::extract_supervised_traceback(&stderr) {
+            let location = crate::profile_results::preserve_unclassified(
+                app_paths,
+                context,
+                target,
+                staged_input.evidence_path(),
+                &traceback,
+            )?;
+            return Err(format!(
+                "profiled triage stopped at unclassified replay; diagnostic_id: {}",
+                location.id
+            ));
+        }
         return Err(format!(
             "profiled triage child exited with status {}",
             output.status
@@ -759,15 +972,73 @@ pub(crate) fn run_profiled_triage(
     let directory = summary_path
         .parent()
         .ok_or_else(|| "profiled triage summary has no parent directory".to_string())?;
+    let input_snapshot = crate::profile_results::snapshot_inputs(
+        directory,
+        &[staged_input.evidence_path().to_path_buf()],
+        "input",
+    )?;
+    let preserved_input = input_snapshot
+        .paths
+        .first()
+        .ok_or_else(|| "profiled triage input snapshot is empty".to_string())?;
+    let mut summary_value: serde_json::Value = serde_json::from_slice(
+        &fs::read(&summary_path)
+            .map_err(|e| format!("failed to read profiled triage summary: {e}"))?,
+    )
+    .map_err(|e| format!("failed to parse profiled triage summary: {e}"))?;
+    bind_profiled_triage_summary(
+        &mut summary_value,
+        preserved_input,
+        &context.profile.loaded.sha256,
+    )?;
+    let summary_bytes = serde_json::to_vec_pretty(&summary_value)
+        .map_err(|e| format!("failed to serialize profiled triage summary: {e}"))?;
+    let summary_temp = directory.join(format!(
+        ".summary.json.tmp-{}-{}",
+        std::process::id(),
+        now_unix_millis()
+    ));
+    fs::write(&summary_temp, &summary_bytes)
+        .map_err(|e| format!("failed to stage profiled triage summary: {e}"))?;
+    fs::rename(&summary_temp, &summary_path)
+        .map_err(|e| format!("failed to publish profiled triage summary: {e}"))?;
     context.write_execution_record(
         directory,
         "triage",
         None,
+        Some(&input_snapshot.manifest_sha256),
         started_unix_ms,
         started.elapsed().as_millis(),
         "success",
         &argv,
     )?;
+    Ok(summary_path)
+}
+
+fn bind_profiled_triage_summary(
+    summary: &mut serde_json::Value,
+    preserved_input: &Path,
+    profile_sha256: &str,
+) -> Result<(), String> {
+    let input = if preserved_input.is_absolute() {
+        preserved_input.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("failed to resolve profiled triage input: {e}"))?
+            .join(preserved_input)
+    };
+    let object = summary
+        .as_object_mut()
+        .ok_or_else(|| "profiled triage summary must be a JSON object".to_string())?;
+    object.insert(
+        "input".to_string(),
+        serde_json::Value::String(input.display().to_string()),
+    );
+    object.insert("profiled_result".to_string(), serde_json::Value::Bool(true));
+    object.insert(
+        "profile_sha256".to_string(),
+        serde_json::Value::String(profile_sha256.to_string()),
+    );
     Ok(())
 }
 
@@ -840,7 +1111,7 @@ mod tests {
 
     use super::{
         build_execution_context_with_env, corpus_snapshot_sha256, profile_child_marker,
-        resolve_profile_selection,
+        resolve_profile_selection, run_profiled_harness,
     };
     use crate::{
         common::sha256_file,
@@ -961,6 +1232,17 @@ mod tests {
     fn verified(fixture: &Fixture) -> VerifiedProfile {
         verify_profile_files(load_profile(&fixture.profile_path, &TargetKind::Onnx).unwrap())
             .unwrap()
+    }
+
+    fn rewrite_replay(fixture: &mut Fixture, body: &str) {
+        executable(&fixture.binary_path, body);
+        let binary_hash = sha256_file(&fixture.binary_path).unwrap();
+        for role in ["compiler", "linker", "engine", "rust"] {
+            fixture.value["toolchain"][role]["sha256"] = json!(binary_hash);
+        }
+        for binary in fixture.value["binaries"].as_array_mut().unwrap() {
+            binary["sha256"] = json!(binary_hash);
+        }
     }
 
     fn qualification(profile: &VerifiedProfile, status: &str) -> Value {
@@ -1148,6 +1430,86 @@ mod tests {
         assert!(!profile_child_marker(None));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn profiled_harness_enforces_the_millisecond_input_deadline() {
+        let mut fixture = fixture("millisecond-timeout");
+        let marker = fixture.root.join("ran-past-deadline");
+        rewrite_replay(
+            &mut fixture,
+            &format!(
+                "#!/bin/sh\nsleep 0.20\nprintf reached > '{}'\n",
+                marker.display()
+            ),
+        );
+        fixture.value["limits"]["input_timeout_ms"] = json!(50);
+        fs::write(
+            &fixture.profile_path,
+            serde_json::to_vec_pretty(&fixture.value).unwrap(),
+        )
+        .unwrap();
+        let input = fixture.root.join("case.onnx");
+        fs::write(&input, b"model").unwrap();
+
+        let error = run_profiled_harness(&validation_context(&fixture), &TargetKind::Onnx, &input)
+            .expect_err("a 50ms profile deadline must stop a 200ms replay");
+        assert!(
+            matches!(error, crate::target::HarnessError::Unavailable(message)
+            if message.contains("timed out after 50ms"))
+        );
+        thread::sleep(std::time::Duration::from_millis(250));
+        assert!(
+            !marker.exists(),
+            "the replay survived its profile deadline and wrote its marker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profiled_harness_preserves_full_signal_stderr_for_replay_observations() {
+        let mut fixture = fixture("signal-stderr");
+        rewrite_replay(
+            &mut fixture,
+            "#!/bin/sh\nprintf 'AddressSanitizer: heap-use-after-free\\n#0 parser_frame\\n' >&2\nkill -ABRT $$\n",
+        );
+        fs::write(
+            &fixture.profile_path,
+            serde_json::to_vec_pretty(&fixture.value).unwrap(),
+        )
+        .unwrap();
+        let input = fixture.root.join("case.onnx");
+        fs::write(&input, b"model").unwrap();
+
+        let error = run_profiled_harness(&validation_context(&fixture), &TargetKind::Onnx, &input)
+            .expect_err("a signal-terminated replay must be a library crash");
+        let crate::target::HarnessError::LibraryCrash(detail) = error else {
+            panic!("signal-terminated replay lost its crash identity: {error}");
+        };
+        assert!(
+            detail.contains("signal: 6"),
+            "signal identity missing: {detail}"
+        );
+        assert!(
+            detail.contains("AddressSanitizer: heap-use-after-free\n#0 parser_frame"),
+            "multi-line sanitizer stderr was truncated: {detail}"
+        );
+    }
+
+    #[test]
+    fn profiled_triage_summary_keeps_intrinsic_profile_identity() {
+        let mut summary = json!({"schema_version": "1.0", "triage_id": "fixture"});
+        super::bind_profiled_triage_summary(
+            &mut summary,
+            Path::new("/tmp/preserved-input.onnx"),
+            &"a".repeat(64),
+        )
+        .expect("profiled triage summary binding");
+
+        assert_eq!(summary["profiled_result"], true);
+        assert_eq!(summary["profile_sha256"], "a".repeat(64));
+        assert_eq!(summary["input"], "/tmp/preserved-input.onnx");
+    }
+
     #[test]
     fn context_rechecks_profile_bytes_before_each_child() {
         let mut fixture = fixture("recheck");
@@ -1166,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_record_uses_hash_references_without_embedding_profile_or_qualification() {
+    fn execution_record_snapshots_profile_bytes_without_embedding_them() {
         let fixture = fixture("record");
         let context = validation_context(&fixture);
         let record_dir = fixture.root.join("run");
@@ -1177,6 +1539,7 @@ mod tests {
                 &record_dir,
                 "local-harness",
                 Some(&"c".repeat(64)),
+                None,
                 10,
                 20,
                 "success",
@@ -1186,12 +1549,57 @@ mod tests {
         let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(value["profile_sha256"], context.profile.loaded.sha256);
         assert_eq!(value["authorization"], "unqualified_validation");
+        assert_eq!(
+            value["profile_path"],
+            record_dir.join("profile.json").display().to_string()
+        );
+        assert_eq!(
+            fs::read(record_dir.join("profile.json")).unwrap(),
+            context.profile.loaded.bytes
+        );
         assert!(value.get("profile").is_none());
         assert!(value.get("qualification").is_none());
         assert_eq!(
             sha256_file(&fixture.profile_path).unwrap(),
             context.profile.loaded.sha256,
             "writing the sidecar must not mutate the profile and create a hash cycle"
+        );
+    }
+
+    #[test]
+    fn qualified_execution_record_snapshots_qualification_bytes() {
+        let fixture = fixture("qualified-record");
+        let profile = verified(&fixture);
+        let qualification_path = fixture.root.join("qualification.json");
+        fs::write(
+            &qualification_path,
+            serde_json::to_vec_pretty(&qualification(&profile, "verified")).unwrap(),
+        )
+        .unwrap();
+        let context =
+            build_execution_context_with_env(profile, None, Vec::new()).expect("qualified context");
+        let record_dir = fixture.root.join("run");
+
+        let execution_path = context
+            .write_execution_record(
+                &record_dir,
+                "local-harness",
+                Some(&"c".repeat(64)),
+                None,
+                10,
+                20,
+                "success",
+                &["tool".to_string(), "run".to_string()],
+            )
+            .expect("execution record");
+        let execution: Value = serde_json::from_slice(&fs::read(execution_path).unwrap()).unwrap();
+        assert_eq!(
+            execution["qualification_path"],
+            record_dir.join("qualification.json").display().to_string()
+        );
+        assert_eq!(
+            fs::read(record_dir.join("qualification.json")).unwrap(),
+            fs::read(qualification_path).unwrap()
         );
     }
 
@@ -1212,6 +1620,7 @@ mod tests {
             .write_execution_record(
                 &record_dir,
                 "local-harness",
+                None,
                 None,
                 10,
                 20,

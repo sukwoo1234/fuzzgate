@@ -49,10 +49,26 @@ canonical_path() {
 PROJECT_ROOT="${PROJECT_ROOT:-${DEFAULT_PROJECT_ROOT}}"
 TARGET="${TARGET:-onnx}"
 BACKEND="${BACKEND:-aflpp}"
+TOOL_BIN="${TOOL_BIN:-${PROJECT_ROOT}/target/release/tool}"
 WORKERS="${WORKERS:-1}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-30}"
 RESTART_LIMIT="${RESTART_LIMIT:-1}"
-CORPUS_DIR="${CORPUS_DIR:-${PROJECT_ROOT}/seeds/${TARGET}}"
+TARGET_SPEC="$("${TOOL_BIN}" target-spec --target "${TARGET}" --format shell)" || {
+    printf 'failed to resolve target spec for %s\n' "${TARGET}" >&2
+    exit 2
+}
+if ! grep -Fqx 'campaign_supported=1' <<<"${TARGET_SPEC}"; then
+    printf 'target is registered but campaign dispatch is unavailable: %s\n' "${TARGET}" >&2
+    exit 2
+fi
+SEED_SUBDIR="$(printf '%s\n' "${TARGET_SPEC}" | sed -n 's/^seed_subdir=//p')"
+if [[ ! "${SEED_SUBDIR}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'target spec for %s has an unsafe seed_subdir\n' "${TARGET}" >&2
+    exit 2
+fi
+if [[ -z "${CORPUS_DIR:-}" ]]; then
+    CORPUS_DIR="${PROJECT_ROOT}/seeds/${SEED_SUBDIR}"
+fi
 ITERATION_SLEEP_SEC="${ITERATION_SLEEP_SEC:-2}"
 MAX_ITERATIONS="${FUZZ_LOOP_MAX_ITERATIONS:-0}"
 # G2: refuse the silent uninstrumented fallback when the run is meant to be native.
@@ -104,8 +120,6 @@ case "${TARGET}" in
     onnx) AFLPP_LD_LIBRARY_PATH="{container_workdir}/data/targets/onnxruntime/v1.23.2/onnxruntime-1.23.2/build/Linux/Release:{container_workdir}/data/targets/onnxruntime/v1.23.2/onnxruntime-1.23.2/build/cov-o0/RelWithDebInfo:{container_workdir}/data/targets/onnxruntime/v1.23.2/onnxruntime-1.23.2/build/cov/RelWithDebInfo" ;;
     *)    AFLPP_LD_LIBRARY_PATH="" ;;
 esac
-
-TOOL_BIN="${TOOL_BIN:-${PROJECT_ROOT}/target/release/tool}"
 
 log() {
     echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] fuzz-loop-aflpp: $*"

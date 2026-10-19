@@ -12,10 +12,30 @@ set -uo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-/home/ssw/bugbounty}"
 TARGET="${TARGET:-onnx}"
 BACKEND="${BACKEND:-local-harness}"
+TOOL_BIN="${TOOL_BIN:-${PROJECT_ROOT}/target/release/tool}"
 WORKERS="${WORKERS:-12}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-30}"
 RESTART_LIMIT="${RESTART_LIMIT:-1}"
-SEED_DIR="${SEED_DIR:-${PROJECT_ROOT}/seeds/${TARGET}}"
+TARGET_SPEC="$("${TOOL_BIN}" target-spec --target "${TARGET}" --format shell)" || {
+    printf 'failed to resolve target spec for %s\n' "${TARGET}" >&2
+    exit 2
+}
+if ! grep -Fqx 'campaign_supported=1' <<<"${TARGET_SPEC}"; then
+    printf 'target is registered but campaign dispatch is unavailable: %s\n' "${TARGET}" >&2
+    exit 2
+fi
+if ! grep -Fqx 'mutation_supported=1' <<<"${TARGET_SPEC}"; then
+    printf 'target is registered but mutation dispatch is unavailable: %s\n' "${TARGET}" >&2
+    exit 2
+fi
+SEED_SUBDIR="$(printf '%s\n' "${TARGET_SPEC}" | sed -n 's/^seed_subdir=//p')"
+if [[ ! "${SEED_SUBDIR}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'target spec for %s has an unsafe seed_subdir\n' "${TARGET}" >&2
+    exit 2
+fi
+if [[ -z "${SEED_DIR:-}" ]]; then
+    SEED_DIR="${PROJECT_ROOT}/seeds/${SEED_SUBDIR}"
+fi
 MUTATE_COUNT="${MUTATE_COUNT:-50}"
 MUTATE_OPERATORS="${MUTATE_OPERATORS:-}"
 ITERATION_SLEEP_SEC="${ITERATION_SLEEP_SEC:-2}"
@@ -23,7 +43,6 @@ MAX_BATCHES_KEEP="${MAX_BATCHES_KEEP:-2000}"
 MAX_ITERATIONS="${FUZZ_LOOP_MAX_ITERATIONS:-0}"
 
 MUTATED_ROOT="${PROJECT_ROOT}/data/corpus/mutated/${TARGET}"
-TOOL_BIN="${TOOL_BIN:-${PROJECT_ROOT}/target/release/tool}"
 
 log() {
     echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] fuzz-loop: $*"

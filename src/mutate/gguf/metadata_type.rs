@@ -89,13 +89,7 @@ pub(crate) fn same_width_alternatives(value_type: GgufValueType) -> Vec<GgufValu
     WIDTH_GROUPS
         .iter()
         .find(|group| group.contains(&value_type))
-        .map(|group| {
-            group
-                .iter()
-                .copied()
-                .filter(|t| *t != value_type)
-                .collect()
-        })
+        .map(|group| group.iter().copied().filter(|t| *t != value_type).collect())
         .unwrap_or_default()
 }
 
@@ -121,7 +115,11 @@ fn rewrite_type(
     // A17/A18: derive the label instead of claiming one. A same-width retype leaves a
     // file that still parses; a width-changing one usually does not, but "usually" is
     // not something the manifest gets to assert.
-    let parse_preserving = if parse_gguf(&out).is_ok() { "yes" } else { "no" };
+    let parse_preserving = if parse_gguf(&out).is_ok() {
+        "yes"
+    } else {
+        "no"
+    };
     MutationOutput {
         bytes: out,
         operator_params: vec![
@@ -164,7 +162,11 @@ mod tests {
             let changed: Vec<usize> = (0..before.kvs.len())
                 .filter(|&i| before.kvs[i].value_type != after.kvs[i].value_type)
                 .collect();
-            assert_eq!(changed.len(), 1, "seed {s}: exactly one kv should be retyped");
+            assert_eq!(
+                changed.len(),
+                1,
+                "seed {s}: exactly one kv should be retyped"
+            );
             let i = changed[0];
             assert_eq!(
                 before.kvs[i].value_type.scalar_size(),

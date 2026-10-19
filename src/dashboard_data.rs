@@ -23,7 +23,7 @@ use crate::dashboard_discovery::{
 
 use crate::common::{artifact_contract, has_ext, now_unix, AppPaths};
 use crate::json_utils::{extract_json_number_literal, extract_json_string_literal};
-use crate::target::{default_seed_dir, resolve_target_adapter, TargetKind};
+use crate::target::{all_target_specs, default_seed_dir, resolve_target_adapter, TargetKind};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DashboardSnapshot {
@@ -72,6 +72,7 @@ pub(crate) struct DashboardSnapshot {
     pub(crate) recent_triage_ids: Vec<String>,
     pub(crate) recent_report_ids: Vec<String>,
     pub(crate) recent_coverage_ids: Vec<String>,
+    pub(crate) recent_diagnostic_ids: Vec<String>,
     pub(crate) seeds_onnx_count: usize,
     pub(crate) seeds_gguf_count: usize,
     pub(crate) seeds_safetensors_count: usize,
@@ -138,9 +139,12 @@ pub(crate) fn list_recent_ids(
         "triages" => (artifact.triage_root, "triage-"),
         "reports" => (artifact.reports_root, "report-"),
         "coverage" => (artifact.coverage_root, "coverage-"),
+        "diagnostics" => {
+            return recent_diagnostic_ids(&artifact.diagnostics_root, limit);
+        }
         other => {
             return Err(format!(
-                "unknown kind: '{other}' (use runs|triages|reports|coverage|all)"
+                "unknown kind: '{other}' (use runs|triages|reports|coverage|diagnostics|all)"
             ))
         }
     };
@@ -172,7 +176,12 @@ pub(crate) fn collect_dashboard_snapshot(
         &default_seed_dir(app_paths, &TargetKind::Safetensors),
         resolve_target_adapter(&TargetKind::Safetensors).input_ext,
     )?;
-    let seeds_total_count = seeds_onnx_count + seeds_gguf_count + seeds_safetensors_count;
+    let seeds_total_count = all_target_specs()
+        .iter()
+        .map(|spec| count_seed_files(&default_seed_dir(app_paths, &spec.kind), spec.input_ext))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum();
 
     let runs_count = count_prefixed_dirs(&runs_root, "run-")?;
     let triage_count = count_prefixed_dirs(&triage_root, "triage-")?;
@@ -190,6 +199,7 @@ pub(crate) fn collect_dashboard_snapshot(
     let recent_triage_ids = recent_prefixed_dir_names(&triage_root, "triage-", 8)?;
     let recent_report_ids = recent_prefixed_dir_names(&reports_root, "report-", 8)?;
     let recent_coverage_ids = recent_prefixed_dir_names(&coverage_root, "coverage-", 8)?;
+    let recent_diagnostic_ids = recent_diagnostic_ids(&artifact.diagnostics_root, 8)?;
     let latest_coverage_summary = if latest_coverage == "not_available" {
         "not_available".to_string()
     } else {
@@ -523,6 +533,7 @@ pub(crate) fn collect_dashboard_snapshot(
         recent_triage_ids,
         recent_report_ids,
         recent_coverage_ids,
+        recent_diagnostic_ids,
         seeds_onnx_count,
         seeds_gguf_count,
         seeds_safetensors_count,
@@ -576,6 +587,35 @@ pub(crate) fn collect_dashboard_snapshot(
         logs_total_lines,
         logs_error,
     })
+}
+
+fn recent_diagnostic_ids(root: &Path, limit: usize) -> Result<Vec<String>, String> {
+    if !root.exists() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut ids = fs::read_dir(root)
+        .map_err(|e| format!("failed to read '{}': {e}", root.display()))?
+        .map(|entry| {
+            let entry = entry.map_err(|e| format!("failed to read diagnostic entry: {e}"))?;
+            let metadata = entry
+                .file_type()
+                .map_err(|e| format!("failed to inspect diagnostic entry: {e}"))?;
+            if !metadata.is_dir() {
+                return Ok(None);
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "diagnostic ID is not UTF-8".to_string())?;
+            Ok(name.starts_with("diagnostic-").then_some(name))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    ids.sort_by(|left, right| right.cmp(left));
+    ids.truncate(limit);
+    Ok(ids)
 }
 
 fn count_seed_files(root: &Path, ext: &str) -> Result<usize, String> {

@@ -4,9 +4,10 @@ use std::{
 };
 
 use crate::mutate::common::{
-    operator_set, print_batch_mutation_report, unproductive_inputs, print_mutation_report, select_operator,
-    single_manifest_path, write_mutation_manifest, write_output, BatchMutationReport,
-    DeterministicRng, MutationManifestEntry, MutationOutput, MutationReport, OperatorError,
+    operator_set, print_batch_mutation_report, print_mutation_report, select_operator,
+    single_manifest_path, unproductive_inputs, write_mutation_manifest, write_output,
+    BatchMutationReport, DeterministicRng, MutationManifestEntry, MutationOutput, MutationReport,
+    OperatorError,
 };
 use crate::{common::sha256_file, target::TargetKind};
 
@@ -461,8 +462,8 @@ pub(crate) fn parse_safetensors(bytes: &[u8]) -> Result<SafetensorsLayout, Parse
     if json_end > bytes.len() {
         return Err(ParseError::HeaderOutOfRange);
     }
-    let json_slice = std::str::from_utf8(&bytes[json_start..json_end])
-        .map_err(|_| ParseError::InvalidUtf8)?;
+    let json_slice =
+        std::str::from_utf8(&bytes[json_start..json_end]).map_err(|_| ParseError::InvalidUtf8)?;
 
     let mut walker = JsonWalker::new(json_slice, json_start);
     walker.skip_whitespace();
@@ -723,8 +724,7 @@ impl<'a> JsonWalker<'a> {
         }
         let dtype = dtype.ok_or(ParseError::TensorMissingField("dtype"))?;
         let shape = shape.ok_or(ParseError::TensorMissingField("shape"))?;
-        let data_offsets =
-            data_offsets.ok_or(ParseError::TensorMissingField("data_offsets"))?;
+        let data_offsets = data_offsets.ok_or(ParseError::TensorMissingField("data_offsets"))?;
         if data_offsets.elements.len() != 2 {
             return Err(ParseError::DataOffsetsNotPair);
         }
@@ -1033,7 +1033,11 @@ mod tests {
         // The label is DERIVED now (was hardcoded "no"): for this seed the ±1 header
         // length still parses, so the label must be "yes" and must match the parser.
         let parses = parse_safetensors(&r.bytes).is_ok();
-        assert_eq!(r.parse_preserving == "yes", parses, "label must match the parser");
+        assert_eq!(
+            r.parse_preserving == "yes",
+            parses,
+            "label must match the parser"
+        );
         assert_eq!(r.parse_preserving, "yes");
     }
 
@@ -1090,7 +1094,8 @@ mod tests {
         assert_ne!(r.bytes, bytes);
         assert_eq!(r.bytes.len(), bytes.len());
         let layout = parse_safetensors(&r.bytes).expect("parse after");
-        let dtype = &r.bytes[layout.tensors[0].dtype.inner_start..layout.tensors[0].dtype.inner_end];
+        let dtype =
+            &r.bytes[layout.tensors[0].dtype.inner_start..layout.tensors[0].dtype.inner_end];
         assert_eq!(dtype.len(), 3);
         assert_ne!(dtype, b"F32");
         assert_eq!(r.parse_preserving, "yes");

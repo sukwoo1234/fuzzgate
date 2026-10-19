@@ -3,6 +3,7 @@ use crate::dashboard_charts::{
 };
 use crate::dashboard_data::{DashboardSnapshot, LOG_TAIL_LIMIT};
 use crate::json_utils::{html_escape, json_escape, url_encode};
+use crate::target::{all_target_specs, parse_target_id, target_spec};
 use std::fs;
 
 const DEFAULT_DASHBOARD_HTML_TEMPLATE: &str = include_str!("../../templates/dashboard.html");
@@ -185,8 +186,14 @@ pub(crate) fn render_dashboard_html(s: &DashboardSnapshot) -> String {
     let recent_triage_rows = render_recent_triage_rows(&s.data_dir, &s.recent_triage_ids);
     let recent_report_rows = render_recent_report_rows(&s.data_dir, &s.recent_report_ids);
     let recent_coverage_rows = render_recent_coverage_rows(&s.data_dir, &s.recent_coverage_ids);
+    let recent_diagnostic_rows =
+        render_recent_diagnostic_rows(&s.data_dir, &s.recent_diagnostic_ids);
+    let target_prepare_options = render_target_options("onnx");
+    let target_build_options = render_target_options("gguf");
 
     dashboard_html_template()
+        .replace("{{target_prepare_options}}", &target_prepare_options)
+        .replace("{{target_build_options}}", &target_build_options)
         .replace("{{generated_at}}", &s.generated_at.to_string())
         .replace("{{config_data_dir}}", &html_escape(&s.data_dir))
         .replace("{{config_seeds_dir}}", &html_escape(&s.seeds_dir))
@@ -498,6 +505,24 @@ pub(crate) fn render_dashboard_html(s: &DashboardSnapshot) -> String {
         .replace("{{recent_triage_rows}}", &recent_triage_rows)
         .replace("{{recent_report_rows}}", &recent_report_rows)
         .replace("{{recent_coverage_rows}}", &recent_coverage_rows)
+        .replace("{{recent_diagnostic_rows}}", &recent_diagnostic_rows)
+}
+
+fn render_target_options(default_target: &str) -> String {
+    all_target_specs()
+        .iter()
+        .filter(|spec| spec.ui_supported)
+        .map(|spec| {
+            let selected = if spec.target_id == default_target {
+                " selected"
+            } else {
+                ""
+            };
+            let target = html_escape(spec.target_id);
+            format!("<option value=\"{target}\"{selected}>{target}</option>")
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn dashboard_html_template() -> String {
@@ -828,6 +853,21 @@ fn render_recent_coverage_rows(data_dir: &str, ids: &[String]) -> String {
         .join("")
 }
 
+fn render_recent_diagnostic_rows(data_dir: &str, ids: &[String]) -> String {
+    if ids.is_empty() {
+        return "<li>not_available</li>".to_string();
+    }
+    ids.iter()
+        .map(|id| {
+            let route = id_to_route_link(id, "diagnostic");
+            let record = format!("{data_dir}/diagnostics/{id}/diagnostic.json");
+            let record_link = file_link(&record, "diagnostic.json");
+            format!("<li>{route} <span class=\"sep\">|</span> {record_link}</li>")
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 fn render_run_result_chart(points: &[RunResultPoint]) -> String {
     if points.is_empty() {
         return "<p class=\"chart-empty\">최근 검사 기록이 없습니다</p>".to_string();
@@ -987,11 +1027,14 @@ fn render_suggested_commands(s: &DashboardSnapshot) -> String {
     } else {
         "<backend>"
     };
+    let seed_subdir = parse_target_id(target)
+        .map(|kind| target_spec(&kind).seed_subdir)
+        .unwrap_or(target);
     let commands: Vec<(&str, String)> = vec![
         (
             "Run",
             format!(
-                "tool run --target {target} --backend local-harness --corpus-dir seeds/{target} --timeout-sec 30 --restart-limit 1"
+                "tool run --target {target} --backend local-harness --corpus-dir seeds/{seed_subdir} --timeout-sec 30 --restart-limit 1"
             ),
         ),
         (
@@ -1028,7 +1071,7 @@ fn render_suggested_commands(s: &DashboardSnapshot) -> String {
         (
             "Mutate",
             format!(
-                "tool mutate --target {target} --input-dir seeds/{target} --out-dir data/corpus/mutated/{target}/<batch-id> --count 5 --seed 1"
+                "tool mutate --target {target} --input-dir seeds/{seed_subdir} --out-dir data/corpus/mutated/{target}/<batch-id> --count 5 --seed 1"
             ),
         ),
         (

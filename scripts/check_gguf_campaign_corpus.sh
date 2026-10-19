@@ -17,6 +17,16 @@ PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export HOOK_FILE="$WORK/no-discord-hook" DISCORD_WEBHOOK="" GGUF_LIBFUZZER_CORPUS_CAP=1048576
+TARGET_SPEC_TOOL="$WORK/target-spec-tool"
+cat > "$TARGET_SPEC_TOOL" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == target-spec ]]; then
+  printf 'target_id=gguf\nseed_subdir=gguf\ninput_ext=gguf\nmutation_supported=1\ncampaign_supported=1\n'
+  exit 0
+fi
+exit 64
+EOF
+chmod +x "$TARGET_SPEC_TOOL"
 
 fail() { echo "[gguf-campaign-corpus] fail: $*" >&2; exit 1; }
 log() { echo "[gguf-campaign-corpus] $*"; }
@@ -55,6 +65,7 @@ run_long() {
   env -u TOOL_LIBFUZZER_CMD -u TOOL_LIBFUZZER_MODE -u LIBFUZZER_DRIVER \
     REQUIRE_NATIVE=0 REQUIRE_INSTRUMENTED=0 \
     WORKDIR="$ROOT" DATA_DIR="$ROOT/output" CORPUS_PROBE="$ROOT/probe" \
+    TOOL_BIN="$TARGET_SPEC_TOOL" \
     bash "$PROJECT_ROOT/scripts/run_long.sh" --target gguf --backend libfuzzer \
       --duration-seconds 1 --tag corpus-check "$@" > "$ROOT/run.log" 2>&1 \
     || { cat "$ROOT/run.log" >&2; fail 'run_long failed'; }
@@ -122,6 +133,7 @@ ROOT="$WORK/missing"
 mkdir -p "$ROOT"
 rc=0
 env -u TOOL_LIBFUZZER_CMD WORKDIR="$ROOT" \
+  TOOL_BIN="$TARGET_SPEC_TOOL" \
   bash "$PROJECT_ROOT/scripts/run_long.sh" --target gguf --backend libfuzzer \
     --duration-seconds 1 --tag corpus-check > "$ROOT/run.log" 2>&1 || rc=$?
 [[ "$rc" -eq 2 ]] || fail "missing fixture returned $rc, expected 2"

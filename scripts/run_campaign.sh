@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: run_campaign.sh --mode <serial|parallel> --target <onnx|gguf|safetensors> (--hours <N>|--duration-seconds <N>) --campaign-id <ID> [--backends <local-harness,libfuzzer,aflpp>] [--corpus-dir <dir>] [--data-root <dir>] [--workers <n>] [--timeout-sec <n>] [--restart-limit <n>] [--max-jobs <n>] [--dry-run]
+usage: run_campaign.sh --mode <serial|parallel> --target <registered-target> (--hours <N>|--duration-seconds <N>) --campaign-id <ID> [--backends <local-harness,libfuzzer,aflpp>] [--corpus-dir <dir>] [--data-root <dir>] [--workers <n>] [--timeout-sec <n>] [--restart-limit <n>] [--max-jobs <n>] [--dry-run]
 EOF
 }
 
@@ -64,10 +64,23 @@ case "$MODE" in
   *) echo "[campaign] unsupported mode: $MODE" >&2; exit 2 ;;
 esac
 
-case "$TARGET" in
-  onnx|gguf|safetensors) ;;
-  *) echo "[campaign] unsupported target: $TARGET" >&2; exit 2 ;;
-esac
+if [[ ! -x "$TOOL_BIN" ]]; then
+  echo "[campaign] tool binary is not executable: $TOOL_BIN" >&2
+  exit 2
+fi
+TARGET_SPEC="$("$TOOL_BIN" target-spec --target "$TARGET" --format shell 2>/dev/null)" || {
+  echo "[campaign] unsupported target: $TARGET" >&2
+  exit 2
+}
+if ! grep -Fqx 'campaign_supported=1' <<<"$TARGET_SPEC"; then
+  echo "[campaign] target is registered but campaign dispatch is unavailable: $TARGET" >&2
+  exit 2
+fi
+SEED_SUBDIR="$(sed -n 's/^seed_subdir=//p' <<<"$TARGET_SPEC")"
+if [[ ! "$SEED_SUBDIR" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "[campaign] registered target has an invalid seed_subdir: $TARGET" >&2
+  exit 2
+fi
 
 if [[ ! "$CAMPAIGN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "[campaign] campaign-id allows only A-Z, a-z, 0-9, dot, underscore, dash" >&2
@@ -99,7 +112,7 @@ if [[ -n "$MAX_JOBS" && ( ! "$MAX_JOBS" =~ ^[0-9]+$ || "$MAX_JOBS" -lt 1 ) ]]; t
 fi
 
 if [[ -z "$CORPUS_DIR" ]]; then
-  CORPUS_DIR="seeds/${TARGET}"
+  CORPUS_DIR="seeds/${SEED_SUBDIR}"
 fi
 if [[ -z "$DATA_ROOT" ]]; then
   DATA_ROOT="data/campaigns"
@@ -366,7 +379,12 @@ cleanup_children() {
 }
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  echo "[campaign] dry-run mode=$MODE target=$TARGET duration=$DURATION_LABEL campaign=$CAMPAIGN_ID"
+  if [[ "${TOOL_PROFILED_CAMPAIGN:-0}" == "1" ]]; then
+    PROFILED_LABEL=yes
+  else
+    PROFILED_LABEL=no
+  fi
+  echo "[campaign] dry-run mode=$MODE target=$TARGET duration=$DURATION_LABEL campaign=$CAMPAIGN_ID profiled=$PROFILED_LABEL"
   for backend in "${BACKEND_LIST[@]}"; do
     duration_arg="--hours $HOURS"
     if [[ -n "$DURATION_SECONDS" ]]; then

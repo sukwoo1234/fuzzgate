@@ -41,4 +41,3 @@ pub(crate) fn apply(
         parse_preserving,
     })
 }
-

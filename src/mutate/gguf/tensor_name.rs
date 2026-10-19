@@ -59,8 +59,8 @@ fn parse_preserving_label(bytes: &[u8]) -> &'static str {
 
 #[cfg(test)]
 mod label_tests {
-    use super::*;
     use super::super::test_fixtures::build_gguf_with_multibyte_tensor_name;
+    use super::*;
 
     // A17/A18: the operator substitutes an arbitrary printable byte into a string,
     // which can be a JSON delimiter in a safetensors header or the middle of a

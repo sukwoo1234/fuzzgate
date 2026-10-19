@@ -28,6 +28,9 @@ printf 'seed' > "$WORK/seeds/onnx/seed.onnx"
 # so the batch count stays at the two the fixture pre-created.
 cat > "$WORK/bin/tool" <<'TOOLEOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "target-spec" ]]; then
+  printf 'target_id=onnx\nseed_subdir=onnx\ninput_ext=onnx\nmutation_supported=1\ncampaign_supported=1\n'
+fi
 exit 0
 TOOLEOF
 chmod +x "$WORK/bin/tool"

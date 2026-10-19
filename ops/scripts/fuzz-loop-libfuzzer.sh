@@ -22,6 +22,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 . "${SCRIPT_DIR}/../../scripts/lib/gguf_corpus.sh"
 TARGET="${TARGET:-onnx}"
 BACKEND="${BACKEND:-libfuzzer}"
+TOOL_BIN="${TOOL_BIN:-${PROJECT_ROOT}/target/release/tool}"
 WORKERS="${WORKERS:-12}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-30}"
 RESTART_LIMIT="${RESTART_LIMIT:-1}"
@@ -34,10 +35,25 @@ RESTART_LIMIT="${RESTART_LIMIT:-1}"
 # onnx is deliberately left as it was: its arms have always shared seeds/onnx by design
 # (see ops/systemd/tool-fuzz-onnx-libfuzzer.service), and published Arm B/C numbers rest
 # on that. Changing it now would make old and new runs incomparable.
+TARGET_SPEC="$("${TOOL_BIN}" target-spec --target "${TARGET}" --format shell)" || exit 2
+if ! grep -Fqx 'campaign_supported=1' <<<"${TARGET_SPEC}"; then
+    printf 'target is registered but campaign dispatch is unavailable: %s\n' "${TARGET}" >&2
+    exit 2
+fi
+SEED_SUBDIR="$(printf '%s\n' "${TARGET_SPEC}" | sed -n 's/^seed_subdir=//p')"
+if [[ ! "${SEED_SUBDIR}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'target spec for %s has an unsafe seed_subdir\n' "${TARGET}" >&2
+    exit 2
+fi
+INPUT_EXT="$(printf '%s\n' "${TARGET_SPEC}" | sed -n 's/^input_ext=//p')"
+if [[ ! "${INPUT_EXT}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+    printf 'target spec for %s has an unsafe input_ext\n' "${TARGET}" >&2
+    exit 2
+fi
 if [ -z "${CORPUS_DIR:-}" ]; then
     case "${TARGET}" in
         gguf) CORPUS_DIR="${PROJECT_ROOT}/data/corpus/libfuzzer/${TARGET}" ;;
-        *)    CORPUS_DIR="${PROJECT_ROOT}/seeds/${TARGET}" ;;
+        *)    CORPUS_DIR="${PROJECT_ROOT}/seeds/${SEED_SUBDIR}" ;;
     esac
 fi
 ITERATION_SLEEP_SEC="${ITERATION_SLEEP_SEC:-2}"
@@ -74,8 +90,6 @@ if [[ -z "${LIBFUZZER_DRIVER:-}" ]]; then
     fi
 fi
 
-TOOL_BIN="${TOOL_BIN:-${PROJECT_ROOT}/target/release/tool}"
-
 log() {
     echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] fuzz-loop-libfuzzer: $*"
 }
@@ -88,7 +102,7 @@ cd "${PROJECT_ROOT}"
 # fuzzing the units the new fixture exists to replace (see scripts/lib/gguf_corpus.sh).
 # C3: the gguf arm seeds from the under-cap derivative when there is one. The choice
 # lives in scripts/lib/gguf_corpus.sh so run_long.sh makes the same one.
-SEED_FIXTURE="${PROJECT_ROOT}/seeds/${TARGET}"
+SEED_FIXTURE="${PROJECT_ROOT}/seeds/${SEED_SUBDIR}"
 if [ "${TARGET}" = "gguf" ]; then
     if SEED_FIXTURE="$(gguf_libfuzzer_seed_fixture "${PROJECT_ROOT}")"; then
         :
@@ -152,7 +166,7 @@ if [[ "${LIBFUZZER_MODE}" == "native" ]]; then
     esac
     export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && ${LIBFUZZER_PROFILE_PREFIX}${LIBFUZZER_DRIVER} ${LIBFUZZER_RESOURCE_LIMITS} -artifact_prefix={artifact_dir}/ -max_total_time=${LIBFUZZER_MAX_TOTAL_TIME} {corpus_dir} >/dev/null 2>&1"
 else
-    export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && TOOL_HARNESS_TOOL=${TOOL_BIN} TOOL_HARNESS_TARGET=${TARGET} TOOL_HARNESS_EXT=${TARGET} ${LIBFUZZER_DRIVER} ${LIBFUZZER_RESOURCE_LIMITS} -artifact_prefix={artifact_dir}/ -max_total_time=${LIBFUZZER_MAX_TOTAL_TIME} {corpus_dir} >/dev/null 2>&1"
+    export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && TOOL_HARNESS_TOOL=${TOOL_BIN} TOOL_HARNESS_TARGET=${TARGET} TOOL_HARNESS_EXT=${INPUT_EXT} ${LIBFUZZER_DRIVER} ${LIBFUZZER_RESOURCE_LIMITS} -artifact_prefix={artifact_dir}/ -max_total_time=${LIBFUZZER_MAX_TOTAL_TIME} {corpus_dir} >/dev/null 2>&1"
 fi
 
 iter=0

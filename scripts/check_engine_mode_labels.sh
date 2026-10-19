@@ -41,6 +41,15 @@ printf 'seed' > "$WORK/seeds/onnx/seed.onnx"
 # stand-in for target/release/tool: the loops only need one iteration to complete
 cat > "$WORK/bin/tool" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "target-spec" ]]; then
+  target=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--target" ]]; then target="$2"; break; fi
+    shift
+  done
+  printf 'target_id=%s\nseed_subdir=%s\ninput_ext=%s\nmutation_supported=1\ncampaign_supported=1\n' \
+    "$target" "$target" "$target"
+fi
 exit 0
 EOF
 chmod +x "$WORK/bin/tool"

@@ -25,6 +25,17 @@ def check(name, override, target='gguf', backend='libfuzzer', native=True):
     (seed / 'seed').write_text('fixture seed\n')
     scripts = root / 'scripts'
     scripts.mkdir()
+    tool = root / 'tool-fixture'
+    tool.write_text(
+        '#!/usr/bin/env bash\n'
+        'if [[ "${1:-}" == target-spec ]]; then\n'
+        '  target=""; while [[ $# -gt 0 ]]; do '
+        'if [[ "$1" == --target ]]; then target="$2"; break; fi; shift; done\n'
+        '  printf "target_id=%s\\nseed_subdir=%s\\ninput_ext=%s\\nmutation_supported=1\\ncampaign_supported=1\\n" "$target" "$target" "$target"\n'
+        '  exit 0\n'
+        'fi\n'
+        'exit 64\n')
+    tool.chmod(0o755)
     probe = root / 'probe'
     (scripts / 'run_backend_loop.sh').write_text(
         '#!/usr/bin/env bash\nprintf "%s" "${TOOL_LIBFUZZER_CMD:-}" > "$GUARD_PROBE"\n')
@@ -39,6 +50,7 @@ def check(name, override, target='gguf', backend='libfuzzer', native=True):
         'HOOK_FILE': str(root / 'no-hook'), 'DISCORD_WEBHOOK': '',
         'R28_EXTRA': '-rss_limit_mb=0 -malloc_limit_mb=0',
         'TOOL_AFLPP_CMD': 'true',
+        'TOOL_BIN': str(tool),
     }
     if override is not None:
         env['TOOL_LIBFUZZER_CMD'] = override

@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: run_long.sh --target <onnx|gguf|safetensors> --backend <local-harness|libfuzzer|aflpp> (--hours <N>|--duration-seconds <N>) --tag <TAG> [--corpus-dir <dir>] [--seed-fixture <dir>] [--data-dir <dir>] [--workers <n>] [--timeout-sec <n>] [--restart-limit <n>] [--max-jobs <n>]
+usage: run_long.sh --target <registered-target> --backend <local-harness|libfuzzer|aflpp> (--hours <N>|--duration-seconds <N>) --tag <TAG> [--corpus-dir <dir>] [--seed-fixture <dir>] [--data-dir <dir>] [--workers <n>] [--timeout-sec <n>] [--restart-limit <n>] [--max-jobs <n>]
 --seed-fixture records a caller-known source for an explicit corpus; it does not copy seeds.
 GGUF libFuzzer uses generated commands with memory limits; unset TOOL_LIBFUZZER_CMD before running.
 EOF
@@ -58,6 +58,28 @@ if [[ -z "$TARGET" || -z "$BACKEND" || -z "$TAG" ]]; then
   usage
   exit 2
 fi
+if [[ ! -x "$TOOL_BIN" ]]; then
+  echo "[run-long] tool binary is not executable: $TOOL_BIN" >&2
+  exit 2
+fi
+TARGET_SPEC="$("$TOOL_BIN" target-spec --target "$TARGET" --format shell 2>/dev/null)" || {
+  echo "[run-long] unsupported target: $TARGET" >&2
+  exit 2
+}
+if ! grep -Fqx 'campaign_supported=1' <<<"$TARGET_SPEC"; then
+  echo "[run-long] target is registered but campaign dispatch is unavailable: $TARGET" >&2
+  exit 2
+fi
+SEED_SUBDIR="$(sed -n 's/^seed_subdir=//p' <<<"$TARGET_SPEC")"
+if [[ ! "$SEED_SUBDIR" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "[run-long] registered target has an invalid seed_subdir: $TARGET" >&2
+  exit 2
+fi
+INPUT_EXT="$(sed -n 's/^input_ext=//p' <<<"$TARGET_SPEC")"
+if [[ ! "$INPUT_EXT" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+  echo "[run-long] registered target has an invalid input_ext: $TARGET" >&2
+  exit 2
+fi
 if [[ -z "$HOURS" && -z "$DURATION_SECONDS" ]]; then
   echo "[run-long] either --hours or --duration-seconds is required" >&2
   usage
@@ -70,7 +92,7 @@ if [[ -n "$HOURS" && -n "$DURATION_SECONDS" ]]; then
 fi
 
 if [[ -z "$CORPUS_DIR" ]]; then
-  CORPUS_DIR="seeds/${TARGET}"
+  CORPUS_DIR="seeds/${SEED_SUBDIR}"
   # Default selection owns its source label; caller metadata applies only to an
   # explicit corpus. Keep the copy decision separate from provenance metadata.
   SEED_FIXTURE="$CORPUS_DIR"
@@ -92,6 +114,13 @@ if [[ ! -d "$CORPUS_DIR" ]]; then
   exit 2
 fi
 
+if [[ -n "${TOOL_TARGET_PROFILE:-}" ]]; then
+  case "$BACKEND" in
+    local-harness|libfuzzer|aflpp) ;;
+    *) echo "[run-long] unsupported backend: $BACKEND" >&2; exit 2 ;;
+  esac
+  echo "[run-long] profiled=yes backend command comes only from the verified target profile"
+else
 case "$BACKEND" in
   local-harness)
     ;;
@@ -142,7 +171,7 @@ case "$BACKEND" in
           echo "[run-long] REQUIRE_NATIVE=1 is set; refusing to run in black-box mode" >&2
           exit 3
         fi
-        export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && TOOL_HARNESS_TOOL=${TOOL_BIN} TOOL_HARNESS_TARGET=${TARGET} TOOL_HARNESS_EXT=${TARGET} ${WORKDIR}/harnesses/libfuzzer/tool_harness_driver ${LIBFUZZER_RESOURCE_LIMITS} -artifact_prefix={artifact_dir}/ -max_total_time=5 {corpus_dir} >/dev/null 2>&1"
+        export TOOL_LIBFUZZER_CMD="mkdir -p {artifact_dir} && TOOL_HARNESS_TOOL=${TOOL_BIN} TOOL_HARNESS_TARGET=${TARGET} TOOL_HARNESS_EXT=${INPUT_EXT} ${WORKDIR}/harnesses/libfuzzer/tool_harness_driver ${LIBFUZZER_RESOURCE_LIMITS} -artifact_prefix={artifact_dir}/ -max_total_time=5 {corpus_dir} >/dev/null 2>&1"
       fi
       echo "[run-long] libfuzzer_mode=${TOOL_LIBFUZZER_MODE}"
       echo "[run-long] TOOL_LIBFUZZER_CMD=${TOOL_LIBFUZZER_CMD}"
@@ -225,6 +254,7 @@ case "$BACKEND" in
     exit 2
     ;;
 esac
+fi
 
 # R26: fixtures are inputs, never the writable libFuzzer corpus. Only an omitted
 # --corpus-dir uses this shared working copy; campaign arm copies stay caller-owned.

@@ -5,9 +5,12 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=lib/seed_collect.sh
 . "$SCRIPT_DIR/lib/seed_collect.sh"
 
+WORKDIR="${WORKDIR:-$PWD}"
+TOOL_BIN="${TOOL_BIN:-$WORKDIR/target/debug/tool}"
+
 usage() {
   cat <<'EOF'
-usage: seed_fetch.sh --target <onnx|gguf|safetensors> --url <https_url> [--sha256 <hex>] [--out-dir <dir>] [--tmp-dir <dir>] [--no-sync]
+usage: seed_fetch.sh --target <registered-target> --url <https_url> [--sha256 <hex>] [--out-dir <dir>] [--tmp-dir <dir>] [--no-sync]
 
 examples:
   bash scripts/seed_fetch.sh \
@@ -48,12 +51,31 @@ if [[ -z "$TARGET" || -z "$URL" ]]; then
   exit 2
 fi
 
-case "$TARGET" in
-  onnx) EXT="onnx" ;;
-  gguf) EXT="gguf" ;;
-  safetensors) EXT="safetensors" ;;
-  *) echo "[seed-fetch] unsupported target: $TARGET" >&2; exit 2 ;;
-esac
+if [[ ! -x "$TOOL_BIN" ]]; then
+  echo "[seed-fetch] tool binary missing or not executable: $TOOL_BIN" >&2
+  exit 2
+fi
+TARGET_SPEC="$("$TOOL_BIN" target-spec --target "$TARGET" --format shell 2>/dev/null)" || {
+  echo "[seed-fetch] unsupported target: $TARGET" >&2
+  exit 2
+}
+TARGET_ID="$(sed -n 's/^target_id=//p' <<<"$TARGET_SPEC")"
+SEED_SUBDIR="$(sed -n 's/^seed_subdir=//p' <<<"$TARGET_SPEC")"
+EXT="$(sed -n 's/^input_ext=//p' <<<"$TARGET_SPEC")"
+if [[ "$TARGET_ID" != "$TARGET" \
+  || ! "$TARGET_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "[seed-fetch] registered target has an invalid or mismatched target_id: $TARGET" >&2
+  exit 2
+fi
+if [[ ! "$SEED_SUBDIR" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "[seed-fetch] registered target has an invalid seed_subdir: $TARGET" >&2
+  exit 2
+fi
+if [[ ! "$EXT" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+  echo "[seed-fetch] registered target has an invalid input_ext: $TARGET" >&2
+  exit 2
+fi
+TARGET="$TARGET_ID"
 
 if [[ "$URL" != https://* ]]; then
   echo "[seed-fetch] only https URLs are allowed" >&2
@@ -72,7 +94,7 @@ case "$URL" in
 esac
 
 if [[ -z "$OUT_DIR" ]]; then
-  OUT_DIR="seeds/${TARGET}"
+  OUT_DIR="$WORKDIR/seeds/${SEED_SUBDIR}"
 fi
 if [[ -z "$TMP_DIR" ]]; then
   TMP_DIR="$(mktemp -d /tmp/seed-fetch-${TARGET}-XXXXXX)"
@@ -144,8 +166,8 @@ fi
 
 if [[ "$SYNC" -eq 1 ]]; then
   echo "[seed-fetch] running harness-filter sync"
-  ./target/debug/tool seed sync --target "$TARGET" --from "$RAW_DIR" --to "$OUT_DIR" --harness-filter
-  ./target/debug/tool seed stats --target "$TARGET" --dir "$OUT_DIR"
+  "$TOOL_BIN" seed sync --target "$TARGET" --from "$RAW_DIR" --to "$OUT_DIR" --harness-filter
+  "$TOOL_BIN" seed stats --target "$TARGET" --dir "$OUT_DIR"
 else
   echo "[seed-fetch] sync disabled (--no-sync). raw files remain at: $RAW_DIR"
 fi

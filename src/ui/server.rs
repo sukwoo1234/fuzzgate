@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::common::AppPaths;
+use crate::common::{now_unix_millis, AppPaths};
 use crate::dashboard_data::collect_dashboard_snapshot;
-use crate::json_utils::{extract_json_string_literal, html_escape, json_escape, url_encode};
+use crate::json_utils::{html_escape, json_escape, url_encode};
+use crate::target::{parse_target_id, target_label, target_spec};
 
 /// A4: a client that opens the socket and then goes quiet must not be able to hold a slot
 /// forever, and a slow reader must not wedge a writer.
@@ -493,6 +494,9 @@ fn route_request(
     if let Some(id) = raw_path.strip_prefix("/coverage/") {
         return handle_entity_view(app_paths, "coverage", id);
     }
+    if let Some(id) = raw_path.strip_prefix("/diagnostic/") {
+        return handle_entity_view(app_paths, "diagnostic", id);
+    }
 
     match raw_path {
         "/healthz" => respond("200 OK", "text/plain; charset=utf-8", "ok\n"),
@@ -815,38 +819,41 @@ fn handle_replay_start(app_paths: &AppPaths, raw_path: &str) -> Result<Response,
     if triage_id.is_empty() && input_value.is_empty() {
         return bad_request("missing_input");
     }
-    let input_path = if triage_id.is_empty() {
+    let (input_path, target, identity) = if triage_id.is_empty() {
         let decoded_input =
             url_decode(input_value).ok_or_else(|| "invalid url encoding".to_string())?;
         if !is_safe_query_value(&decoded_input) {
             return bad_request("invalid_input");
         }
-        resolve_replay_input(app_paths, &decoded_input)
+        let Some(input_path) = resolve_replay_input(app_paths, &decoded_input) else {
+            return bad_request("invalid_input");
+        };
+        let Some(target) = ui_target_id(extract_query_param(raw_path, "target").unwrap_or("onnx"))
+        else {
+            return bad_request("invalid_target");
+        };
+        (input_path, target, ReplayIdentity::Legacy)
     } else {
-        resolve_triage_input(app_paths, &triage_id)
-    };
-    let Some(input_path) = input_path else {
-        return bad_request("invalid_input");
-    };
-
-    let target = match extract_query_param(raw_path, "target").unwrap_or("onnx") {
-        "onnx" | "gguf" | "safetensors" => {
-            extract_query_param(raw_path, "target").unwrap_or("onnx")
+        let Some(replay) = resolve_triage_replay(app_paths, &triage_id) else {
+            return bad_request("invalid_input");
+        };
+        if let Some(requested) = extract_query_param(raw_path, "target") {
+            let Some(requested) = ui_target_id(requested) else {
+                return bad_request("invalid_target");
+            };
+            if requested != replay.target {
+                return bad_request("target_mismatch");
+            }
         }
-        _ => {
-            return respond(
-                "400 Bad Request",
-                "application/json; charset=utf-8",
-                "{\"error\":\"invalid_target\"}",
-            )
-        }
+        (replay.input, replay.target, replay.identity)
     };
     let repro_retries =
         match bounded_count_param(extract_query_param(raw_path, "repro_retries"), 1, 100, "3") {
             Some(value) => value,
             None => return bad_request("invalid_repro_retries"),
         };
-    let Some(timeout_sec) = positive_timeout_sec_param(extract_query_param(raw_path, "timeout_sec"))
+    let Some(timeout_sec) =
+        positive_timeout_sec_param(extract_query_param(raw_path, "timeout_sec"))
     else {
         return bad_request("invalid_timeout_sec");
     };
@@ -871,6 +878,45 @@ fn handle_replay_start(app_paths: &AppPaths, raw_path: &str) -> Result<Response,
 
     let cwd = std::env::current_dir().map_err(|e| format!("failed to get current dir: {e}"))?;
     let mut cmd = tool_child_command(app_paths)?;
+    clear_profile_identity_env(&mut cmd);
+    let (profiled, authorization, validation_run) = match &identity {
+        ReplayIdentity::Legacy => (false, "legacy_unverified", None),
+        ReplayIdentity::Qualified {
+            profile_path,
+            profile_sha256,
+            qualification_path,
+            qualification_sha256,
+        } => {
+            cmd.arg("--target-profile")
+                .arg(profile_path)
+                .env(crate::execution_context::PROFILE_SHA256_ENV, profile_sha256)
+                .env(
+                    crate::execution_context::QUALIFICATION_PATH_ENV,
+                    qualification_path,
+                )
+                .env(
+                    crate::execution_context::QUALIFICATION_SHA256_ENV,
+                    qualification_sha256,
+                );
+            (true, "qualified", None)
+        }
+        ReplayIdentity::Unqualified {
+            profile_path,
+            profile_sha256,
+        } => {
+            let validation_run = fresh_ui_validation_run();
+            cmd.arg("--target-profile")
+                .arg(profile_path)
+                .arg("--validation-run")
+                .arg(&validation_run)
+                .env(crate::execution_context::PROFILE_SHA256_ENV, profile_sha256)
+                .env(
+                    crate::execution_context::VALIDATION_RUN_ENV,
+                    &validation_run,
+                );
+            (true, "unqualified_validation", Some(validation_run))
+        }
+    };
     cmd.current_dir(&cwd)
         .arg("triage")
         .arg("--target")
@@ -897,11 +943,18 @@ fn handle_replay_start(app_paths: &AppPaths, raw_path: &str) -> Result<Response,
     };
     write_replay_state(app_paths, &state)?;
 
+    let validation_run_json = validation_run
+        .as_deref()
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .unwrap_or_else(|| "null".to_string());
     let body = format!(
-        "{{\"ok\":true,\"running\":true,\"pid\":{},\"target\":\"{}\",\"input\":\"{}\"}}",
+        "{{\"ok\":true,\"running\":true,\"pid\":{},\"target\":\"{}\",\"input\":\"{}\",\"profiled\":{},\"authorization\":\"{}\",\"validation_run\":{}}}",
         pid,
         json_escape(target),
         json_escape(&state.input),
+        profiled,
+        json_escape(authorization),
+        validation_run_json,
     );
     respond("200 OK", "application/json; charset=utf-8", &body)
 }
@@ -916,11 +969,9 @@ fn handle_target_prepare(app_paths: &AppPaths, raw_path: &str) -> Result<Respons
         );
     }
 
-    let target = match extract_query_param(raw_path, "target").unwrap_or("onnx") {
-        "onnx" | "gguf" | "safetensors" => {
-            extract_query_param(raw_path, "target").unwrap_or("onnx")
-        }
-        _ => {
+    let target = match ui_target_id(extract_query_param(raw_path, "target").unwrap_or("onnx")) {
+        Some(target) => target,
+        None => {
             return respond(
                 "400 Bad Request",
                 "application/json; charset=utf-8",
@@ -1017,11 +1068,9 @@ fn handle_target_build_start(app_paths: &AppPaths, raw_path: &str) -> Result<Res
         );
     }
 
-    let target = match extract_query_param(raw_path, "target").unwrap_or("gguf") {
-        "gguf" | "onnx" | "safetensors" => {
-            extract_query_param(raw_path, "target").unwrap_or("gguf")
-        }
-        _ => {
+    let target = match ui_target_id(extract_query_param(raw_path, "target").unwrap_or("gguf")) {
+        Some(target) => target,
+        None => {
             return respond(
                 "400 Bad Request",
                 "application/json; charset=utf-8",
@@ -1173,7 +1222,8 @@ fn handle_control_start(app_paths: &AppPaths, raw_path: &str) -> Result<Response
     else {
         return bad_request("invalid_workers");
     };
-    let Some(timeout_sec) = positive_timeout_sec_param(extract_query_param(raw_path, "timeout_sec"))
+    let Some(timeout_sec) =
+        positive_timeout_sec_param(extract_query_param(raw_path, "timeout_sec"))
     else {
         return bad_request("invalid_timeout_sec");
     };
@@ -1183,13 +1233,13 @@ fn handle_control_start(app_paths: &AppPaths, raw_path: &str) -> Result<Response
         return bad_request("invalid_restart_limit");
     };
 
-    if !matches!(target, "onnx" | "gguf" | "safetensors") {
+    let Some(target) = ui_target_id(target) else {
         return respond(
             "400 Bad Request",
             "application/json; charset=utf-8",
             "{\"error\":\"invalid_target\"}",
         );
-    }
+    };
     if !matches!(backend, "local-harness" | "aflpp" | "libfuzzer") {
         return respond(
             "400 Bad Request",
@@ -1218,7 +1268,10 @@ fn handle_control_start(app_paths: &AppPaths, raw_path: &str) -> Result<Response
     let cwd = std::env::current_dir().map_err(|e| format!("failed to get current dir: {e}"))?;
     let tool_bin =
         std::env::current_exe().map_err(|e| format!("failed to resolve current exe: {e}"))?;
-    let corpus_dir = app_paths.seeds_dir.join(target);
+    let target_kind = parse_target_id(target).ok_or_else(|| "invalid UI target".to_string())?;
+    let corpus_dir = app_paths
+        .seeds_dir
+        .join(target_spec(&target_kind).seed_subdir);
     let mut cmd = Command::new("bash");
     cmd.arg("scripts/run_backend_loop.sh")
         .current_dir(&cwd)
@@ -1746,12 +1799,13 @@ fn latest_prepared_version(app_paths: &AppPaths, target: &str) -> Option<String>
 }
 
 fn target_storage_name(target: &str) -> Option<&'static str> {
-    match target {
-        "gguf" => Some("llama.cpp"),
-        "onnx" => Some("onnxruntime"),
-        "safetensors" => Some("safetensors"),
-        _ => None,
-    }
+    parse_target_id(target).map(|kind| target_spec(&kind).storage_name)
+}
+
+fn ui_target_id(target: &str) -> Option<&'static str> {
+    let kind = parse_target_id(target)?;
+    let spec = target_spec(&kind);
+    spec.ui_supported.then_some(target_label(&kind))
 }
 
 fn tool_child_command(app_paths: &AppPaths) -> Result<Command, String> {
@@ -1922,6 +1976,14 @@ fn handle_entity_view(app_paths: &AppPaths, kind: &str, id: &str) -> Result<Resp
             entity("coverage", "summary.json"),
             vec![],
         ),
+        "diagnostic" => (
+            format!("Diagnostic Detail: {id}"),
+            entity("diagnostics", "diagnostic.json"),
+            vec![
+                entity("diagnostics", "traceback.txt"),
+                entity("diagnostics", "execution.json"),
+            ],
+        ),
         _ => return respond("404 Not Found", "text/plain; charset=utf-8", "not found\n"),
     };
 
@@ -1942,22 +2004,84 @@ fn handle_entity_view(app_paths: &AppPaths, kind: &str, id: &str) -> Result<Resp
             }
         }
     }
+    if kind == "diagnostic" {
+        extras_html.push_str(&render_diagnostic_replay_links(app_paths, id));
+    }
     let extras_section = if extras_html.is_empty() {
         String::new()
     } else {
         format!("<h3>Related Files</h3><ul>{extras_html}</ul>")
     };
+    let validation_status = if kind == "diagnostic" {
+        format!(
+            "<p class=\"meta\" data-validation-status=\"raw-unverified\"><strong>Validation: raw/unverified.</strong> This view does not validate the evidence bundle. Run <code>tool show {}</code> or <code>tool export {}</code> for strict validation.</p>",
+            html_escape(id),
+            html_escape(id)
+        )
+    } else {
+        String::new()
+    };
+    let diagnostic_traceback = if kind == "diagnostic" {
+        let traceback = entity("diagnostics", "traceback.txt");
+        resolve_safe_data_path(&app_paths.data_dir, &traceback)
+            .ok()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .map(|content| format!("<h3>Traceback</h3><pre>{}</pre>", html_escape(&content)))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>body{{font-family:Segoe UI,system-ui,sans-serif;margin:0;background:#eef2f7;color:#111827}}.wrap{{max-width:1100px;margin:0 auto;padding:14px}}.top{{position:sticky;top:0;background:#eef2f7cc;backdrop-filter:blur(4px);padding-bottom:10px}}.card{{background:#fff;border:1px solid #d4dee8;border-radius:12px;padding:14px;box-shadow:0 4px 12px rgba(16,24,40,.04)}}pre{{white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid #e2e8f0;padding:12px;border-radius:10px;max-height:68vh;overflow:auto}}a{{color:#0b5563;text-decoration:none}}ul{{margin:8px 0 12px 16px;padding:0}}li{{margin:4px 0}}.meta{{font-size:12px;color:#4b5563}}@media (max-width:640px){{.wrap{{padding:10px}}h2{{font-size:18px}}pre{{font-size:11px}}}}</style></head><body><div class=\"wrap\"><div class=\"top\"><p><a href=\"/dashboard.html\">← dashboard</a></p><h2>{}</h2><p class=\"meta\">{}</p></div><div class=\"card\">{}<pre>{}</pre></div></div></body></html>",
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>body{{font-family:Segoe UI,system-ui,sans-serif;margin:0;background:#eef2f7;color:#111827}}.wrap{{max-width:1100px;margin:0 auto;padding:14px}}.top{{position:sticky;top:0;background:#eef2f7cc;backdrop-filter:blur(4px);padding-bottom:10px}}.card{{background:#fff;border:1px solid #d4dee8;border-radius:12px;padding:14px;box-shadow:0 4px 12px rgba(16,24,40,.04)}}pre{{white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid #e2e8f0;padding:12px;border-radius:10px;max-height:68vh;overflow:auto}}a{{color:#0b5563;text-decoration:none}}ul{{margin:8px 0 12px 16px;padding:0}}li{{margin:4px 0}}.meta{{font-size:12px;color:#4b5563}}@media (max-width:640px){{.wrap{{padding:10px}}h2{{font-size:18px}}pre{{font-size:11px}}}}</style></head><body><div class=\"wrap\"><div class=\"top\"><p><a href=\"/dashboard.html\">← dashboard</a></p><h2>{}</h2><p class=\"meta\">{}</p></div><div class=\"card\">{}{}<pre>{}</pre>{}</div></div></body></html>",
         html_escape(&title),
         html_escape(&title),
         html_escape(&main_rel_path),
+        validation_status,
         extras_section,
-        html_escape(&main_content)
+        html_escape(&main_content),
+        diagnostic_traceback
     );
 
     respond("200 OK", "text/html; charset=utf-8", &html)
+}
+
+fn render_diagnostic_replay_links(app_paths: &AppPaths, id: &str) -> String {
+    let replay_dir = app_paths
+        .data_dir
+        .join("diagnostics")
+        .join(id)
+        .join("replays");
+    let Ok(replay_dir) =
+        resolve_safe_data_path(&app_paths.data_dir, &replay_dir.display().to_string())
+    else {
+        return String::new();
+    };
+    let Ok(entries) = fs::read_dir(replay_dir) else {
+        return String::new();
+    };
+    let mut links = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (name.starts_with("replay-") && name.ends_with(".json")).then_some((name, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    links.sort_by(|left, right| left.0.cmp(&right.0));
+    links
+        .into_iter()
+        .map(|(name, path)| {
+            let path = path.display().to_string();
+            let href = format!("/file?path={}", url_encode(&path));
+            format!(
+                "<li><a href=\"{}\">{}</a></li>",
+                html_escape(&href),
+                html_escape(&name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn handle_file_view(app_paths: &AppPaths, raw_path: &str) -> Result<Response, String> {
@@ -2164,10 +2288,30 @@ fn from_hex(c: u8) -> Option<u8> {
     }
 }
 
-/// The dashboard's replay button names the triage record, not a path: the input is read back out
-/// of the summary the tool itself wrote. That keeps the caller from choosing which file gets fed
-/// to triage (A14) while still replaying a PoC the researcher triaged from outside the data dir.
-fn resolve_triage_input(app_paths: &AppPaths, triage_id: &str) -> Option<PathBuf> {
+struct TriageReplay {
+    input: PathBuf,
+    target: &'static str,
+    identity: ReplayIdentity,
+}
+
+enum ReplayIdentity {
+    Legacy,
+    Qualified {
+        profile_path: PathBuf,
+        profile_sha256: String,
+        qualification_path: PathBuf,
+        qualification_sha256: String,
+    },
+    Unqualified {
+        profile_path: PathBuf,
+        profile_sha256: String,
+    },
+}
+
+/// The dashboard's replay button names the triage record, not a path or target: both are read back
+/// out of the summary the tool itself wrote. That keeps the caller from choosing a different file
+/// or dispatching it through a different target while still replaying a PoC kept outside data/.
+fn resolve_triage_replay(app_paths: &AppPaths, triage_id: &str) -> Option<TriageReplay> {
     if triage_id.is_empty()
         || triage_id == "not_available"
         || !triage_id
@@ -2184,10 +2328,200 @@ fn resolve_triage_input(app_paths: &AppPaths, triage_id: &str) -> Option<PathBuf
         .join("summary.json");
     let summary_path =
         resolve_safe_data_path(&app_paths.data_dir, &summary_rel.display().to_string()).ok()?;
-    let summary = fs::read_to_string(summary_path).ok()?;
-    let recorded = extract_json_string_literal(&summary, "input")?;
+    let result_dir = summary_path.parent()?.to_path_buf();
+    let summary: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&summary_path).ok()?).ok()?;
+    let target = ui_target_id(summary.get("target")?.as_str()?)?;
+    let recorded = summary.get("input")?.as_str()?;
     let path = fs::canonicalize(recorded).ok()?;
-    path.is_file().then_some(path)
+    if !path.is_file() {
+        return None;
+    }
+    let identity =
+        resolve_replay_identity(app_paths, triage_id, &result_dir, &summary, target, &path)?;
+    Some(TriageReplay {
+        input: path,
+        target,
+        identity,
+    })
+}
+
+/// Legacy triage records have no execution identity at all. Once any profiled signal is present,
+/// replay is permitted only after `tool show` has validated the complete result and the references
+/// are proven to name the snapshots in this exact triage directory. This prevents a copied or
+/// partially deleted envelope from silently falling back to the legacy harness environment.
+fn resolve_replay_identity(
+    app_paths: &AppPaths,
+    triage_id: &str,
+    result_dir: &Path,
+    summary: &serde_json::Value,
+    target: &str,
+    input: &Path,
+) -> Option<ReplayIdentity> {
+    let profiled = summary
+        .get("profiled_result")
+        .and_then(serde_json::Value::as_bool);
+    let summary_hash = summary
+        .get("profile_sha256")
+        .and_then(serde_json::Value::as_str);
+    let has_identity_file = [
+        "execution.json",
+        "profiled-result.json",
+        "input-manifest.json",
+        "profile.json",
+        "qualification.json",
+    ]
+    .iter()
+    .any(|name| fs::symlink_metadata(result_dir.join(name)).is_ok());
+
+    if profiled.is_none() && summary_hash.is_none() && !has_identity_file {
+        return Some(ReplayIdentity::Legacy);
+    }
+    if profiled != Some(true)
+        || summary_hash
+            .is_none_or(|hash| hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+
+    let result_dir = fs::canonicalize(result_dir).ok()?;
+    for name in [
+        "execution.json",
+        "profiled-result.json",
+        "input-manifest.json",
+        "profile.json",
+    ] {
+        local_regular_file(&result_dir, name)?;
+    }
+    let profile_path = local_regular_file(&result_dir, "profile.json")?;
+
+    let mut show = tool_child_command(app_paths).ok()?;
+    clear_profile_identity_env(&mut show);
+    show.arg("show").arg(triage_id);
+    let (output, timed_out) = crate::common::output_with_deadline(show, 30).ok()?;
+    if timed_out || !output.status.success() {
+        return None;
+    }
+    let validated: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    if validated.get("id")?.as_str()? != triage_id
+        || validated.get("kind")?.as_str()? != "triage"
+        || !validated.get("profiled")?.as_bool()?
+        || validated.get("target_id")?.as_str()? != target
+    {
+        return None;
+    }
+    let validated_hash = validated.get("profile_sha256")?.as_str()?;
+    if !validated_hash.eq_ignore_ascii_case(summary_hash?) {
+        return None;
+    }
+
+    if !crate::common::sha256_file(&profile_path)
+        .ok()?
+        .eq_ignore_ascii_case(validated_hash)
+    {
+        return None;
+    }
+    let execution: serde_json::Value =
+        serde_json::from_slice(&fs::read(result_dir.join("execution.json")).ok()?).ok()?;
+    if canonical_json_path(&execution, "profile_path")? != profile_path
+        || execution.get("profile_sha256")?.as_str()? != validated_hash
+        || execution.get("target_id")?.as_str()? != target
+    {
+        return None;
+    }
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(result_dir.join("input-manifest.json")).ok()?).ok()?;
+    let entries = manifest.get("files")?.as_array()?;
+    if entries.len() != 1 {
+        return None;
+    }
+    let preserved_input = result_dir.join(entries[0].get("path")?.as_str()?);
+    if fs::canonicalize(preserved_input).ok()?.as_path() != input {
+        return None;
+    }
+
+    let authorization = validated.get("authorization")?.as_str()?;
+    if execution.get("authorization")?.as_str()? != authorization {
+        return None;
+    }
+    match authorization {
+        "qualified" => {
+            let qualification_path = local_regular_file(&result_dir, "qualification.json")?;
+            if canonical_json_path(&execution, "qualification_path")? != qualification_path {
+                return None;
+            }
+            let qualification_hash = execution.get("qualification_sha256")?.as_str()?;
+            if !crate::common::sha256_file(&qualification_path)
+                .ok()?
+                .eq_ignore_ascii_case(qualification_hash)
+                || !execution.get("validation_run")?.is_null()
+            {
+                return None;
+            }
+            Some(ReplayIdentity::Qualified {
+                profile_path,
+                profile_sha256: validated_hash.to_string(),
+                qualification_path,
+                qualification_sha256: qualification_hash.to_string(),
+            })
+        }
+        "unqualified_validation" => {
+            if !execution.get("qualification_path")?.is_null()
+                || !execution.get("qualification_sha256")?.is_null()
+                || execution
+                    .get("validation_run")?
+                    .as_str()
+                    .is_none_or(str::is_empty)
+                || fs::symlink_metadata(result_dir.join("qualification.json")).is_ok()
+            {
+                return None;
+            }
+            Some(ReplayIdentity::Unqualified {
+                profile_path,
+                profile_sha256: validated_hash.to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn local_regular_file(result_dir: &Path, name: &str) -> Option<PathBuf> {
+    let path = result_dir.join(name);
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let resolved = fs::canonicalize(path).ok()?;
+    (resolved.parent() == Some(result_dir)).then_some(resolved)
+}
+
+fn canonical_json_path(value: &serde_json::Value, field: &str) -> Option<PathBuf> {
+    fs::canonicalize(value.get(field)?.as_str()?).ok()
+}
+
+fn clear_profile_identity_env(command: &mut Command) {
+    for name in [
+        crate::execution_context::TARGET_PROFILE_ENV,
+        crate::execution_context::PROFILE_CHILD_ENV,
+        crate::execution_context::PROFILE_SHA256_ENV,
+        crate::execution_context::VALIDATION_RUN_ENV,
+        crate::execution_context::QUALIFICATION_PATH_ENV,
+        crate::execution_context::QUALIFICATION_SHA256_ENV,
+        crate::profile_results::DIAGNOSTIC_SUPERVISOR_ENV,
+    ] {
+        command.env_remove(name);
+    }
+}
+
+fn fresh_ui_validation_run() -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    format!(
+        "ui-replay-{}-{}-{}",
+        now_unix_millis(),
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// A14: replay/start used to accept any path that existed and was a file, so `tool triage` could
@@ -2288,7 +2622,7 @@ mod tests {
         is_process_alive, is_safe_query_value, is_safe_source_url, is_safe_version,
         parse_request_head, positive_timeout_sec_param, proc_stat_field, process_pgid,
         process_start_ticks, process_state, read_request_head, reap_children, register_child,
-        resolve_replay_input, resolve_triage_input, respond_to_request, running_job_pid,
+        resolve_replay_input, resolve_triage_replay, respond_to_request, running_job_pid,
         signal_job, spawn_job, HEAD_DEADLINE, SIGTERM,
     };
     use crate::common::{now_unix_millis, AppPaths};
@@ -2753,6 +3087,29 @@ mod tests {
         let run_dir = app_paths.data_dir.join("runs").join("run-7");
         fs::create_dir_all(&run_dir).expect("run dir");
         fs::write(run_dir.join("status.json"), "{\"total\": 41}").expect("write status");
+        let diagnostic_dir = app_paths
+            .data_dir
+            .join("diagnostics")
+            .join("diagnostic-1-2-3");
+        fs::create_dir_all(&diagnostic_dir).expect("diagnostic dir");
+        fs::write(
+            diagnostic_dir.join("diagnostic.json"),
+            "{\"classification\": \"unclassified-marker\"}",
+        )
+        .expect("write diagnostic");
+        fs::write(
+            diagnostic_dir.join("traceback.txt"),
+            "traceback-marker-4a91",
+        )
+        .expect("write traceback");
+        let replay_dir = diagnostic_dir.join("replays");
+        fs::create_dir_all(&replay_dir).expect("replay dir");
+        fs::write(
+            replay_dir.join("replay-2.json"),
+            "{\"result\":\"incomplete\"}",
+        )
+        .expect("write replay");
+        fs::write(replay_dir.join("notes.json"), "{}").expect("write unrelated replay file");
 
         let sec = secured("tok");
         let triage = respond_to_request(&app_paths, &sec, &request("GET", "/triage/triage-x"));
@@ -2762,6 +3119,60 @@ mod tests {
         let run = respond_to_request(&app_paths, &sec, &request("GET", "/run/run-7"));
         assert_eq!(run.status, "200 OK", "{}", run.body);
         assert!(run.body.contains("41"), "{}", run.body);
+
+        let diagnostic = respond_to_request(
+            &app_paths,
+            &sec,
+            &request("GET", "/diagnostic/diagnostic-1-2-3"),
+        );
+        assert_eq!(diagnostic.status, "200 OK", "{}", diagnostic.body);
+        assert!(
+            diagnostic.body.contains("unclassified-marker"),
+            "{}",
+            diagnostic.body
+        );
+        assert!(
+            diagnostic.body.contains("traceback-marker-4a91"),
+            "{}",
+            diagnostic.body
+        );
+        assert!(
+            diagnostic
+                .body
+                .contains("data-validation-status=\"raw-unverified\""),
+            "the raw detail route must not imply strict validation: {}",
+            diagnostic.body
+        );
+        assert!(
+            diagnostic
+                .body
+                .contains("<code>tool show diagnostic-1-2-3</code>"),
+            "the validation hint must use show's positional result ID: {}",
+            diagnostic.body
+        );
+        assert!(
+            diagnostic
+                .body
+                .contains("<code>tool export diagnostic-1-2-3</code>"),
+            "the validation hint must use export's positional result ID: {}",
+            diagnostic.body
+        );
+        assert!(
+            !diagnostic.body.contains("tool show --id")
+                && !diagnostic.body.contains("tool export --id"),
+            "the hint must not advertise unsupported --id flags: {}",
+            diagnostic.body
+        );
+        assert!(
+            diagnostic.body.contains("replay-2.json"),
+            "safe replay evidence must be discoverable: {}",
+            diagnostic.body
+        );
+        assert!(
+            !diagnostic.body.contains("notes.json"),
+            "only replay-*.json evidence may be linked: {}",
+            diagnostic.body
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2876,7 +3287,7 @@ mod tests {
                 .join("triage-1")
                 .join("summary.json"),
             format!(
-                "{{\"schema_version\": \"1.1\", \"input\": \"{}\"}}",
+                "{{\"schema_version\": \"1.1\", \"target\": \"gguf\", \"input\": \"{}\"}}",
                 poc.display()
             ),
         )
@@ -2886,19 +3297,74 @@ mod tests {
             seeds_dir: root.join("seeds"),
         };
 
+        let replay =
+            resolve_triage_replay(&app_paths, "triage-1").expect("valid recorded input and target");
         assert_eq!(
-            resolve_triage_input(&app_paths, "triage-1").as_deref(),
-            Some(poc.canonicalize().expect("canonical poc").as_path()),
+            replay.input.as_path(),
+            poc.canonicalize().expect("canonical poc").as_path(),
             "the input recorded by the tool itself is trusted provenance"
         );
-        assert!(resolve_triage_input(&app_paths, "missing").is_none());
+        assert_eq!(
+            replay.target, "gguf",
+            "the recorded target, not the input extension, is authoritative"
+        );
+        let mismatch = respond_to_request(
+            &app_paths,
+            &secured("tok"),
+            &head(
+                "POST",
+                "/replay/start?triage_id=triage-1&target=onnx",
+                "X-Tool-Token: tok\r\n",
+            ),
+        );
+        assert_eq!(mismatch.status, "400 Bad Request", "{}", mismatch.body);
         assert!(
-            resolve_triage_input(&app_paths, "../../etc").is_none(),
+            mismatch.body.contains("target_mismatch"),
+            "a client must not override the recorded target: {}",
+            mismatch.body
+        );
+        assert!(resolve_triage_replay(&app_paths, "missing").is_none());
+        assert!(
+            resolve_triage_replay(&app_paths, "../../etc").is_none(),
             "a triage id must not walk out of the triage tree"
         );
-        assert!(resolve_triage_input(&app_paths, "a/b").is_none());
-        assert!(resolve_triage_input(&app_paths, "").is_none());
-        assert!(resolve_triage_input(&app_paths, "not_available").is_none());
+        assert!(resolve_triage_replay(&app_paths, "a/b").is_none());
+        assert!(resolve_triage_replay(&app_paths, "").is_none());
+        assert!(resolve_triage_replay(&app_paths, "not_available").is_none());
+
+        fs::write(
+            data_dir
+                .join("triage")
+                .join("triage-1")
+                .join("summary.json"),
+            format!(
+                "{{\"schema_version\": \"1.1\", \"target\": \"gguf\", \"input\": \"{}\", \
+                 \"profiled_result\": true, \"profile_sha256\": \"{}\"}}",
+                poc.display(),
+                "a".repeat(64)
+            ),
+        )
+        .expect("write incomplete profiled summary");
+        assert!(
+            resolve_triage_replay(&app_paths, "triage-1").is_none(),
+            "a profiled triage with no result-local identity envelope must fail closed"
+        );
+
+        fs::write(
+            data_dir
+                .join("triage")
+                .join("triage-1")
+                .join("summary.json"),
+            format!(
+                "{{\"schema_version\": \"1.1\", \"input\": \"{}\"}}",
+                poc.display()
+            ),
+        )
+        .expect("write targetless summary");
+        assert!(
+            resolve_triage_replay(&app_paths, "triage-1").is_none(),
+            "a triage replay without a recorded target must fail closed"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

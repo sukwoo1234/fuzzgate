@@ -11,8 +11,7 @@ pub(crate) fn apply(
     }
     let mut out = bytes.to_vec();
     let len = out.len();
-    let offset = flip_value_byte(&mut out, 0, len, rng)
-        .ok_or(OperatorError::NoApplicableField)?;
+    let offset = flip_value_byte(&mut out, 0, len, rng).ok_or(OperatorError::NoApplicableField)?;
     Ok(MutationOutput {
         bytes: out,
         operator_params: vec![("byte_offset", offset.to_string())],

@@ -1,6 +1,4 @@
-use super::{
-    digit_count_u64, parse_safetensors, NATURAL_ALIGNMENT_LARGE, NATURAL_ALIGNMENT_SMALL,
-};
+use super::{digit_count_u64, parse_safetensors, NATURAL_ALIGNMENT_LARGE, NATURAL_ALIGNMENT_SMALL};
 use crate::mutate::common::{DeterministicRng, MutationOutput, OperatorError};
 
 pub(crate) const NAME: &str = "tensor_data_offsets";
@@ -41,11 +39,11 @@ pub(crate) fn apply(
         let end_elem = &tensor.data_offsets.elements[1];
         let start_raw = &bytes[start_elem.start..start_elem.end];
         let end_raw = &bytes[end_elem.start..end_elem.end];
-        let (start_val, end_val) = match (parse_number_bytes(start_raw), parse_number_bytes(end_raw))
-        {
-            (Some(s), Some(e)) => (s, e),
-            _ => continue,
-        };
+        let (start_val, end_val) =
+            match (parse_number_bytes(start_raw), parse_number_bytes(end_raw)) {
+                (Some(s), Some(e)) => (s, e),
+                _ => continue,
+            };
         let alignment = detect_alignment(start_val, end_val);
         if alignment == 0 {
             continue;

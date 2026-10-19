@@ -10,17 +10,20 @@ use crate::common::{
 };
 use crate::json_utils::{extract_json_string_literal, extract_json_u64_field, json_escape};
 use crate::run::{execute_harness_subprocess, write_job_log, RunJob};
-use crate::target::{collect_corpus_inputs, default_seed_dir, target_label, TargetKind};
+use crate::target::{
+    collect_corpus_inputs, default_seed_dir, target_label, target_spec, TargetKind,
+};
 
 // The env var naming the pinned instrumented coverage runner, selected per target so
 // `coverage --target <t>` runs the right one. The configured path must match the
 // first-party runner bytes embedded in this build. ONNX keeps its historical env name.
-fn coverage_cmd_env_key(target: &TargetKind) -> &'static str {
-    match target {
-        TargetKind::Gguf => "TOOL_COVERAGE_GGUF_CMD",
-        TargetKind::Onnx => "TOOL_COVERAGE_ONNX_CMD",
-        TargetKind::Safetensors => "TOOL_COVERAGE_SAFETENSORS_CMD",
-    }
+fn coverage_cmd_env_key(target: &TargetKind) -> Result<&'static str, String> {
+    target_spec(target).coverage_env_key.ok_or_else(|| {
+        format!(
+            "target '{}' has no registered source-coverage runner",
+            target_label(target)
+        )
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -29,20 +32,28 @@ struct TrustedCoverageRunner {
     bytes: &'static [u8],
 }
 
-fn expected_coverage_runner(target: &TargetKind) -> TrustedCoverageRunner {
-    match target {
-        TargetKind::Gguf => TrustedCoverageRunner {
+fn expected_coverage_runner(target: &TargetKind) -> Result<TrustedCoverageRunner, String> {
+    match target_spec(target).coverage_runner {
+        Some("scripts/run_coverage_gguf.sh") => Ok(TrustedCoverageRunner {
             name: "scripts/run_coverage_gguf.sh",
             bytes: include_bytes!("../scripts/run_coverage_gguf.sh"),
-        },
-        TargetKind::Onnx => TrustedCoverageRunner {
+        }),
+        Some("scripts/run_coverage_onnx.sh") => Ok(TrustedCoverageRunner {
             name: "scripts/run_coverage_onnx.sh",
             bytes: include_bytes!("../scripts/run_coverage_onnx.sh"),
-        },
-        TargetKind::Safetensors => TrustedCoverageRunner {
+        }),
+        Some("scripts/run_coverage_safetensors.sh") => Ok(TrustedCoverageRunner {
             name: "scripts/run_coverage_safetensors.sh",
             bytes: include_bytes!("../scripts/run_coverage_safetensors.sh"),
-        },
+        }),
+        Some(other) => Err(format!(
+            "target '{}' registers unknown coverage runner '{other}'",
+            target_label(target)
+        )),
+        None => Err(format!(
+            "target '{}' has no registered source-coverage runner",
+            target_label(target)
+        )),
     }
 }
 
@@ -68,11 +79,11 @@ fn resolve_trusted_coverage_runner(
     {
         return Err(format!(
             "{} must name one trusted coverage runner script without shell syntax",
-            coverage_cmd_env_key(target)
+            coverage_cmd_env_key(target)?
         ));
     }
 
-    let expected = expected_coverage_runner(target);
+    let expected = expected_coverage_runner(target)?;
     let actual = fs::read(path_text).map_err(|e| {
         format!(
             "failed to read trusted coverage runner '{}': {e}",
@@ -120,6 +131,9 @@ pub(crate) fn run_coverage_job(
         inputs.truncate(max_jobs);
     }
 
+    // Resolve the registry capability before creating an artifact directory so
+    // a recognized-but-unsupported target fails without leaving an empty result.
+    let coverage_env_key = coverage_cmd_env_key(target)?;
     let coverage_id = now_unix_millis();
     let coverage_dir = artifact
         .coverage_root
@@ -143,7 +157,7 @@ pub(crate) fn run_coverage_job(
     // run the pinned instrumented coverage command and emit a schema 2.0 summary from
     // its coverage.json. When unset, fall through to the existing proxy replay below
     // so baseline workflows keep working unchanged.
-    if let Some(cmd) = std::env::var(coverage_cmd_env_key(target))
+    if let Some(cmd) = std::env::var(coverage_env_key)
         .ok()
         .filter(|s| !s.trim().is_empty())
     {
@@ -172,6 +186,7 @@ pub(crate) fn run_coverage_job(
     let mut failed = 0usize;
     let mut timeout = 0usize;
     let mut rejected = 0usize;
+    let mut unclassified = 0usize;
 
     for (i, input) in inputs.iter().enumerate() {
         let job = RunJob {
@@ -179,7 +194,15 @@ pub(crate) fn run_coverage_job(
             input: input.clone(),
         };
         let (result, _is_session_ok) =
-            execute_harness_subprocess(&job, target, timeout_sec, timeout_available, None)?;
+            execute_harness_subprocess(
+                &job.input,
+                target,
+                timeout_sec,
+                timeout_available,
+                app_paths,
+                None,
+                None,
+            )?;
         write_job_log(&logs_dir, &job, 1, &result)?;
         match result {
             HarnessExecResult::Success(_) => success += 1,
@@ -187,13 +210,14 @@ pub(crate) fn run_coverage_job(
             HarnessExecResult::Timeout(_) => timeout += 1,
             // G3: this input never reached the library, so it is not a coverage failure
             HarnessExecResult::Rejected(_) => rejected += 1,
+            HarnessExecResult::Unclassified(_) => unclassified += 1,
         }
     }
 
-    let total = success + failed + timeout + rejected;
+    let total = success + failed + timeout + rejected + unclassified;
     let summary_path = coverage_dir.join("summary.json");
     let summary = format!(
-        "{{\n  \"schema_version\": \"1.0\",\n  \"coverage_id\": \"{}\",\n  \"target\": \"{}\",\n  \"corpus_dir\": \"{}\",\n  \"timeout_sec\": {},\n  \"total\": {},\n  \"success\": {},\n  \"failed\": {},\n  \"timeout\": {},\n  \"rejected\": {},\n  \"coverage_proxy\": {{\n    \"success_ratio\": {:.4}\n  }},\n  \"generated_at\": {}\n}}\n",
+        "{{\n  \"schema_version\": \"1.0\",\n  \"coverage_id\": \"{}\",\n  \"target\": \"{}\",\n  \"corpus_dir\": \"{}\",\n  \"timeout_sec\": {},\n  \"total\": {},\n  \"success\": {},\n  \"failed\": {},\n  \"timeout\": {},\n  \"rejected\": {},\n  \"unclassified\": {},\n  \"coverage_proxy\": {{\n    \"success_ratio\": {:.4}\n  }},\n  \"generated_at\": {}\n}}\n",
         coverage_id,
         target_label(target),
         json_escape(&corpus_dir.display().to_string()),
@@ -203,6 +227,7 @@ pub(crate) fn run_coverage_job(
         failed,
         timeout,
         rejected,
+        unclassified,
         if total == 0 {
             0.0
         } else {
@@ -218,6 +243,7 @@ pub(crate) fn run_coverage_job(
     println!("success: {success}");
     println!("failed: {failed}");
     println!("timeout: {timeout}");
+    println!("unclassified: {unclassified}");
     println!("summary: {}", summary_path.display());
     Ok(())
 }
@@ -628,10 +654,16 @@ mod tests {
     // silently ran the onnx command.
     #[test]
     fn coverage_env_key_is_per_target() {
-        assert_eq!(coverage_cmd_env_key(&TargetKind::Onnx), "TOOL_COVERAGE_ONNX_CMD");
-        assert_eq!(coverage_cmd_env_key(&TargetKind::Gguf), "TOOL_COVERAGE_GGUF_CMD");
         assert_eq!(
-            coverage_cmd_env_key(&TargetKind::Safetensors),
+            coverage_cmd_env_key(&TargetKind::Onnx).unwrap(),
+            "TOOL_COVERAGE_ONNX_CMD"
+        );
+        assert_eq!(
+            coverage_cmd_env_key(&TargetKind::Gguf).unwrap(),
+            "TOOL_COVERAGE_GGUF_CMD"
+        );
+        assert_eq!(
+            coverage_cmd_env_key(&TargetKind::Safetensors).unwrap(),
             "TOOL_COVERAGE_SAFETENSORS_CMD"
         );
     }

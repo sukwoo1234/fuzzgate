@@ -43,6 +43,7 @@ pub(crate) struct ArtifactContract {
     pub(crate) coverage_root: PathBuf,
     pub(crate) metrics_root: PathBuf,
     pub(crate) exports_root: PathBuf,
+    pub(crate) diagnostics_root: PathBuf,
     pub(crate) mutated_root: PathBuf,
     pub(crate) legacy_mutated_root: PathBuf,
 }
@@ -59,6 +60,7 @@ pub(crate) fn artifact_contract_for_data_dir(data_dir: &Path) -> ArtifactContrac
         coverage_root: data_dir.join("coverage"),
         metrics_root: data_dir.join("metrics"),
         exports_root: data_dir.join("exports"),
+        diagnostics_root: data_dir.join("diagnostics"),
         mutated_root: data_dir.join("corpus").join("mutated"),
         legacy_mutated_root: data_dir.join("mutated"),
     }
@@ -136,12 +138,19 @@ pub(crate) fn is_core_dump_wrapper_exec_failure(exit_code: Option<i32>, stderr: 
 /// problem, and unlinking them afterwards frees the space even if a grandchild keeps
 /// writing. Like the `timeout` binary, only the direct child is killed.
 pub(crate) fn output_with_deadline(
-    mut cmd: Command,
+    cmd: Command,
     timeout_sec: u64,
+) -> std::io::Result<(Output, bool)> {
+    output_with_deadline_ms(cmd, timeout_sec.saturating_mul(1000))
+}
+
+pub(crate) fn output_with_deadline_ms(
+    mut cmd: Command,
+    timeout_ms: u64,
 ) -> std::io::Result<(Output, bool)> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    let deadline = Duration::from_secs(timeout_sec.max(1));
+    let deadline = Duration::from_millis(timeout_ms.max(1));
     let unique = format!(
         "tool-exec-{}-{}-{}",
         std::process::id(),
@@ -452,6 +461,9 @@ pub(crate) enum HarnessExecResult {
     // G3: the harness rejected this input before the library ran. Not a failed job and
     // not a reproducer - keeping it in `failed` inflates the crash-side counters.
     Rejected(String),
+    // A profiled loader raised a non-signal exception that still needs independent
+    // replay. It is neither a confirmed crash nor a benign input rejection.
+    Unclassified(String),
 }
 
 #[cfg(test)]
@@ -575,7 +587,10 @@ mod tests {
         let started = Instant::now();
         let (output, timed_out) = output_with_deadline(cmd, 1).expect("spawn");
 
-        assert!(timed_out, "a child past its deadline must be reported as timed out");
+        assert!(
+            timed_out,
+            "a child past its deadline must be reported as timed out"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "the deadline must actually fire: {:?}",

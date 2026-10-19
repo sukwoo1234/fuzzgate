@@ -78,12 +78,33 @@ export XDG_RUNTIME_DIR="$WORK/run"
 # state so the run can prove it did not add to or modify it.
 # A whole-tree stamp: a directory's own mtime does not change when a file inside it
 # is rewritten, so watching one subdirectory proved much less than the message said.
+snapshot_operator_data_tree() {
+  local destination="$1"
+  local entries="${destination}.entries"
+  local errors="${destination}.errors"
+  if [[ -e "$WORKDIR/data" || -L "$WORKDIR/data" ]]; then
+    # Never follow an operator symlink out of data/. A directory may also be
+    # intentionally unreadable (for example an AFL container output owned by
+    # another uid); record that refusal and the directory's own metadata so the
+    # before/after comparison remains useful without turning it into a skip.
+    if find -P "$WORKDIR/data" -printf '%p\t%y\t%T@\t%s\t%l\n' \
+      2>"$errors" | LC_ALL=C sort > "$entries"
+    then
+      :
+    fi
+    {
+      printf '[entries]\n'
+      cat "$entries"
+      printf '[scan-errors]\n'
+      LC_ALL=C sort "$errors"
+    } > "$destination"
+  else
+    printf 'absent\n' > "$destination"
+  fi
+}
+
 DATA_TREE_STAMP_BEFORE="$WORK/data-tree-before.txt"
-if [[ -e "$WORKDIR/data" || -L "$WORKDIR/data" ]]; then
-  find -L "$WORKDIR/data" -printf '%p\t%T@\t%s\n' | sort > "$DATA_TREE_STAMP_BEFORE"
-else
-  printf 'absent\n' > "$DATA_TREE_STAMP_BEFORE"
-fi
+snapshot_operator_data_tree "$DATA_TREE_STAMP_BEFORE"
 
 # An ephemeral port, so a running campaign dashboard on 8787 is not in the way.
 pick_port() {
@@ -119,18 +140,169 @@ cd "$WORKDIR"
 
 # Enough of a tree that the entity-detail assertions still assert something.
 printf 'seed' > "$SEEDS_DIR/onnx/seed.onnx"
-# All four entity kinds: the detail routes were rewritten this stage, and without a
+# All five entity kinds: the detail routes were rewritten this stage, and without a
 # fixture for a kind the dashboard renders no link and the assertion below silently
 # skips - which is how reports and coverage stopped being checked at all.
 mkdir -p "$DATA_DIR/runs/run-1" "$DATA_DIR/triage/triage-1" \
-         "$DATA_DIR/reports/report-1" "$DATA_DIR/coverage/coverage-1"
+         "$DATA_DIR/reports/report-1" "$DATA_DIR/coverage/coverage-1" \
+         "$DATA_DIR/diagnostics/diagnostic-1-1-1/replays"
 printf '{"run_id": "run-1", "total": 1, "success": 1}\n' > "$DATA_DIR/runs/run-1/status.json"
-printf '{"triage_id": "triage-1", "verdict": "not_reproduced", "attempts": []}\n' \
-  > "$DATA_DIR/triage/triage-1/summary.json"
+printf '{"triage_id":"triage-1","target":"gguf","input":"%s","verdict":"not_reproduced","attempts":[]}\n' \
+  "$SEEDS_DIR/onnx/seed.onnx" > "$DATA_DIR/triage/triage-1/summary.json"
 printf '# Report report-1\n' > "$DATA_DIR/reports/report-1/report.md"
 printf '{"report_id": "report-1"}\n' > "$DATA_DIR/reports/report-1/meta.json"
 printf '{"coverage_id": "coverage-1", "coverage_kind": "proxy"}\n' \
   > "$DATA_DIR/coverage/coverage-1/summary.json"
+printf '{"diagnostic_id":"diagnostic-1-1-1","classification":"unclassified"}\n' \
+  > "$DATA_DIR/diagnostics/diagnostic-1-1-1/diagnostic.json"
+printf 'fixture traceback\n' > "$DATA_DIR/diagnostics/diagnostic-1-1-1/traceback.txt"
+printf '{"schema_version":"1"}\n' > "$DATA_DIR/diagnostics/diagnostic-1-1-1/execution.json"
+printf '{"result":"incomplete"}\n' \
+  > "$DATA_DIR/diagnostics/diagnostic-1-1-1/replays/replay-1.json"
+printf '{}\n' > "$DATA_DIR/diagnostics/diagnostic-1-1-1/replays/notes.json"
+
+# A replay selected by triage ID must preserve the result's execution identity. Build two real
+# profiled triage records so the route check observes the child environment, not just its JSON
+# response. The replay program writes only below the throwaway tree through profile-authorized
+# TMPDIR; clear the setup observations before the UI starts.
+PROFILE_DIR="$WORK/replay-profile"
+PROFILE_OBSERVED_DIR="$WORK/replay-observed"
+PROFILE_OBSERVED="$PROFILE_OBSERVED_DIR/replay-environment.tsv"
+mkdir -p "$PROFILE_DIR" "$PROFILE_OBSERVED_DIR"
+cat > "$PROFILE_DIR/replay" <<'REPLAY'
+#!/usr/bin/env bash
+set -eu
+printf '%s\t%s\t%s\n' \
+  "${TOOL_TARGET_PROFILE:-}" \
+  "${TOOL_PROFILE_QUALIFICATION:-}" \
+  "${TOOL_VALIDATION_RUN:-}" >> "$TMPDIR/replay-environment.tsv"
+exit 0
+REPLAY
+chmod +x "$PROFILE_DIR/replay"
+python3 -B - "$PROFILE_DIR" "$PROFILE_OBSERVED_DIR" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+root, observed = sys.argv[1:]
+replay = os.path.join(root, "replay")
+binary_hash = hashlib.sha256(open(replay, "rb").read()).hexdigest()
+profile = {
+    "schema_version": "1",
+    "target_id": "onnx",
+    "format_revision": "onnx-ir-v10",
+    "loader_id": "ui-replay-fixture",
+    "loader_version": "1",
+    "source_artifacts": [{
+        "url": "https://github.com/microsoft/onnxruntime/archive/refs/tags/v1.23.2.tar.gz",
+        "tag": "v1.23.2",
+        "resolved_commit": "0123456789abcdef0123456789abcdef01234567",
+        "sha256": binary_hash,
+        "size_bytes": os.path.getsize(replay),
+    }],
+    "patches": [],
+    "toolchain": {
+        "compiler": {"version": "1", "path": replay, "sha256": binary_hash},
+        "linker": {"version": "1", "path": replay, "sha256": binary_hash},
+        "engine": {"version": "1", "path": replay, "sha256": binary_hash},
+        "python": None,
+        "rust": {"version": "1", "path": replay, "sha256": binary_hash},
+        "environment": {"PATH": "/usr/bin:/bin", "TMPDIR": observed},
+    },
+    "sanitizer_policy": {
+        "compile_flags": ["-fsanitize=address"],
+        "recovery": "abort",
+        "runtime_env": {"ASAN_OPTIONS": "abort_on_error=1"},
+        "rust_panic": "abort",
+    },
+    "binaries": [{
+        "role": "replay",
+        "path": replay,
+        "sha256": binary_hash,
+        "argv": ["{input}"],
+        "linked_libraries": [],
+    }],
+    "input_kind": {"kind": "single", "extensions": ["onnx"], "subformats": []},
+    "depth": "session",
+    "engine_capabilities": [{
+        "backend": "local-harness",
+        "binary_role": "replay",
+        "required_mode": "native",
+        "instrumentation_scope": "fixture",
+    }],
+    "limits": {
+        "max_input_bytes": 1048576,
+        "memory_bytes": 1073741824,
+        "input_timeout_ms": 5000,
+        "block_timeout_ms": 30000,
+        "threads": 1,
+        "workers": 1,
+    },
+    "coverage_scope": {
+        "unit": "source-line",
+        "include_sources": ["fixture"],
+        "exclude_sources": [],
+    },
+}
+profile_path = os.path.join(root, "profile.json")
+with open(profile_path, "w", encoding="utf-8") as stream:
+    json.dump(profile, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+profile_hash = hashlib.sha256(open(profile_path, "rb").read()).hexdigest()
+qualification = {
+    "schema_version": "1",
+    "profile_sha256": profile_hash,
+    "status": "verified",
+    "gate_evidence": [
+        {"requirement_id": f"Q{number:02}", "evidence_sha256": profile_hash}
+        for number in range(1, 13)
+    ],
+}
+with open(os.path.join(root, "qualification.json"), "w", encoding="utf-8") as stream:
+    json.dump(qualification, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+
+QUALIFIED_SETUP_LOG="$WORK/qualified-setup.log"
+UNQUALIFIED_SETUP_LOG="$WORK/unqualified-setup.log"
+"$TOOL_BIN" --data-dir "$DATA_DIR" --seeds-dir "$SEEDS_DIR" \
+  --target-profile "$PROFILE_DIR/profile.json" \
+  triage --target onnx --input "$SEEDS_DIR/onnx/seed.onnx" \
+  --repro-retries 1 --timeout-sec 2 > "$QUALIFIED_SETUP_LOG" 2>&1
+"$TOOL_BIN" --data-dir "$DATA_DIR" --seeds-dir "$SEEDS_DIR" \
+  --target-profile "$PROFILE_DIR/profile.json" --validation-run source-validation \
+  triage --target onnx --input "$SEEDS_DIR/onnx/seed.onnx" \
+  --repro-retries 1 --timeout-sec 2 > "$UNQUALIFIED_SETUP_LOG" 2>&1
+QUALIFIED_SUMMARY="$(sed -n 's/^summary: //p' "$QUALIFIED_SETUP_LOG" | tail -n 1)"
+UNQUALIFIED_SUMMARY="$(sed -n 's/^summary: //p' "$UNQUALIFIED_SETUP_LOG" | tail -n 1)"
+if [[ -z "$QUALIFIED_SUMMARY" || -z "$UNQUALIFIED_SUMMARY" ]]; then
+  echo "[FAIL] could not create profiled triage fixtures" >&2
+  tail -n 20 "$QUALIFIED_SETUP_LOG" >&2
+  tail -n 20 "$UNQUALIFIED_SETUP_LOG" >&2
+  exit 1
+fi
+QUALIFIED_TRIAGE_ID="$(basename -- "$(dirname -- "$QUALIFIED_SUMMARY")")"
+UNQUALIFIED_TRIAGE_ID="$(basename -- "$(dirname -- "$UNQUALIFIED_SUMMARY")")"
+: > "$PROFILE_OBSERVED"
+
+mkdir -p "$DATA_DIR/triage/triage-profile-incomplete"
+printf '{"triage_id":"triage-profile-incomplete","target":"onnx","input":"%s","profiled_result":true,"profile_sha256":"%064d"}\n' \
+  "$SEEDS_DIR/onnx/seed.onnx" 0 \
+  > "$DATA_DIR/triage/triage-profile-incomplete/summary.json"
+cp -a "$DATA_DIR/triage/$QUALIFIED_TRIAGE_ID" \
+  "$DATA_DIR/triage/triage-profile-copied"
+python3 -B - "$DATA_DIR/triage/triage-profile-copied/summary.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+value = json.load(open(path, encoding="utf-8"))
+value["triage_id"] = "triage-profile-copied"
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(value, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
 
 "$TOOL_BIN" --data-dir "$DATA_DIR" --seeds-dir "$SEEDS_DIR" \
   ui-serve --bind "$BIND" >"$SERVER_LOG" 2>&1 &
@@ -210,6 +382,12 @@ check_rejected_inputs() {
     "A14 replay input outside the data dir" "${AUTH[@]}"
   check_status 400 POST "${BASE_URL}/replay/start?target=onnx&triage_id=..%2F..%2Fetc" \
     "A14 triage id must not leave the triage tree" "${AUTH[@]}"
+  check_status 400 POST "${BASE_URL}/replay/start?target=onnx&triage_id=triage-1" \
+    "recorded triage target cannot be overridden" "${AUTH[@]}"
+  check_status 400 POST "${BASE_URL}/replay/start?triage_id=triage-profile-incomplete" \
+    "profiled replay fails closed when its local identity envelope is incomplete" "${AUTH[@]}"
+  check_status 400 POST "${BASE_URL}/replay/start?triage_id=triage-profile-copied" \
+    "profiled replay rejects identity references copied from another result" "${AUTH[@]}"
   # A handler error used to close the connection with zero bytes (curl exit 52) instead of a status.
   check_status 500 GET "${BASE_URL}/file?path=%2Fetc%2Fpasswd" "a refused file view answers a status"
   local state="$DATA_DIR/ui-target/prepare-target.state"
@@ -262,6 +440,97 @@ check_authorization() {
 
 check_authorization
 
+wait_for_replay() {
+  local i=1
+  local state
+  while [[ "$i" -le 100 ]]; do
+    state="$(curl -fsS --max-time 10 "${BASE_URL}/replay/status")"
+    if printf '%s' "$state" | grep -q '"running":false'; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  echo "[FAIL] UI replay did not finish" | tee -a "$CHECK_LOG"
+  tail -n 30 "$SERVER_LOG" | sed 's/^/[server] /' | tee -a "$CHECK_LOG"
+  return 1
+}
+
+assert_replay_observations() {
+  local expected_profile="$1"
+  local expected_qualification="$2"
+  local expected_validation="$3"
+  local label="$4"
+  if python3 -B - "$PROFILE_OBSERVED" "$expected_profile" \
+    "$expected_qualification" "$expected_validation" <<'PY'
+import sys
+
+path, expected_profile, expected_qualification, expected_validation = sys.argv[1:]
+rows = [line.rstrip("\n").split("\t") for line in open(path, encoding="utf-8")]
+assert rows, "profile replay program was never executed"
+assert all(len(row) == 3 for row in rows), rows
+assert all(row == [expected_profile, expected_qualification, expected_validation] for row in rows), rows
+PY
+  then
+    echo "[OK] $label" | tee -a "$CHECK_LOG"
+  else
+    echo "[FAIL] $label" | tee -a "$CHECK_LOG"
+    sed 's/^/[observed] /' "$PROFILE_OBSERVED" | tee -a "$CHECK_LOG"
+    return 1
+  fi
+}
+
+check_profiled_replay_identity() {
+  local response validation_run
+  : > "$PROFILE_OBSERVED"
+  response="$(curl -fsS --max-time 10 -X POST "${AUTH[@]}" \
+    "${BASE_URL}/replay/start?triage_id=${QUALIFIED_TRIAGE_ID}&repro_retries=1&timeout_sec=2")"
+  if ! python3 -B - "$response" <<'PY'
+import json
+import sys
+
+value = json.loads(sys.argv[1])
+assert value["profiled"] is True, value
+assert value["authorization"] == "qualified", value
+assert value["validation_run"] is None, value
+assert "verified" not in sys.argv[1], value
+PY
+  then
+    echo "[FAIL] qualified UI replay response overstated or lost its identity: $response" \
+      | tee -a "$CHECK_LOG"
+    return 1
+  fi
+  wait_for_replay
+  assert_replay_observations \
+    "$DATA_DIR/triage/$QUALIFIED_TRIAGE_ID/profile.json" \
+    "$DATA_DIR/triage/$QUALIFIED_TRIAGE_ID/qualification.json" "" \
+    "qualified UI replay uses the exact result-local profile and qualification"
+
+  : > "$PROFILE_OBSERVED"
+  response="$(curl -fsS --max-time 10 -X POST "${AUTH[@]}" \
+    "${BASE_URL}/replay/start?triage_id=${UNQUALIFIED_TRIAGE_ID}&repro_retries=1&timeout_sec=2")"
+  validation_run="$(python3 -B - "$response" <<'PY'
+import json
+import sys
+
+value = json.loads(sys.argv[1])
+assert value["profiled"] is True, value
+assert value["authorization"] == "unqualified_validation", value
+validation = value["validation_run"]
+assert isinstance(validation, str) and validation.startswith("ui-replay-"), value
+assert validation != "source-validation", value
+assert "verified" not in sys.argv[1], value
+print(validation)
+PY
+)"
+  wait_for_replay
+  assert_replay_observations \
+    "$DATA_DIR/triage/$UNQUALIFIED_TRIAGE_ID/profile.json" "" "$validation_run" \
+    "unqualified UI replay uses the local profile under a fresh validation run"
+}
+
+check_profiled_replay_identity
+
 # A4: a client that opens the socket and sends nothing used to block the single-threaded accept
 # loop. A client that dribbles a partial head never trips the per-read timeout, so it also has to
 # be bounded. In both cases the dashboard must still answer promptly, not merely eventually.
@@ -311,8 +580,9 @@ run_path="$(printf '%s' "$dash_html" | sed -n 's/.*href="\(\/*run\/[^"]*\)".*/\1
 triage_path="$(printf '%s' "$dash_html" | sed -n 's/.*href="\(\/*triage\/[^"]*\)".*/\1/p' | head -n 1)"
 report_path="$(printf '%s' "$dash_html" | sed -n 's/.*href="\(\/*report\/[^"]*\)".*/\1/p' | head -n 1)"
 coverage_path="$(printf '%s' "$dash_html" | sed -n 's/.*href="\(\/*coverage\/[^"]*\)".*/\1/p' | head -n 1)"
+diagnostic_path="$(printf '%s' "$dash_html" | sed -n 's/.*href="\(\/*diagnostic\/[^"]*\)".*/\1/p' | head -n 1)"
 
-for kind in run triage report coverage; do
+for kind in run triage report coverage diagnostic; do
   eval "path=\"\${${kind}_path}\""
   if [[ -z "$path" ]]; then
     echo "[FAIL] the dashboard exposed no /${kind}/<id> link to check" | tee -a "$CHECK_LOG"
@@ -320,6 +590,32 @@ for kind in run triage report coverage; do
   fi
   check_url "${BASE_URL}${path}"
 done
+
+diagnostic_html="$(curl -fsS --max-time 10 "${BASE_URL}${diagnostic_path}")"
+if ! printf '%s' "$diagnostic_html" | grep -q 'data-validation-status="raw-unverified"'; then
+  echo "[FAIL] diagnostic detail did not identify the view as raw/unverified" | tee -a "$CHECK_LOG"
+  exit 1
+fi
+if ! printf '%s' "$diagnostic_html" | grep -q 'replay-1.json'; then
+  echo "[FAIL] diagnostic detail did not expose replay-*.json evidence" | tee -a "$CHECK_LOG"
+  exit 1
+fi
+if printf '%s' "$diagnostic_html" | grep -q 'notes.json'; then
+  echo "[FAIL] diagnostic detail exposed a non-replay file from replays/" | tee -a "$CHECK_LOG"
+  exit 1
+fi
+if ! printf '%s' "$diagnostic_html" \
+  | grep -q '<code>tool show diagnostic-1-1-1</code>.*<code>tool export diagnostic-1-1-1</code>'
+then
+  echo "[FAIL] diagnostic detail did not show the positional show/export syntax" | tee -a "$CHECK_LOG"
+  exit 1
+fi
+if printf '%s' "$diagnostic_html" | grep -Eq 'tool (show|export) --id'; then
+  echo "[FAIL] diagnostic detail advertised an unsupported --id flag" | tee -a "$CHECK_LOG"
+  exit 1
+fi
+echo "[OK] diagnostic detail labels raw evidence and lists only replay-*.json" | tee -a "$CHECK_LOG"
+echo "[OK] diagnostic validation hint uses positional show/export result IDs" | tee -a "$CHECK_LOG"
 
 # R5: the operator's own token file must be exactly as it was.
 if [[ -n "$ORIG_TOKEN_SUM" ]]; then
@@ -337,11 +633,7 @@ else
 fi
 
 DATA_TREE_STAMP_AFTER="$WORK/data-tree-after.txt"
-if [[ -e "$WORKDIR/data" || -L "$WORKDIR/data" ]]; then
-  find -L "$WORKDIR/data" -printf '%p\t%T@\t%s\n' | sort > "$DATA_TREE_STAMP_AFTER"
-else
-  printf 'absent\n' > "$DATA_TREE_STAMP_AFTER"
-fi
+snapshot_operator_data_tree "$DATA_TREE_STAMP_AFTER"
 if ! diff -q "$DATA_TREE_STAMP_BEFORE" "$DATA_TREE_STAMP_AFTER" >/dev/null; then
   echo "[FAIL] the check changed the operator data dir:" | tee -a "$CHECK_LOG"
   diff "$DATA_TREE_STAMP_BEFORE" "$DATA_TREE_STAMP_AFTER" | head -n 20 | tee -a "$CHECK_LOG"

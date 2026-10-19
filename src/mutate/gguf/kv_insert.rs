@@ -78,11 +78,7 @@ pub(crate) fn apply(
     // The KV section ends where the tensor info begins; a file with no KVs has both at
     // the end of the 24-byte header.
     let kv_end = layout.kvs.last().map(|kv| kv.entry_end).unwrap_or(24);
-    let tensor_info_end = layout
-        .tensors
-        .last()
-        .map(|t| t.entry_end)
-        .unwrap_or(kv_end);
+    let tensor_info_end = layout.tensors.last().map(|t| t.entry_end).unwrap_or(kv_end);
 
     let mut out = Vec::with_capacity(bytes.len() + entry.len() + 64);
     out.extend_from_slice(&bytes[..kv_end]);
@@ -101,14 +97,21 @@ pub(crate) fn apply(
     out.resize(out.len() + padding, 0);
     out.extend_from_slice(data);
 
-    let parse_preserving = if parse_gguf(&out).is_ok() { "yes" } else { "no" };
+    let parse_preserving = if parse_gguf(&out).is_ok() {
+        "yes"
+    } else {
+        "no"
+    };
     Ok(MutationOutput {
         bytes: out,
         operator_params: vec![
             ("inserted_key", key),
             ("value_type", (value_type as u32).to_string()),
             ("insert_offset", kv_end.to_string()),
-            ("new_kv_count", layout.kv_count.saturating_add(1).to_string()),
+            (
+                "new_kv_count",
+                layout.kv_count.saturating_add(1).to_string(),
+            ),
             ("alignment_used", alignment_used.to_string()),
             ("padding_bytes", padding.to_string()),
         ],
@@ -202,8 +205,8 @@ pub(crate) fn padding_for(
 #[cfg(test)]
 mod tests {
     use super::super::test_fixtures::{build_gguf_without_alignment_key, build_minimal_gguf};
-    use super::*;
     use super::super::ALIGNMENT_KEY;
+    use super::*;
 
     fn key_of<'a>(bytes: &'a [u8], kv: &super::super::KvEntry) -> &'a [u8] {
         &bytes[kv.key_str_start..kv.key_str_end]
@@ -261,11 +264,7 @@ mod tests {
             };
             applied += 1;
             let layout = parse_gguf(&out.bytes).expect("mutant parses");
-            let mut keys: Vec<&[u8]> = layout
-                .kvs
-                .iter()
-                .map(|kv| key_of(&out.bytes, kv))
-                .collect();
+            let mut keys: Vec<&[u8]> = layout.kvs.iter().map(|kv| key_of(&out.bytes, kv)).collect();
             let total = keys.len();
             keys.sort_unstable();
             keys.dedup();

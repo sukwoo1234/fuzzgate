@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+WORKDIR="${WORKDIR:-$PWD}"
+TOOL_BIN="${TOOL_BIN:-$WORKDIR/target/debug/tool}"
+
 usage() {
   cat <<'EOF'
 usage: export_experiment_summary.sh \
   --experiment-id <id> \
   --machine-label <label> \
-  --target <onnx|gguf|safetensors> \
+  --target <registered-target> \
   --backend <local-harness|libfuzzer|aflpp> \
   --duration-hours <n> \
   [--out-dir <dir>] \
@@ -140,8 +143,34 @@ if [[ -z "$EXPERIMENT_ID" || -z "$MACHINE_LABEL" || -z "$TARGET" || -z "$BACKEND
   exit 2
 fi
 
+if [[ ! -x "$TOOL_BIN" ]]; then
+  echo "[export-experiment] tool binary missing or not executable: $TOOL_BIN" >&2
+  exit 2
+fi
+TARGET_SPEC="$("$TOOL_BIN" target-spec --target "$TARGET" --format shell 2>/dev/null)" || {
+  echo "[export-experiment] unsupported target: $TARGET" >&2
+  exit 2
+}
+TARGET_ID="$(sed -n 's/^target_id=//p' <<<"$TARGET_SPEC")"
+SEED_SUBDIR="$(sed -n 's/^seed_subdir=//p' <<<"$TARGET_SPEC")"
+INPUT_EXT="$(sed -n 's/^input_ext=//p' <<<"$TARGET_SPEC")"
+if [[ "$TARGET_ID" != "$TARGET" \
+  || ! "$TARGET_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "[export-experiment] registered target has an invalid or mismatched target_id: $TARGET" >&2
+  exit 2
+fi
+if [[ ! "$SEED_SUBDIR" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "[export-experiment] registered target has an invalid seed_subdir: $TARGET" >&2
+  exit 2
+fi
+if [[ ! "$INPUT_EXT" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+  echo "[export-experiment] registered target has an invalid input_ext: $TARGET" >&2
+  exit 2
+fi
+TARGET="$TARGET_ID"
+
 if [[ -z "$CORPUS_DIR" ]]; then
-  CORPUS_DIR="seeds/${TARGET}"
+  CORPUS_DIR="$WORKDIR/seeds/${SEED_SUBDIR}"
 fi
 
 if [[ -z "$OUT_DIR" ]]; then
@@ -189,7 +218,7 @@ cp "$METRICS_FILE" "$OUT_DIR/metrics-latest.json"
 
 SEED_COUNT=0
 if [[ -d "$CORPUS_DIR" ]]; then
-  SEED_COUNT="$(find "$CORPUS_DIR" -maxdepth 1 -type f -name "*.${TARGET}" | wc -l | tr -d ' ')"
+  SEED_COUNT="$(find "$CORPUS_DIR" -maxdepth 1 -type f -name "*.${INPUT_EXT}" | wc -l | tr -d ' ')"
 fi
 MUTATION_MANIFEST=""
 MUTATED_COUNT=0

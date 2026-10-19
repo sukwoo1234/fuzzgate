@@ -135,7 +135,11 @@ fn apply_with_budget(
     // tensor-data tail - which parse_gguf never reads - leaves a file that still parses,
     // and on a real multi-MB model that tail is most of the file. The manifest records
     // what the parser actually says, not what the operator intends.
-    let parse_preserving = if parse_gguf(&out).is_ok() { "yes" } else { "no" };
+    let parse_preserving = if parse_gguf(&out).is_ok() {
+        "yes"
+    } else {
+        "no"
+    };
     Ok(MutationOutput {
         bytes: out,
         operator_params: vec![
@@ -227,14 +231,18 @@ mod tests {
     // output re-parses - those outputs must be labeled "yes", not a blanket "no".
     #[test]
     fn parse_preserving_matches_the_parser() {
-        use super::super::test_fixtures::build_minimal_gguf;
         use super::super::parse_gguf;
+        use super::super::test_fixtures::build_minimal_gguf;
         let bytes = build_minimal_gguf();
         let mut parseable = 0usize;
         for s in 0..256u64 {
             let mut rng = DeterministicRng::new(s);
             let out = apply_with_budget(&bytes, &mut rng, 16).expect("applies");
-            let expected = if parse_gguf(&out.bytes).is_ok() { "yes" } else { "no" };
+            let expected = if parse_gguf(&out.bytes).is_ok() {
+                "yes"
+            } else {
+                "no"
+            };
             assert_eq!(
                 out.parse_preserving, expected,
                 "seed {s}: label disagrees with the parser"

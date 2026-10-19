@@ -47,8 +47,8 @@ pub(crate) fn apply(
 /// derived instead of claimed.
 #[cfg(test)]
 mod label_tests {
-    use super::*;
     use super::super::test_fixtures::build_minimal_safetensors;
+    use super::*;
 
     // A17/A18: the operator substitutes an arbitrary printable byte into a string,
     // which can be a JSON delimiter in a safetensors header or the middle of a

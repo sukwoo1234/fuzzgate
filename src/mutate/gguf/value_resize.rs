@@ -113,14 +113,22 @@ pub(crate) fn apply(
     meta.extend_from_slice(&entry);
     meta.extend_from_slice(&bytes[kv.entry_end..tensor_info_end]);
 
-    let (padding, alignment_used) =
-        padding_for(&meta, data, layout.alignment, bytes.len() + PADDING_HEADROOM)
-            .ok_or(OperatorError::NoApplicableField)?;
+    let (padding, alignment_used) = padding_for(
+        &meta,
+        data,
+        layout.alignment,
+        bytes.len() + PADDING_HEADROOM,
+    )
+    .ok_or(OperatorError::NoApplicableField)?;
     let mut out = meta;
     out.resize(out.len() + padding, 0);
     out.extend_from_slice(data);
 
-    let parse_preserving = if parse_gguf(&out).is_ok() { "yes" } else { "no" };
+    let parse_preserving = if parse_gguf(&out).is_ok() {
+        "yes"
+    } else {
+        "no"
+    };
     Ok(MutationOutput {
         bytes: out,
         operator_params: vec![
@@ -167,9 +175,13 @@ mod tests {
         let mut grew = false;
         for s in 0..64u64 {
             let mut rng = DeterministicRng::new(s);
-            let out = apply(&bytes, &mut rng).expect("value_resize applies to a file with a string");
+            let out =
+                apply(&bytes, &mut rng).expect("value_resize applies to a file with a string");
             let after = parse_gguf(&out.bytes).expect("the resized file still parses");
-            assert_eq!(out.parse_preserving, "yes", "seed {s}: a valid resize stays parseable");
+            assert_eq!(
+                out.parse_preserving, "yes",
+                "seed {s}: a valid resize stays parseable"
+            );
             let name_after = after
                 .kvs
                 .iter()
@@ -215,7 +227,10 @@ mod tests {
         for s in 0..64u64 {
             let mut rng = DeterministicRng::new(s);
             let out = apply(&bytes, &mut rng).expect("applies");
-            assert!(parse_gguf(&out.bytes).is_ok(), "seed {s}: shrunk file still parses");
+            assert!(
+                parse_gguf(&out.bytes).is_ok(),
+                "seed {s}: shrunk file still parses"
+            );
             if param(&out, "direction") == Some("shrink") {
                 shrank = true;
             }

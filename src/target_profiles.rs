@@ -218,14 +218,39 @@ pub(crate) fn load_profile(
         return Err(format!("target profile is empty: {}", path.display()));
     }
 
-    let profile: TargetProfile = parse_unique_json(&bytes, "target profile")?;
+    load_profile_snapshot(path, &bytes, requested_target)
+}
+
+pub(crate) fn load_profile_snapshot(
+    path: &Path,
+    bytes: &[u8],
+    requested_target: &TargetKind,
+) -> Result<LoadedProfile, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "target profile path must be absolute: {}",
+            path.display()
+        ));
+    }
+    if bytes.len() as u64 > MAX_PROFILE_BYTES {
+        return Err(format!(
+            "target profile exceeds {} bytes: {}",
+            MAX_PROFILE_BYTES,
+            path.display()
+        ));
+    }
+    if bytes.is_empty() {
+        return Err(format!("target profile is empty: {}", path.display()));
+    }
+
+    let profile: TargetProfile = parse_unique_json(bytes, "target profile")?;
     validate_profile(&profile, requested_target)?;
-    let sha256 = sha256_bytes(&bytes)?;
+    let sha256 = sha256_bytes(bytes)?;
 
     Ok(LoadedProfile {
         path: path.to_path_buf(),
         sha256,
-        bytes,
+        bytes: bytes.to_vec(),
         profile,
     })
 }
@@ -233,6 +258,12 @@ pub(crate) fn load_profile(
 pub(crate) fn verify_profile_files(loaded: LoadedProfile) -> Result<VerifiedProfile, String> {
     verify_loaded_bytes_unchanged(&loaded)?;
 
+    verify_profile_snapshot_files(loaded)
+}
+
+pub(crate) fn verify_profile_snapshot_files(
+    loaded: LoadedProfile,
+) -> Result<VerifiedProfile, String> {
     let mut files = Vec::new();
     for (label, tool) in [
         ("toolchain.compiler", &loaded.profile.toolchain.compiler),
@@ -323,13 +354,49 @@ pub(crate) fn load_qualification(
             path.display()
         ));
     }
-    let qualification: Qualification = parse_unique_json(&bytes, "profile qualification")?;
-    validate_qualification(&qualification, &verified.loaded.sha256)?;
-    let sha256 = sha256_bytes(&bytes)?;
+
+    load_qualification_snapshot(verified, &path, &bytes)
+}
+
+pub(crate) fn load_qualification_snapshot(
+    verified: &VerifiedProfile,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<LoadedQualification, String> {
+    load_qualification_snapshot_for_profile(&verified.loaded, path, bytes)
+}
+
+pub(crate) fn load_qualification_snapshot_for_profile(
+    loaded: &LoadedProfile,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<LoadedQualification, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "profile qualification path must be absolute: {}",
+            path.display()
+        ));
+    }
+    if bytes.len() as u64 > MAX_QUALIFICATION_BYTES {
+        return Err(format!(
+            "profile qualification exceeds {} bytes: {}",
+            MAX_QUALIFICATION_BYTES,
+            path.display()
+        ));
+    }
+    if bytes.is_empty() {
+        return Err(format!(
+            "profile qualification is empty: {}",
+            path.display()
+        ));
+    }
+    let qualification: Qualification = parse_unique_json(bytes, "profile qualification")?;
+    validate_qualification(&qualification, &loaded.sha256)?;
+    let sha256 = sha256_bytes(bytes)?;
     Ok(LoadedQualification {
-        path,
+        path: path.to_path_buf(),
         sha256,
-        bytes,
+        bytes: bytes.to_vec(),
         qualification,
     })
 }

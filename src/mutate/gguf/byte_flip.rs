@@ -13,8 +13,7 @@ pub(crate) fn apply(
         return Err(OperatorError::NoApplicableField);
     }
     let mut out = bytes.to_vec();
-    let pick =
-        flip_value_byte(&mut out, 0, end, rng).ok_or(OperatorError::NoApplicableField)?;
+    let pick = flip_value_byte(&mut out, 0, end, rng).ok_or(OperatorError::NoApplicableField)?;
     Ok(MutationOutput {
         bytes: out,
         operator_params: vec![

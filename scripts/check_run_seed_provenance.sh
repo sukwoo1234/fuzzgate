@@ -52,7 +52,7 @@ fi
     executable(root / 'bin/tool', '''#!/bin/bash
 "$CHECK_REAL_TOOL" "$@"
 rc=$?
-touch "$DATA_DIR/ticked"
+if [[ "${1:-}" != "target-spec" ]]; then touch "$DATA_DIR/ticked"; fi
 exit "$rc"
 ''')
     executable(root / 'bin/curl', '#!/bin/sh\necho "unexpected notification" >&2\nexit 99\n')

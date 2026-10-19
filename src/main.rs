@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, ExitCode},
 };
 
@@ -17,6 +17,7 @@ mod metrics;
 #[allow(dead_code)]
 mod model_bundle;
 mod mutate;
+mod profile_results;
 mod report;
 mod retention;
 mod run;
@@ -50,6 +51,7 @@ const E_UI_SERVER: &str = "E6001";
 pub(crate) const EXIT_HARNESS_LIBRARY_CRASH: u8 = 4;
 pub(crate) const EXIT_HARNESS_INPUT_REJECTED: u8 = 9;
 pub(crate) const EXIT_HARNESS_UNAVAILABLE: u8 = 10;
+pub(crate) const EXIT_HARNESS_UNCLASSIFIED: u8 = 11;
 
 #[derive(Parser)]
 #[command(name = "tool", version, about = "Bug bounty fuzzing platform CLI")]
@@ -90,6 +92,10 @@ enum Commands {
     PrepareTarget(PrepareTargetArgs),
     Harness(HarnessArgs),
     Mutate(MutateArgs),
+    /// Print the canonical metadata used by target dispatchers
+    TargetSpec(TargetSpecArgs),
+    /// Replay a preserved unclassified diagnostic in fresh processes
+    ReplayDiagnostic(ReplayDiagnosticArgs),
 }
 
 #[derive(Args)]
@@ -262,7 +268,7 @@ struct SeedStatsArgs {
 
 #[derive(Args)]
 struct ListArgs {
-    /// Resource kind: all | runs | triages | reports | coverage
+    /// Resource kind: all | runs | triages | reports | coverage | diagnostics
     #[arg(long, default_value = "all")]
     kind: String,
 
@@ -326,6 +332,31 @@ struct ShowArgs {
 struct ExportArgs {
     /// Result ID to export
     id: String,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum TargetSpecFormat {
+    Json,
+    Shell,
+}
+
+#[derive(Args)]
+struct TargetSpecArgs {
+    #[arg(long, value_enum)]
+    target: TargetKind,
+
+    #[arg(long, value_enum, default_value_t = TargetSpecFormat::Json)]
+    format: TargetSpecFormat,
+}
+
+#[derive(Args)]
+struct ReplayDiagnosticArgs {
+    /// Exact diagnostic ID to replay
+    id: String,
+
+    /// Number of fresh-process attempts
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(2..=100))]
+    attempts: u32,
 }
 
 #[derive(Args)]
@@ -394,6 +425,13 @@ fn run_campaign_command(
     args: &CampaignArgs,
     execution_context: Option<&ExecutionContext>,
 ) -> Result<(), String> {
+    let spec = target::target_spec(&args.target);
+    if !spec.campaign_supported {
+        return Err(format!(
+            "target '{}' is registered but campaign dispatch is not supported",
+            spec.target_id
+        ));
+    }
     if args.hours.is_none() && args.duration_seconds.is_none() {
         return Err("either --hours or --duration-seconds is required".to_string());
     }
@@ -411,6 +449,23 @@ fn run_campaign_command(
     }
     common::validate_max_jobs(args.max_jobs)?;
 
+    if let Some(context) = execution_context {
+        let backend_labels = if args.backends.is_empty() {
+            vec!["local-harness", "libfuzzer", "aflpp"]
+        } else {
+            args.backends.iter().map(run_backend_cli_label).collect()
+        };
+        for backend in backend_labels {
+            context.validate_run_limits(backend, args.workers, args.timeout_sec)?;
+            if args.dry_run {
+                println!(
+                    "resolved-profile-contract: {}",
+                    context.backend_contract_json(backend)?
+                );
+            }
+        }
+    }
+
     let cwd = std::env::current_dir().map_err(|e| format!("failed to get current dir: {e}"))?;
     let script = cwd.join("scripts").join("run_campaign.sh");
     if !script.is_file() {
@@ -425,7 +480,7 @@ fn run_campaign_command(
     let corpus_dir = args
         .corpus_dir
         .clone()
-        .unwrap_or_else(|| app_paths.seeds_dir.join(target_label(&args.target)));
+        .unwrap_or_else(|| app_paths.seeds_dir.join(spec.seed_subdir));
 
     let use_setsid = cfg!(unix) && command_exists("setsid");
     let mut cmd = if use_setsid {
@@ -439,6 +494,7 @@ fn run_campaign_command(
     };
     if let Some(context) = execution_context {
         context.apply_to_command(&mut cmd, false)?;
+        cmd.env("TOOL_PROFILED_CAMPAIGN", "1");
     }
     cmd.current_dir(&cwd)
         .env("WORKDIR", cwd.as_os_str())
@@ -577,6 +633,13 @@ fn main() -> ExitCode {
         validation_run,
         command,
     } = Cli::parse();
+    if let Commands::TargetSpec(args) = &command {
+        match args.format {
+            TargetSpecFormat::Json => println!("{}", target::render_target_spec_json(&args.target)),
+            TargetSpecFormat::Shell => print!("{}", target::render_target_spec_shell(&args.target)),
+        }
+        return ExitCode::SUCCESS;
+    }
     let profile_requested = target_profile.is_some()
         || validation_run.is_some()
         || std::env::var_os(execution_context::TARGET_PROFILE_ENV).is_some();
@@ -766,7 +829,7 @@ fn main() -> ExitCode {
         }
         Commands::List(args) => {
             let kinds: Vec<&str> = if args.kind == "all" {
-                vec!["runs", "triages", "reports", "coverage"]
+                vec!["runs", "triages", "reports", "coverage", "diagnostics"]
             } else {
                 vec![args.kind.as_str()]
             };
@@ -795,15 +858,16 @@ fn main() -> ExitCode {
             }
         }
         Commands::Show(args) => {
-            print_stub_with_id("show", &app_paths.data_dir, &app_paths.seeds_dir, &args.id);
+            if let Err(err) = profile_results::show_result(&app_paths, &args.id) {
+                eprintln!("[{E_CONFIG_PREPARE}] show error: {err}");
+                return ExitCode::from(2);
+            }
         }
         Commands::Export(args) => {
-            print_stub_with_id(
-                "export",
-                &app_paths.data_dir,
-                &app_paths.seeds_dir,
-                &args.id,
-            );
+            if let Err(err) = profile_results::export_result(&app_paths, &args.id) {
+                eprintln!("[{E_CONFIG_PREPARE}] export error: {err}");
+                return ExitCode::from(2);
+            }
         }
         Commands::PrepareTarget(args) => {
             if let Err(err) =
@@ -814,12 +878,68 @@ fn main() -> ExitCode {
             }
         }
         Commands::Harness(args) => {
-            let result = if let Some(context) = execution_context.as_ref() {
-                execution_context::run_profiled_harness(context, &args.target, &args.input)
+            let staged_input = if execution_context.is_some() {
+                match profile_results::stage_input(&args.input) {
+                    Ok(staged) => Some(staged),
+                    Err(err) => {
+                        eprintln!("[{E_HARNESS_EXEC}] harness input staging error: {err}");
+                        return ExitCode::from(err.exit_code());
+                    }
+                }
             } else {
-                target::run_harness(&args.target, &args.input)
+                None
+            };
+            let replay_input = staged_input
+                .as_ref()
+                .map(profile_results::StagedInput::path)
+                .unwrap_or(&args.input);
+            let result = if let Some(context) = execution_context.as_ref() {
+                execution_context::run_profiled_harness(context, &args.target, replay_input)
+            } else {
+                target::run_harness(&args.target, replay_input)
             };
             if let Err(err) = result {
+                if let target::HarnessError::Unclassified(traceback) = &err {
+                    if let Ok(supervisor) =
+                        std::env::var(profile_results::DIAGNOSTIC_SUPERVISOR_ENV)
+                    {
+                        match profile_results::supervised_traceback_line(traceback) {
+                            Ok(line) => eprintln!("{line}"),
+                            Err(encode_error) => {
+                                eprintln!("[{E_HARNESS_EXEC}] {encode_error}");
+                            }
+                        }
+                        return ExitCode::from(if supervisor == "triage" {
+                            EXIT_HARNESS_UNAVAILABLE
+                        } else {
+                            EXIT_HARNESS_UNCLASSIFIED
+                        });
+                    }
+                    let Some(context) = execution_context.as_ref() else {
+                        eprintln!("[{E_HARNESS_EXEC}] harness error: {err}");
+                        return ExitCode::from(err.exit_code());
+                    };
+                    match profile_results::preserve_unclassified(
+                        &app_paths,
+                        context,
+                        &args.target,
+                        staged_input
+                            .as_ref()
+                            .map(profile_results::StagedInput::evidence_path)
+                            .unwrap_or(replay_input),
+                        traceback,
+                    ) {
+                        Ok(record) => {
+                            eprintln!("diagnostic_id: {}", record.id);
+                            eprintln!("diagnostic: {}", record.path.display());
+                        }
+                        Err(preserve_error) => {
+                            eprintln!(
+                                "[{E_HARNESS_EXEC}] failed to preserve unclassified diagnostic: {preserve_error}"
+                            );
+                        }
+                    }
+                }
                 eprintln!("[{E_HARNESS_EXEC}] harness error: {err}");
                 return ExitCode::from(err.exit_code());
             }
@@ -839,14 +959,16 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+        Commands::ReplayDiagnostic(args) => {
+            if let Err(err) =
+                profile_results::replay_diagnostic(&app_paths, &args.id, args.attempts)
+            {
+                eprintln!("[{E_HARNESS_EXEC}] replay-diagnostic error: {err}");
+                return ExitCode::from(2);
+            }
+        }
+        Commands::TargetSpec(_) => unreachable!("target-spec exits before path preparation"),
     }
 
     ExitCode::SUCCESS
-}
-
-fn print_stub_with_id(command: &str, data_dir: &Path, seeds_dir: &Path, id: &str) {
-    println!("[{}] not implemented yet", command);
-    println!("id: {}", id);
-    println!("data_dir: {}", data_dir.display());
-    println!("seeds_dir: {}", seeds_dir.display());
 }

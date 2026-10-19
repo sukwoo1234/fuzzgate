@@ -11,7 +11,7 @@ use crate::common::{
 };
 use crate::json_utils::json_escape;
 
-#[derive(clap::ValueEnum, Clone, Debug)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TargetKind {
     #[value(name = "gguf")]
     Gguf,
@@ -81,32 +81,56 @@ pub(crate) struct TargetAdapter {
     pub(crate) input_ext: &'static str,
 }
 
-pub(crate) fn target_label(target: &TargetKind) -> &'static str {
-    match target {
-        TargetKind::Gguf => "gguf",
-        TargetKind::Onnx => "onnx",
-        TargetKind::Safetensors => "safetensors",
-    }
+#[derive(Clone, Copy)]
+pub(crate) struct TargetSpec {
+    pub(crate) kind: TargetKind,
+    pub(crate) target_id: &'static str,
+    pub(crate) seed_subdir: &'static str,
+    pub(crate) input_ext: &'static str,
+    pub(crate) storage_name: &'static str,
+    pub(crate) coverage_env_key: Option<&'static str>,
+    pub(crate) coverage_runner: Option<&'static str>,
+    pub(crate) external_harness_env: &'static str,
+    pub(crate) mutation_supported: bool,
+    pub(crate) campaign_supported: bool,
+    pub(crate) ui_supported: bool,
+    pub(crate) preset: TargetPreset,
 }
 
-pub(crate) fn seed_ext(target: &TargetKind) -> &'static str {
-    match target {
-        TargetKind::Gguf => "gguf",
-        TargetKind::Onnx => "onnx",
-        TargetKind::Safetensors => "safetensors",
-    }
-}
-
-pub(crate) fn preset_for_target(target: &TargetKind) -> TargetPreset {
-    match target {
-        TargetKind::Gguf => TargetPreset {
+const TARGET_SPECS: &[TargetSpec] = &[
+    TargetSpec {
+        kind: TargetKind::Gguf,
+        target_id: "gguf",
+        seed_subdir: "gguf",
+        input_ext: "gguf",
+        storage_name: "llama.cpp",
+        coverage_env_key: Some("TOOL_COVERAGE_GGUF_CMD"),
+        coverage_runner: Some("scripts/run_coverage_gguf.sh"),
+        external_harness_env: "TOOL_GGUF_HARNESS_CMD",
+        mutation_supported: true,
+        campaign_supported: true,
+        ui_supported: true,
+        preset: TargetPreset {
             name: "llama.cpp",
             default_version: "b7921",
             default_url: "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b7921.tar.gz",
             official_owner: "ggml-org",
             official_repo: "llama.cpp",
         },
-        TargetKind::Onnx => TargetPreset {
+    },
+    TargetSpec {
+        kind: TargetKind::Onnx,
+        target_id: "onnx",
+        seed_subdir: "onnx",
+        input_ext: "onnx",
+        storage_name: "onnxruntime",
+        coverage_env_key: Some("TOOL_COVERAGE_ONNX_CMD"),
+        coverage_runner: Some("scripts/run_coverage_onnx.sh"),
+        external_harness_env: "TOOL_ONNX_HARNESS_CMD",
+        mutation_supported: true,
+        campaign_supported: true,
+        ui_supported: true,
+        preset: TargetPreset {
             name: "onnxruntime",
             default_version: "v1.23.2",
             default_url:
@@ -114,7 +138,20 @@ pub(crate) fn preset_for_target(target: &TargetKind) -> TargetPreset {
             official_owner: "microsoft",
             official_repo: "onnxruntime",
         },
-        TargetKind::Safetensors => TargetPreset {
+    },
+    TargetSpec {
+        kind: TargetKind::Safetensors,
+        target_id: "safetensors",
+        seed_subdir: "safetensors",
+        input_ext: "safetensors",
+        storage_name: "safetensors",
+        coverage_env_key: Some("TOOL_COVERAGE_SAFETENSORS_CMD"),
+        coverage_runner: Some("scripts/run_coverage_safetensors.sh"),
+        external_harness_env: "TOOL_SAFETENSORS_HARNESS_CMD",
+        mutation_supported: true,
+        campaign_supported: true,
+        ui_supported: true,
+        preset: TargetPreset {
             name: "safetensors",
             default_version: "v0.7.0",
             default_url:
@@ -122,14 +159,81 @@ pub(crate) fn preset_for_target(target: &TargetKind) -> TargetPreset {
             official_owner: "huggingface",
             official_repo: "safetensors",
         },
-    }
+    },
+];
+
+pub(crate) fn all_target_specs() -> &'static [TargetSpec] {
+    TARGET_SPECS
+}
+
+pub(crate) fn target_spec(target: &TargetKind) -> &'static TargetSpec {
+    TARGET_SPECS
+        .iter()
+        .find(|spec| spec.kind == *target)
+        .expect("every TargetKind must have one registry entry")
+}
+
+pub(crate) fn parse_target_id(value: &str) -> Option<TargetKind> {
+    TARGET_SPECS
+        .iter()
+        .find(|spec| spec.target_id == value)
+        .map(|spec| spec.kind)
+}
+
+pub(crate) fn render_target_spec_json(target: &TargetKind) -> String {
+    let spec = target_spec(target);
+    serde_json::json!({
+        "schema_version": "1",
+        "target_id": spec.target_id,
+        "seed_subdir": spec.seed_subdir,
+        "input_ext": spec.input_ext,
+        "storage_name": spec.storage_name,
+        "coverage_env_key": spec.coverage_env_key,
+        "coverage_runner": spec.coverage_runner,
+        "external_harness_env": spec.external_harness_env,
+        "mutation_supported": spec.mutation_supported,
+        "campaign_supported": spec.campaign_supported,
+        "ui_supported": spec.ui_supported,
+        "support_scope": "profile-backend",
+    })
+    .to_string()
+}
+
+pub(crate) fn render_target_spec_shell(target: &TargetKind) -> String {
+    let spec = target_spec(target);
+    format!(
+        "target_id={}\nseed_subdir={}\ninput_ext={}\nstorage_name={}\ncoverage_env_key={}\ncoverage_runner={}\nexternal_harness_env={}\nmutation_supported={}\ncampaign_supported={}\nui_supported={}\nsupport_scope=profile-backend\n",
+        spec.target_id,
+        spec.seed_subdir,
+        spec.input_ext,
+        spec.storage_name,
+        spec.coverage_env_key.unwrap_or(""),
+        spec.coverage_runner.unwrap_or(""),
+        spec.external_harness_env,
+        u8::from(spec.mutation_supported),
+        u8::from(spec.campaign_supported),
+        u8::from(spec.ui_supported),
+    )
+}
+
+pub(crate) fn target_label(target: &TargetKind) -> &'static str {
+    target_spec(target).target_id
+}
+
+pub(crate) fn seed_ext(target: &TargetKind) -> &'static str {
+    target_spec(target).input_ext
+}
+
+pub(crate) fn preset_for_target(target: &TargetKind) -> TargetPreset {
+    target_spec(target).preset
 }
 
 pub(crate) fn resolve_target_adapter(target: &TargetKind) -> TargetAdapter {
+    let spec = target_spec(target);
     TargetAdapter {
-        target_label: target_label(target),
-        seed_subdir: target_label(target),
-        input_ext: seed_ext(target),
+        target_label: spec.target_id,
+        seed_subdir: spec.seed_subdir,
+        input_ext: spec.input_ext,
     }
 }
 
@@ -151,11 +255,7 @@ pub(crate) fn collect_corpus_inputs(
         if !path.is_file() {
             continue;
         }
-        let keep = match target {
-            TargetKind::Gguf => has_ext(&path, "gguf"),
-            TargetKind::Onnx => has_ext(&path, "onnx"),
-            TargetKind::Safetensors => has_ext(&path, "safetensors"),
-        };
+        let keep = has_ext(&path, target_spec(target).input_ext);
         if keep {
             files.push(path);
         }
@@ -230,6 +330,7 @@ pub(crate) enum HarnessError {
     LibraryCrash(String),
     InputRejected(String),
     Unavailable(String),
+    Unclassified(String),
 }
 
 impl HarnessError {
@@ -238,6 +339,7 @@ impl HarnessError {
             HarnessError::LibraryCrash(_) => crate::EXIT_HARNESS_LIBRARY_CRASH,
             HarnessError::InputRejected(_) => crate::EXIT_HARNESS_INPUT_REJECTED,
             HarnessError::Unavailable(_) => crate::EXIT_HARNESS_UNAVAILABLE,
+            HarnessError::Unclassified(_) => crate::EXIT_HARNESS_UNCLASSIFIED,
         }
     }
 }
@@ -247,7 +349,8 @@ impl std::fmt::Display for HarnessError {
         match self {
             HarnessError::LibraryCrash(msg)
             | HarnessError::InputRejected(msg)
-            | HarnessError::Unavailable(msg) => write!(f, "{msg}"),
+            | HarnessError::Unavailable(msg)
+            | HarnessError::Unclassified(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -419,11 +522,7 @@ fn split_command_line(line: &str) -> Result<Vec<String>, String> {
 }
 
 fn maybe_run_external_harness(target: &TargetKind, input: &Path) -> Result<String, HarnessError> {
-    let env_key = match target {
-        TargetKind::Gguf => "TOOL_GGUF_HARNESS_CMD",
-        TargetKind::Onnx => "TOOL_ONNX_HARNESS_CMD",
-        TargetKind::Safetensors => "TOOL_SAFETENSORS_HARNESS_CMD",
-    };
+    let env_key = target_spec(target).external_harness_env;
 
     let Ok(command_line) = std::env::var(env_key) else {
         return Ok(format!("{env_key} not set (external harness skipped)"));
@@ -703,7 +802,10 @@ fn gguf_native_connect_with_bin(bin: &std::ffi::OsStr, input: &Path) -> LibraryC
         let step = if stdout.trim().is_empty() {
             "gguf parser connected (native: parsed)".to_string()
         } else {
-            format!("gguf parser connected (native: parsed; {})", first_line(&stdout))
+            format!(
+                "gguf parser connected (native: parsed; {})",
+                first_line(&stdout)
+            )
         };
         return LibraryConnectResult {
             step,
@@ -771,7 +873,9 @@ fn gguf_legacy_hash_connect(input: &Path) -> LibraryConnectResult {
     }
     candidates.push(OsString::from("llama-gguf-hash"));
     candidates.push(OsString::from("tools/llama.cpp/build/bin/llama-gguf-hash"));
-    candidates.push(OsString::from("./tools/llama.cpp/build/bin/llama-gguf-hash"));
+    candidates.push(OsString::from(
+        "./tools/llama.cpp/build/bin/llama-gguf-hash",
+    ));
 
     let mut last_error = String::new();
     for cmd in candidates {
@@ -1275,9 +1379,7 @@ fn first_evidence_line(text: &str) -> String {
     let candidates = || {
         text.lines()
             .map(str::trim)
-            .filter(|line| {
-                !line.is_empty() && !line.chars().all(|c| c == '=' || c == '-')
-            })
+            .filter(|line| !line.is_empty() && !line.chars().all(|c| c == '=' || c == '-'))
     };
     candidates()
         .find(|line| !line.eq_ignore_ascii_case("AddressSanitizer:DEADLYSIGNAL"))
@@ -1355,6 +1457,84 @@ fn exit_signal(_status: &ExitStatus) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn target_registry_is_complete_and_unambiguous() {
+        use std::collections::HashSet;
+
+        use clap::ValueEnum;
+
+        use super::{all_target_specs, target_spec, TargetKind};
+
+        fn is_safe_component(value: &str) -> bool {
+            value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        }
+
+        fn is_safe_extension(value: &str) -> bool {
+            value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        }
+
+        let specs = all_target_specs();
+        let ids = specs
+            .iter()
+            .map(|spec| spec.target_id)
+            .collect::<HashSet<_>>();
+        let seed_dirs = specs
+            .iter()
+            .map(|spec| spec.seed_subdir)
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), specs.len(), "duplicate target_id in registry");
+        assert_eq!(
+            seed_dirs.len(),
+            specs.len(),
+            "duplicate seed_subdir in registry"
+        );
+        assert_eq!(
+            specs.len(),
+            TargetKind::value_variants().len(),
+            "TargetKind and registry row counts differ"
+        );
+        for kind in TargetKind::value_variants() {
+            let cli_name = kind
+                .to_possible_value()
+                .expect("every target must have a CLI value")
+                .get_name()
+                .to_owned();
+            assert_eq!(
+                specs.iter().filter(|spec| spec.kind == *kind).count(),
+                1,
+                "TargetKind must have exactly one registry row"
+            );
+            assert_eq!(target_spec(kind).kind, *kind);
+            assert_eq!(target_spec(kind).target_id, cli_name);
+        }
+        for spec in specs {
+            assert!(is_safe_component(spec.target_id), "unsafe target_id");
+            assert!(is_safe_component(spec.seed_subdir), "unsafe seed_subdir");
+            assert!(is_safe_extension(spec.input_ext), "unsafe input_ext");
+            assert_eq!(
+                spec.coverage_env_key.is_some(),
+                spec.coverage_runner.is_some(),
+                "coverage env and runner must be configured together"
+            );
+            assert!(
+                !spec.ui_supported || spec.campaign_supported,
+                "a UI target must support campaign dispatch"
+            );
+        }
+    }
+
     #[cfg(unix)]
     fn gguf_probe_dir(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -1491,10 +1671,8 @@ mod tests {
     #[test]
     fn safetensors_native_missing_binary_is_unavailable() {
         let _guard = env_lock();
-        let dir = std::env::temp_dir().join(format!(
-            "st-missing-{}",
-            crate::common::now_unix_millis()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("st-missing-{}", crate::common::now_unix_millis()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let input = dir.join("in.safetensors");
         std::fs::write(&input, b"whatever").expect("write");
@@ -1553,7 +1731,11 @@ mod tests {
             result.outcome.as_str(),
             result.step
         );
-        assert!(result.step.contains("rejected"), "step was: {}", result.step);
+        assert!(
+            result.step.contains("rejected"),
+            "step was: {}",
+            result.step
+        );
     }
 
     #[cfg(unix)]
@@ -1621,7 +1803,11 @@ mod tests {
             result.outcome.as_str(),
             result.step
         );
-        assert!(result.step.contains('3'), "step must name the exit: {}", result.step);
+        assert!(
+            result.step.contains('3'),
+            "step must name the exit: {}",
+            result.step
+        );
     }
 
     // A36 again, for the gguf harness: the default path is relative, so `tool` run
@@ -1898,11 +2084,13 @@ mod tests {
         let wrapper = dir.join("python.sh");
         std::fs::write(
             &wrapper,
-            format!("#!/bin/sh\nexport PYTHONPATH='{}'\nexec python3 \"$@\"\n", dir.display()),
+            format!(
+                "#!/bin/sh\nexport PYTHONPATH='{}'\nexec python3 \"$@\"\n",
+                dir.display()
+            ),
         )
         .expect("write wrapper");
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         std::env::set_var("TOOL_PYTHON_BIN", &wrapper);
         let result = safetensors_python_connect(std::path::Path::new("/unused.safetensors"));
@@ -2088,10 +2276,13 @@ mod tests {
         // Only this exact test runs in the child. Its restricted PATH and probe
         // overrides must never affect the parent test runner's other threads.
         let previous_path = std::env::var_os("PATH");
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"));
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
         child
             .arg("--exact")
-            .arg("target::tests::a_gguf_candidate_that_cannot_be_executed_falls_through_to_the_next")
+            .arg(
+                "target::tests::a_gguf_candidate_that_cannot_be_executed_falls_through_to_the_next",
+            )
             .arg("--nocapture")
             .env(CHILD_INPUT, &input)
             .env("PATH", &dir_b)
@@ -2224,7 +2415,9 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     // A sanitizer report opens with a rule of '=' characters, so reducing it with
@@ -2425,7 +2618,10 @@ mod tests {
         let input = dir.join("sample.onnx");
         std::fs::write(&input, b"bytes").unwrap();
 
-        std::env::set_var("TOOL_ONNX_HARNESS_CMD", "/nonexistent/tool-external-harness");
+        std::env::set_var(
+            "TOOL_ONNX_HARNESS_CMD",
+            "/nonexistent/tool-external-harness",
+        );
         std::env::remove_var("TOOL_REQUIRE_LIBRARY_CONNECT");
         let result = run_harness(&TargetKind::Onnx, &input);
         std::env::remove_var("TOOL_ONNX_HARNESS_CMD");
@@ -2458,17 +2654,13 @@ mod tests {
         std::env::remove_var("TOOL_PYTHON_BIN");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let err = result.expect_err(
-            "the strict library-connect gate must fail when the probe never ran",
-        );
+        let err =
+            result.expect_err("the strict library-connect gate must fail when the probe never ran");
         assert!(
             matches!(err, HarnessError::Unavailable(_)),
             "err was: {err:?}"
         );
         assert_eq!(err.exit_code(), crate::EXIT_HARNESS_UNAVAILABLE);
-        assert!(
-            err.to_string().contains("unavailable"),
-            "err was: {err}"
-        );
+        assert!(err.to_string().contains("unavailable"), "err was: {err}");
     }
 }

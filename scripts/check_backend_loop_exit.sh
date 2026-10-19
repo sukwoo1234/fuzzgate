@@ -42,6 +42,10 @@ EOF
 cat > "$WORK/bin/tool" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == target-spec ]]; then
+  printf 'target_id=onnx\nseed_subdir=onnx\ninput_ext=onnx\nmutation_supported=1\ncampaign_supported=1\n'
+  exit 0
+fi
 backend=local-harness
 while [[ $# -gt 0 ]]; do
   case "$1" in

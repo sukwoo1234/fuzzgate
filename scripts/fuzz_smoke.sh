@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: fuzz_smoke.sh [--target <onnx|gguf|safetensors>] [--backend <backend>|--backends <list>|--all] [--seconds <n>] [--id <campaign-id>] [--data-dir <dir>] [--seeds-dir <dir>] [--max-jobs <n>] [--workers <n>] [--timeout-sec <n>] [--dry-run]
+usage: fuzz_smoke.sh [--target <registered-target>] [--backend <backend>|--backends <list>|--all] [--seconds <n>] [--id <campaign-id>] [--data-dir <dir>] [--seeds-dir <dir>] [--max-jobs <n>] [--workers <n>] [--timeout-sec <n>] [--dry-run]
 EOF
 }
 
@@ -41,10 +41,36 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-case "$TARGET" in
-  onnx|gguf|safetensors) ;;
-  *) echo "[smoke] unsupported target: $TARGET" >&2; exit 2 ;;
-esac
+if [[ ! -x "$TOOL_BIN" ]]; then
+  echo "[smoke] tool binary missing: $TOOL_BIN" >&2
+  echo "[smoke] run: cargo build --offline" >&2
+  exit 1
+fi
+TARGET_SPEC="$("$TOOL_BIN" target-spec --target "$TARGET" --format shell 2>/dev/null)" || {
+  echo "[smoke] unsupported target: $TARGET" >&2
+  exit 2
+}
+TARGET_ID="$(sed -n 's/^target_id=//p' <<<"$TARGET_SPEC")"
+SEED_SUBDIR="$(sed -n 's/^seed_subdir=//p' <<<"$TARGET_SPEC")"
+INPUT_EXT="$(sed -n 's/^input_ext=//p' <<<"$TARGET_SPEC")"
+if [[ "$TARGET_ID" != "$TARGET" \
+  || ! "$TARGET_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "[smoke] registered target has an invalid or mismatched target_id: $TARGET" >&2
+  exit 2
+fi
+if [[ ! "$SEED_SUBDIR" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "[smoke] registered target has an invalid seed_subdir: $TARGET" >&2
+  exit 2
+fi
+if [[ ! "$INPUT_EXT" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+  echo "[smoke] registered target has an invalid input_ext: $TARGET" >&2
+  exit 2
+fi
+if ! grep -Fqx 'campaign_supported=1' <<<"$TARGET_SPEC"; then
+  echo "[smoke] target is registered but campaign dispatch is unavailable: $TARGET" >&2
+  exit 2
+fi
+TARGET="$TARGET_ID"
 if [[ ! "$SMOKE_SECONDS" =~ ^[0-9]+$ || "$SMOKE_SECONDS" -lt 1 ]]; then
   echo "[smoke] seconds must be an integer >= 1" >&2
   exit 2
@@ -63,12 +89,6 @@ if [[ -z "$CAMPAIGN_ID" ]]; then
   CAMPAIGN_ID="smoke-${TARGET}-${safe_backends}-$(date +%Y%m%d-%H%M%S)"
 fi
 
-if [[ ! -x "$TOOL_BIN" ]]; then
-  echo "[smoke] tool binary missing: $TOOL_BIN" >&2
-  echo "[smoke] run: cargo build --offline" >&2
-  exit 1
-fi
-
 cmd=(
   "$TOOL_BIN"
   --data-dir "$DATA_DIR"
@@ -79,6 +99,7 @@ cmd=(
   --duration-seconds "$SMOKE_SECONDS"
   --campaign-id "$CAMPAIGN_ID"
   --backends "$BACKENDS"
+  --corpus-dir "$SEEDS_DIR/$SEED_SUBDIR"
   --workers "$WORKERS"
   --timeout-sec "$TIMEOUT_SEC"
   --restart-limit "$RESTART_LIMIT"
@@ -88,7 +109,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   cmd+=(--dry-run)
 fi
 
-echo "[smoke] target=$TARGET backends=$BACKENDS seconds=$SMOKE_SECONDS id=$CAMPAIGN_ID"
+echo "[smoke] target=$TARGET seed_subdir=$SEED_SUBDIR input_ext=$INPUT_EXT backends=$BACKENDS seconds=$SMOKE_SECONDS id=$CAMPAIGN_ID"
 printf '[smoke] command:'
 printf ' %q' "${cmd[@]}"
 printf '\n'

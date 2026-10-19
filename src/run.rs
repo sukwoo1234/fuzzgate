@@ -6,15 +6,18 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::Instant,
 };
 
 use crate::common::{
     artifact_contract, command_exists, command_with_core_dump_off, first_line, now_unix,
-    now_unix_millis, output_with_deadline, shell_escape, validate_max_jobs, validate_timeout_sec,
-    AppPaths, ArtifactContract, HarnessExecResult,
+    now_unix_millis, output_with_deadline, output_with_deadline_ms, shell_escape,
+    validate_max_jobs, validate_timeout_sec, AppPaths, ArtifactContract, HarnessExecResult,
 };
 use crate::execution_context::{self, CommandSpec, ExecutionContext};
 use crate::json_utils::json_escape;
@@ -23,6 +26,233 @@ use crate::target::{
     collect_corpus_inputs, default_seed_dir, resolve_target_adapter, target_label, TargetKind,
 };
 use crate::triage;
+
+static NEXT_ENGINE_WORK_DIR: AtomicU64 = AtomicU64::new(0);
+
+struct EngineWorkingCorpus {
+    path: PathBuf,
+}
+
+impl EngineWorkingCorpus {
+    fn create(app_paths: &AppPaths, run_id: u128, inputs: &[PathBuf]) -> Result<Self, String> {
+        let root = app_paths.data_dir.join("engine-work");
+        ensure_engine_directory(&root, "engine work root")?;
+        let path = root.join(format!(
+            "run-{run_id}-{}-{}",
+            std::process::id(),
+            NEXT_ENGINE_WORK_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).map_err(|e| {
+            format!(
+                "failed to create engine working corpus '{}': {e}",
+                path.display()
+            )
+        })?;
+        let corpus = Self { path };
+        for source in inputs {
+            let name = source
+                .file_name()
+                .ok_or_else(|| format!("engine input has no file name: {}", source.display()))?;
+            let destination = corpus.path.join(name);
+            fs::copy(source, &destination).map_err(|e| {
+                format!(
+                    "failed to copy engine input '{}' to '{}': {e}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+        }
+        Ok(corpus)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn sync_into(
+        &self,
+        destination: &Path,
+        target: &TargetKind,
+        context: Option<&ExecutionContext>,
+    ) -> Result<(), String> {
+        for entry in fs::read_dir(&self.path).map_err(|e| {
+            format!(
+                "failed to read engine working corpus '{}': {e}",
+                self.path.display()
+            )
+        })? {
+            let entry = entry.map_err(|e| format!("failed to read engine corpus entry: {e}"))?;
+            let file_type = entry.file_type().map_err(|e| {
+                format!(
+                    "failed to inspect engine corpus entry '{}': {e}",
+                    entry.path().display()
+                )
+            })?;
+            if !file_type.is_file() {
+                return Err(format!(
+                    "engine corpus entry is not a regular file: {}",
+                    entry.path().display()
+                ));
+            }
+            store_engine_corpus_file(&entry.path(), destination, target, context)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for EngineWorkingCorpus {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn ensure_engine_directory(path: &Path, label: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(format!(
+            "{label} is not a real directory: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(path)
+            .map_err(|e| format!("failed to create {label} '{}': {e}", path.display())),
+        Err(error) => Err(format!(
+            "failed to inspect {label} '{}': {error}",
+            path.display()
+        )),
+    }
+}
+
+fn profiled_engine_corpus_path(
+    app_paths: &AppPaths,
+    target: &TargetKind,
+    backend: &RunBackend,
+    context: &ExecutionContext,
+) -> Result<PathBuf, String> {
+    let root = app_paths.data_dir.join("engine-corpus");
+    ensure_engine_directory(&root, "profiled engine corpus root")?;
+    let target_root = root.join(target_label(target));
+    ensure_engine_directory(&target_root, "profiled engine target corpus")?;
+    let profile_root = target_root.join(&context.profile.loaded.sha256);
+    ensure_engine_directory(&profile_root, "profiled engine profile corpus")?;
+    let backend_root = profile_root.join(run_backend_label(backend));
+    ensure_engine_directory(&backend_root, "profiled engine backend corpus")?;
+    Ok(backend_root)
+}
+
+fn store_engine_corpus_file(
+    source: &Path,
+    destination_root: &Path,
+    target: &TargetKind,
+    context: Option<&ExecutionContext>,
+) -> Result<(), String> {
+    let max_bytes = context
+        .map(|context| context.profile.loaded.profile.limits.max_input_bytes)
+        .unwrap_or(u64::MAX);
+    let bytes =
+        crate::profile_results::read_regular_file(source, max_bytes, "engine corpus input")?;
+    let hash = crate::target_profiles::sha256_bytes(&bytes)?;
+    let target_extension = resolve_target_adapter(target).input_ext;
+    let original_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or_else(|| {
+            format!(
+                "engine corpus input has no safe UTF-8 name: {}",
+                source.display()
+            )
+        })?;
+    let original_extension = Path::new(original_name)
+        .extension()
+        .and_then(|value| value.to_str());
+    let preferred_name = if original_extension
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(target_extension))
+    {
+        original_name.to_string()
+    } else {
+        format!("generated-{hash}.{target_extension}")
+    };
+    store_engine_corpus_bytes(
+        destination_root,
+        &preferred_name,
+        &hash,
+        &bytes,
+        target_extension,
+    )
+}
+
+fn store_engine_corpus_bytes(
+    destination_root: &Path,
+    preferred_name: &str,
+    hash: &str,
+    bytes: &[u8],
+    target_extension: &str,
+) -> Result<(), String> {
+    let mut destination = destination_root.join(preferred_name);
+    for attempt in 0..2 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes).map_err(|e| {
+                    format!(
+                        "failed to write engine corpus input '{}': {e}",
+                        destination.display()
+                    )
+                })?;
+                file.sync_all().map_err(|e| {
+                    format!(
+                        "failed to sync engine corpus input '{}': {e}",
+                        destination.display()
+                    )
+                })?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&destination).map_err(|e| {
+                    format!(
+                        "failed to inspect existing engine corpus input '{}': {e}",
+                        destination.display()
+                    )
+                })?;
+                if !metadata.file_type().is_file() {
+                    return Err(format!(
+                        "existing engine corpus input is not a regular file: {}",
+                        destination.display()
+                    ));
+                }
+                if metadata.len() == bytes.len() as u64 {
+                    let existing = crate::profile_results::read_regular_file(
+                        &destination,
+                        bytes.len().max(1) as u64,
+                        "existing engine corpus input",
+                    )?;
+                    if existing == bytes {
+                        return Ok(());
+                    }
+                }
+                if attempt == 0 {
+                    destination =
+                        destination_root.join(format!("generated-{hash}.{target_extension}"));
+                    continue;
+                }
+                return Err(format!(
+                    "engine corpus hash-name collision at '{}'",
+                    destination.display()
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to create engine corpus input '{}': {error}",
+                    destination.display()
+                ));
+            }
+        }
+    }
+    Err("failed to store engine corpus input".to_string())
+}
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RunBackend {
@@ -45,9 +275,24 @@ pub(crate) struct RunJob {
     pub(crate) input: PathBuf,
 }
 
+fn build_run_jobs(inputs: Vec<PathBuf>) -> Vec<RunJob> {
+    inputs
+        .into_iter()
+        .enumerate()
+        .map(|(id, input)| RunJob { id, input })
+        .collect()
+}
+
 /// What running one job reports back: the harness outcome, how many retries it
 /// took, and whether the library session was reached.
 type JobOutcome = (HarnessExecResult, usize, bool);
+
+struct RunJobRuntime<'a> {
+    app_paths: &'a AppPaths,
+    logs_dir: &'a Path,
+    crash_inputs_dir: &'a Path,
+    execution_context: Option<&'a ExecutionContext>,
+}
 
 #[derive(Default)]
 struct RunStats {
@@ -56,6 +301,7 @@ struct RunStats {
     failed: usize,
     timeout: usize,
     rejected: usize,
+    unclassified: usize,
     retries: usize,
     library_session_ok: usize,
     // A26: jobs the run never got to execute. Not failures of the library under test,
@@ -69,6 +315,7 @@ struct RunStatusCounts {
     failed: usize,
     timeout: usize,
     rejected: usize,
+    unclassified: usize,
     retries: usize,
     job_errors: usize,
     worker_errors: usize,
@@ -84,6 +331,7 @@ struct EngineWorkerPlan {
     launch: EngineLaunch,
     command_display: String,
     worker_log_path: PathBuf,
+    deadline_ms: Option<u64>,
 }
 
 enum EngineLaunch {
@@ -168,6 +416,7 @@ pub(crate) fn run_fuzz_pipeline(
             workers,
             timeout_sec,
             restart_limit,
+            max_jobs,
             execution_context,
         );
     }
@@ -195,9 +444,6 @@ pub(crate) fn run_fuzz_pipeline(
         inputs.truncate(max_jobs);
     }
 
-    let corpus_snapshot_sha256 = execution_context
-        .map(|_| execution_context::corpus_snapshot_sha256(&inputs))
-        .transpose()?;
     let execution_started_unix_ms = crate::common::now_unix_millis();
     let execution_started = Instant::now();
 
@@ -206,11 +452,23 @@ pub(crate) fn run_fuzz_pipeline(
     let logs_dir = run_dir.join("logs");
     fs::create_dir_all(&logs_dir)
         .map_err(|e| format!("failed to create run log dir '{}': {e}", logs_dir.display()))?;
+    let input_snapshot = execution_context
+        .map(|_| crate::profile_results::snapshot_inputs(&run_dir, &inputs, "inputs"))
+        .transpose()?;
+    if let Some(snapshot) = &input_snapshot {
+        inputs = snapshot.paths.clone();
+    }
+    let corpus_snapshot_sha256 = execution_context
+        .map(|_| execution_context::corpus_snapshot_sha256(&inputs))
+        .transpose()?;
     if let Some(context) = execution_context {
         context.write_execution_record(
             &run_dir,
             run_backend_label(backend),
             corpus_snapshot_sha256.as_deref(),
+            input_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.manifest_sha256.as_str()),
             execution_started_unix_ms,
             0,
             "running",
@@ -221,11 +479,7 @@ pub(crate) fn run_fuzz_pipeline(
     // dir that retention prunes. Created lazily on the first failed/timeout job.
     let crash_inputs_dir = run_dir.join("crash-inputs");
 
-    let jobs = inputs
-        .into_iter()
-        .enumerate()
-        .map(|(id, input)| RunJob { id, input })
-        .collect::<Vec<_>>();
+    let jobs = build_run_jobs(inputs);
     let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
     let stats = Arc::new(Mutex::new(RunStats {
         total: queue.lock().map_err(|_| "queue lock poisoned")?.len(),
@@ -262,10 +516,17 @@ pub(crate) fn run_fuzz_pipeline(
         let stats = Arc::clone(&stats);
         let logs_dir = logs_dir.clone();
         let crash_inputs_dir = crash_inputs_dir.clone();
-        let target = target.clone();
+        let target = *target;
+        let app_paths = app_paths.clone();
         let execution_context = execution_context.cloned();
 
         handles.push(thread::spawn(move || {
+            let runtime = RunJobRuntime {
+                app_paths: &app_paths,
+                logs_dir: &logs_dir,
+                crash_inputs_dir: &crash_inputs_dir,
+                execution_context: execution_context.as_ref(),
+            };
             let exec = |job: &RunJob| {
                 run_job_with_retry(
                     job,
@@ -273,11 +534,10 @@ pub(crate) fn run_fuzz_pipeline(
                     timeout_sec,
                     restart_limit,
                     timeout_available,
-                    &logs_dir,
-                    execution_context.as_ref(),
+                    &runtime,
                 )
             };
-            drain_job_queue(&queue, &stats, &crash_inputs_dir, &exec)
+            drain_job_queue(&queue, &stats, &exec)
         }));
     }
 
@@ -310,6 +570,7 @@ pub(crate) fn run_fuzz_pipeline(
             failed: s.failed,
             timeout: s.timeout,
             rejected: s.rejected,
+            unclassified: s.unclassified,
             retries: s.retries,
             job_errors: s.job_errors,
             worker_errors: 0,
@@ -324,6 +585,7 @@ pub(crate) fn run_fuzz_pipeline(
         &engine_mode,
         &corpus_dir,
         seed_fixture,
+        execution_context.map(|context| context.profile.loaded.sha256.as_str()),
     )?;
 
     println!("[run] done");
@@ -331,6 +593,7 @@ pub(crate) fn run_fuzz_pipeline(
     println!("failed: {}", s.failed);
     println!("timeout: {}", s.timeout);
     println!("rejected: {}", s.rejected);
+    println!("unclassified: {}", s.unclassified);
     println!("retries: {}", s.retries);
     println!("job_errors: {}", s.job_errors);
     println!("status: {}", status_path.display());
@@ -345,7 +608,7 @@ pub(crate) fn run_fuzz_pipeline(
             // A job that never ran is not a trial: keeping it in `total` would dilute
             // library_connect_rate_proxy with inputs the library never saw.
             total: s.total.saturating_sub(s.job_errors) as u64,
-            errors: (s.failed + s.timeout) as u64,
+            errors: (s.failed + s.timeout + s.unclassified) as u64,
             successful_runs_proxy: s.success as u64,
             library_session_ok: s.library_session_ok as u64,
             new_crashes: 0,
@@ -360,6 +623,9 @@ pub(crate) fn run_fuzz_pipeline(
         &run_dir,
         run_backend_label(backend),
         corpus_snapshot_sha256.as_deref(),
+        input_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.manifest_sha256.as_str()),
         execution_started_unix_ms,
         execution_started.elapsed().as_millis(),
         verdict,
@@ -382,6 +648,12 @@ fn local_run_verdict(stats: &RunStats, worker_error: Option<String>) -> Result<(
             stats.job_errors, stats.total, stats.job_errors
         ));
     }
+    if stats.unclassified > 0 {
+        return Err(format!(
+            "{} of {} jobs need independent diagnostic replay (unclassified={})",
+            stats.unclassified, stats.total, stats.unclassified
+        ));
+    }
     Ok(())
 }
 
@@ -392,7 +664,6 @@ fn local_run_verdict(stats: &RunStats, worker_error: Option<String>) -> Result<(
 fn drain_job_queue(
     queue: &Mutex<VecDeque<RunJob>>,
     stats: &Mutex<RunStats>,
-    crash_inputs_dir: &Path,
     exec: &dyn Fn(&RunJob) -> Result<JobOutcome, String>,
 ) -> Result<(), String> {
     loop {
@@ -438,17 +709,9 @@ fn drain_job_queue(
             HarnessExecResult::Failed(_) => s.failed += 1,
             HarnessExecResult::Timeout(_) => s.timeout += 1,
             HarnessExecResult::Rejected(_) => s.rejected += 1,
+            HarnessExecResult::Unclassified(_) => s.unclassified += 1,
         }
-        let persist_reproducer = is_reproducer(&result);
         drop(s);
-        if persist_reproducer {
-            if let Err(e) = persist_crash_input(crash_inputs_dir, job.id, &job.input) {
-                eprintln!(
-                    "[run] warning: failed to persist reproducer for {}: {e}",
-                    job.input.display()
-                );
-            }
-        }
     }
     Ok(())
 }
@@ -464,6 +727,7 @@ fn run_engine_backend(
     workers: usize,
     timeout_sec: u64,
     restart_limit: u32,
+    max_jobs: Option<usize>,
     execution_context: Option<&ExecutionContext>,
 ) -> Result<(), String> {
     if workers == 0 {
@@ -479,19 +743,6 @@ fn run_engine_backend(
         return Err(format!("corpus_dir is invalid: {}", corpus_dir.display()));
     }
 
-    let corpus_snapshot_sha256 = if execution_context.is_some() {
-        let inputs = collect_corpus_inputs(&corpus_dir, target)?;
-        if inputs.is_empty() {
-            return Err(format!(
-                "no input files found for target '{}' in {}",
-                target_label(target),
-                corpus_dir.display()
-            ));
-        }
-        Some(execution_context::corpus_snapshot_sha256(&inputs)?)
-    } else {
-        None
-    };
     let execution_started_unix_ms = crate::common::now_unix_millis();
     let execution_started = Instant::now();
 
@@ -500,6 +751,76 @@ fn run_engine_backend(
     let logs_dir = run_dir.join("logs");
     fs::create_dir_all(&logs_dir)
         .map_err(|e| format!("failed to create run dir '{}': {e}", run_dir.display()))?;
+    let mut legacy_selected_inputs = None;
+    let stable_corpus_dir;
+    let input_snapshot = if let Some(context) = execution_context {
+        let mut source_inputs = collect_corpus_inputs(&corpus_dir, target)?;
+        if let Some(max_jobs) = max_jobs {
+            source_inputs.truncate(max_jobs);
+        }
+        for input in &source_inputs {
+            context.validate_input(input)?;
+        }
+        let persistent = profiled_engine_corpus_path(app_paths, target, backend, context)?;
+        for input in &source_inputs {
+            store_engine_corpus_file(input, &persistent, target, Some(context))?;
+        }
+        let mut inputs = collect_corpus_inputs(&persistent, target)?;
+        if let Some(max_jobs) = max_jobs {
+            inputs.truncate(max_jobs);
+        }
+        for input in &inputs {
+            context.validate_input(input)?;
+        }
+        if inputs.is_empty() {
+            return Err(format!(
+                "no input files found for target '{}' in {}",
+                target_label(target),
+                corpus_dir.display()
+            ));
+        }
+        stable_corpus_dir = persistent;
+        Some(crate::profile_results::snapshot_inputs(
+            &run_dir, &inputs, "inputs",
+        )?)
+    } else {
+        stable_corpus_dir = corpus_dir.clone();
+        if let Some(max_jobs) = max_jobs {
+            let mut inputs = collect_corpus_inputs(&corpus_dir, target)?;
+            if inputs.is_empty() {
+                return Err(format!(
+                    "no input files found for target '{}' in {}",
+                    target_label(target),
+                    corpus_dir.display()
+                ));
+            }
+            inputs.truncate(max_jobs);
+            legacy_selected_inputs = Some(inputs);
+        }
+        None
+    };
+    let corpus_snapshot_sha256 = input_snapshot
+        .as_ref()
+        .map(|snapshot| execution_context::corpus_snapshot_sha256(&snapshot.paths))
+        .transpose()?;
+    let working_inputs = input_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.paths.as_slice())
+        .or(legacy_selected_inputs.as_deref());
+    let engine_working_corpus = if let Some(inputs) = working_inputs {
+        // Engine corpora are writable by design: libFuzzer adds inputs and both
+        // engines may minimize or rewrite files. Keep the manifest-bound evidence
+        // under inputs/ immutable and give the engine an independent working copy
+        // outside the result tree. Its new corpus units are merged into the stable
+        // corpus after every worker has exited.
+        Some(EngineWorkingCorpus::create(app_paths, run_id, inputs)?)
+    } else {
+        None
+    };
+    let execution_corpus_dir = engine_working_corpus
+        .as_ref()
+        .map(|working| working.path().to_path_buf())
+        .unwrap_or_else(|| stable_corpus_dir.clone());
     let engine_mode = if let Some(context) = execution_context {
         context
             .required_mode(run_backend_label(backend))?
@@ -515,6 +836,9 @@ fn run_engine_backend(
             &run_dir,
             run_backend_label(backend),
             corpus_snapshot_sha256.as_deref(),
+            input_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.manifest_sha256.as_str()),
             execution_started_unix_ms,
             0,
             "running",
@@ -526,7 +850,7 @@ fn run_engine_backend(
     println!("target: {}", target_label(target));
     println!("backend: {}", run_backend_label(backend));
     println!("local_mode: {}", local);
-    println!("corpus_dir: {}", corpus_dir.display());
+    println!("corpus_dir: {}", stable_corpus_dir.display());
     println!("workers: {}", workers);
     println!("timeout_sec: {}", timeout_sec);
     println!("restart_limit: {}", restart_limit);
@@ -548,7 +872,10 @@ fn run_engine_backend(
                 )
             })?;
             let mut values = BTreeMap::new();
-            values.insert("corpus_dir", absolute_path(&corpus_dir).into_os_string());
+            values.insert(
+                "corpus_dir",
+                absolute_path(&execution_corpus_dir).into_os_string(),
+            );
             values.insert(
                 "artifact_dir",
                 absolute_path(&artifact_dir).into_os_string(),
@@ -567,7 +894,7 @@ fn run_engine_backend(
             EngineLaunch::LegacyShell(build_engine_command(
                 target,
                 backend,
-                &corpus_dir,
+                &execution_corpus_dir,
                 &run_dir,
                 workers,
                 worker_id,
@@ -584,6 +911,9 @@ fn run_engine_backend(
             launch,
             command_display,
             worker_log_path,
+            deadline_ms: profiled_context
+                .as_ref()
+                .map(|context| context.profile.loaded.profile.limits.block_timeout_ms),
         });
     }
 
@@ -607,7 +937,20 @@ fn run_engine_backend(
     success += totals.success;
     failed += totals.failed;
     timeout += totals.timeout;
-    let worker_errors = totals.worker_errors;
+    let mut worker_errors = totals.worker_errors;
+    let corpus_sync_error = execution_context
+        .and_then(|context| context.ensure_unchanged().err())
+        .or_else(|| {
+            engine_working_corpus.as_ref().and_then(|working| {
+                working
+                    .sync_into(&stable_corpus_dir, target, execution_context)
+                    .err()
+            })
+        });
+    if let Some(error) = &corpus_sync_error {
+        eprintln!("[run] warning: failed to preserve engine corpus: {error}");
+        worker_errors += 1;
+    }
 
     let ingest = ingest_backend_crash_artifacts(
         app_paths,
@@ -630,6 +973,7 @@ fn run_engine_backend(
             failed,
             timeout,
             rejected: 0,
+            unclassified: 0,
             retries: 0,
             job_errors: 0,
             worker_errors,
@@ -642,8 +986,9 @@ fn run_engine_backend(
         timeout_sec,
         restart_limit,
         &engine_mode,
-        &corpus_dir,
+        &stable_corpus_dir,
         seed_fixture,
+        execution_context.map(|context| context.profile.loaded.sha256.as_str()),
     )?;
 
     println!("[run] done");
@@ -689,13 +1034,14 @@ fn run_engine_backend(
         Ok(())
     } else {
         Err(format!(
-            "backend '{}' engine command failed (failed={}, timeout={}, worker_errors={}, crash_scan_errors={}, manifest_error={}, run_dir={})",
+            "backend '{}' engine command failed (failed={}, timeout={}, worker_errors={}, crash_scan_errors={}, manifest_error={}, corpus_sync_error={}, run_dir={})",
             run_backend_label(backend),
             failed,
             timeout,
             worker_errors,
             ingest.scan_errors,
             ingest.manifest_error,
+            corpus_sync_error.as_deref().unwrap_or("none"),
             run_dir.display()
         ))
     };
@@ -704,6 +1050,9 @@ fn run_engine_backend(
         &run_dir,
         run_backend_label(backend),
         corpus_snapshot_sha256.as_deref(),
+        input_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.manifest_sha256.as_str()),
         execution_started_unix_ms,
         execution_started.elapsed().as_millis(),
         verdict,
@@ -783,17 +1132,23 @@ fn run_engine_worker(plan: EngineWorkerPlan) -> Result<EngineWorkerResult, Strin
             cmd
         }
     };
-    let output = cmd.output().map_err(|e| {
+    let (output, timed_out) = if let Some(deadline_ms) = plan.deadline_ms {
+        output_with_deadline_ms(cmd, deadline_ms)
+    } else {
+        cmd.output().map(|output| (output, false))
+    }
+    .map_err(|e| {
         format!(
             "failed to execute backend engine command for worker {}: {e}",
             plan.worker_id
         )
     })?;
     let log_body = format!(
-        "worker_id: {}\ncmd: {}\nexit_code: {:?}\n\n[stdout]\n{}\n\n[stderr]\n{}\n",
+        "worker_id: {}\ncmd: {}\nexit_code: {:?}\ntimed_out: {}\n\n[stdout]\n{}\n\n[stderr]\n{}\n",
         plan.worker_id,
         plan.command_display,
         output.status.code(),
+        timed_out,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -807,7 +1162,9 @@ fn run_engine_worker(plan: EngineWorkerPlan) -> Result<EngineWorkerResult, Strin
     }
 
     let exit_code = output.status.code().unwrap_or(1);
-    let outcome = if output.status.success() {
+    let outcome = if timed_out {
+        EngineWorkerOutcome::Timeout
+    } else if output.status.success() {
         EngineWorkerOutcome::Success
     } else if exit_code == 124 {
         EngineWorkerOutcome::Timeout
@@ -976,7 +1333,24 @@ fn collect_aflpp_crash_artifacts(run_dir: &Path, scan: &mut BackendCrashScan) {
             }
         };
         let fuzzer_dir = entry.path();
-        if !fuzzer_dir.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) => {
+                scan.note_error(format!(
+                    "failed to inspect afl-out entry '{}': {e}",
+                    fuzzer_dir.display()
+                ));
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            scan.note_error(format!(
+                "refusing symlinked AFL++ fuzzer directory: {}",
+                fuzzer_dir.display()
+            ));
+            continue;
+        }
+        if !file_type.is_dir() {
             continue;
         }
         let crashes_dir = fuzzer_dir.join("crashes");
@@ -990,8 +1364,23 @@ fn collect_libfuzzer_crash_artifacts(run_dir: &Path, scan: &mut BackendCrashScan
 }
 
 fn collect_prefixed_files_recursive(dir: &Path, kind: &'static str, scan: &mut BackendCrashScan) {
-    if !dir.exists() {
-        return;
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            scan.note_error(format!(
+                "refusing non-directory or symlinked artifact path: {}",
+                dir.display()
+            ));
+            return;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            scan.note_error(format!(
+                "failed to inspect artifact directory '{}': {error}",
+                dir.display()
+            ));
+            return;
+        }
     }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -1009,17 +1398,47 @@ fn collect_prefixed_files_recursive(dir: &Path, kind: &'static str, scan: &mut B
             }
         };
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) => {
+                scan.note_error(format!(
+                    "failed to inspect artifact entry '{}': {e}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            scan.note_error(format!(
+                "refusing symlinked artifact entry: {}",
+                path.display()
+            ));
+        } else if file_type.is_dir() {
             collect_prefixed_files_recursive(&path, kind, scan);
-        } else if is_libfuzzer_artifact_file(&path) {
+        } else if file_type.is_file() && is_libfuzzer_artifact_file(&path) {
             scan.artifacts.push(BackendCrashArtifact { path, kind });
         }
     }
 }
 
 fn collect_files_in_dir(dir: &Path, kind: &'static str, scan: &mut BackendCrashScan) {
-    if !dir.exists() {
-        return;
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            scan.note_error(format!(
+                "refusing non-directory or symlinked crash path: {}",
+                dir.display()
+            ));
+            return;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            scan.note_error(format!(
+                "failed to inspect crash directory '{}': {error}",
+                dir.display()
+            ));
+            return;
+        }
     }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -1050,19 +1469,18 @@ fn collect_files_in_dir(dir: &Path, kind: &'static str, scan: &mut BackendCrashS
     }
 }
 
-/// Whether a directory entry names a regular file, following a symlink.
-///
+/// Whether a directory entry names a regular file without crossing a symlink.
 /// The listing itself carries the entry type, so this still answers when the
-/// directory denies search and stat-ing the entry does not. `Path::is_file` alone
-/// reports "not a file" for that permission error, which used to drop a real crash
-/// artifact without a trace.
+/// directory denies search and stat-ing the entry does not.
 fn dir_entry_is_file(entry: &fs::DirEntry) -> std::io::Result<bool> {
-    if let Ok(file_type) = entry.file_type() {
-        if !file_type.is_symlink() {
-            return Ok(file_type.is_file());
-        }
+    let file_type = entry.file_type()?;
+    if file_type.is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "refusing symlinked crash artifact",
+        ));
     }
-    entry.path().metadata().map(|meta| meta.is_file())
+    Ok(file_type.is_file())
 }
 
 fn is_aflpp_metadata_file(path: &Path) -> bool {
@@ -1204,31 +1622,54 @@ fn run_job_with_retry(
     timeout_sec: u64,
     restart_limit: u32,
     timeout_available: bool,
-    logs_dir: &Path,
-    execution_context: Option<&ExecutionContext>,
+    runtime: &RunJobRuntime<'_>,
 ) -> Result<JobOutcome, String> {
     let attempts = restart_limit + 1;
     let mut last = HarnessExecResult::Failed("not executed".to_string());
     let mut last_session_ok = false;
     let mut retries_used = 0usize;
+    // A profiled job must execute and preserve one immutable snapshot. Restaging
+    // the mutable corpus path on every retry, then copying that path after the
+    // child exits, can save bytes the harness never observed.
+    let staged_input = runtime
+        .execution_context
+        .map(|_| crate::profile_results::stage_input(&job.input))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let replay_input = staged_input
+        .as_ref()
+        .map(crate::profile_results::StagedInput::path)
+        .unwrap_or(&job.input);
 
     for attempt in 1..=attempts {
         let (result, is_session_ok) = execute_harness_subprocess(
-            job,
+            replay_input,
             target,
             timeout_sec,
             timeout_available,
-            execution_context,
+            runtime.app_paths,
+            runtime.logs_dir.parent().map(|root| (root, job)),
+            runtime.execution_context,
         )?;
         last_session_ok = is_session_ok;
         // Review follow-up: the harness has already run and its verdict is in hand.
         // Failing here on a full disk or an fd limit threw that verdict away - and
         // for an input that had just crashed the library, the reproducer was never
         // persisted. A log is evidence about a result, not the result.
-        if let Err(e) = write_job_log(logs_dir, job, attempt, &result) {
+        if let Err(e) = write_job_log(runtime.logs_dir, job, attempt, &result) {
             eprintln!("[run] warning: failed to write the job log: {e}");
         }
         if !should_retry(&result) {
+            persist_reproducer_if_needed(
+                &result,
+                runtime.crash_inputs_dir,
+                job.id,
+                if runtime.execution_context.is_some() {
+                    &job.input
+                } else {
+                    replay_input
+                },
+            );
             return Ok((result, retries_used, is_session_ok));
         }
         last = result;
@@ -1237,7 +1678,34 @@ fn run_job_with_retry(
         }
     }
 
+    persist_reproducer_if_needed(
+        &last,
+        runtime.crash_inputs_dir,
+        job.id,
+        if runtime.execution_context.is_some() {
+            &job.input
+        } else {
+            replay_input
+        },
+    );
     Ok((last, retries_used, last_session_ok))
+}
+
+fn persist_reproducer_if_needed(
+    result: &HarnessExecResult,
+    crash_inputs_dir: &Path,
+    job_id: usize,
+    observed_input: &Path,
+) {
+    if !is_reproducer(result) {
+        return;
+    }
+    if let Err(error) = persist_crash_input(crash_inputs_dir, job_id, observed_input) {
+        eprintln!(
+            "[run] warning: failed to persist reproducer for {}: {error}",
+            observed_input.display()
+        );
+    }
 }
 
 // A10: local-harness runs record only counters; a crashing/hanging input still lives
@@ -1260,10 +1728,12 @@ fn persist_crash_input(
 }
 
 pub(crate) fn execute_harness_subprocess(
-    job: &RunJob,
+    replay_input: &Path,
     target: &TargetKind,
     timeout_sec: u64,
     timeout_available: bool,
+    app_paths: &AppPaths,
+    attached_parent: Option<(&Path, &RunJob)>,
     execution_context: Option<&ExecutionContext>,
 ) -> Result<(HarnessExecResult, bool), String> {
     let exe = std::env::current_exe().map_err(|e| format!("failed to resolve current exe: {e}"))?;
@@ -1277,11 +1747,15 @@ pub(crate) fn execute_harness_subprocess(
     } else {
         command_with_core_dump_off(&exe)
     };
-    cmd.arg("harness")
+    cmd.arg("--data-dir")
+        .arg(&app_paths.data_dir)
+        .arg("--seeds-dir")
+        .arg(&app_paths.seeds_dir)
+        .arg("harness")
         .arg("--target")
         .arg(&target_name)
         .arg("--input")
-        .arg(&job.input)
+        .arg(replay_input)
         .env("OMP_NUM_THREADS", "1")
         .env("MKL_NUM_THREADS", "1")
         .env("OPENBLAS_NUM_THREADS", "1")
@@ -1289,6 +1763,7 @@ pub(crate) fn execute_harness_subprocess(
         .env("VECLIB_MAXIMUM_THREADS", "1");
     if let Some(context) = execution_context {
         context.apply_to_command(&mut cmd, true)?;
+        cmd.env(crate::profile_results::DIAGNOSTIC_SUPERVISOR_ENV, "run");
     }
 
     // A9: the external `timeout` bounds the run where it exists; where it does not, the
@@ -1314,10 +1789,42 @@ pub(crate) fn execute_harness_subprocess(
         first_line(&stderr)
     );
 
-    Ok((
-        harness_exec_result(out.status.success(), out.status.code(), timed_out, summary),
-        is_session_ok,
-    ))
+    let mut result =
+        harness_exec_result(out.status.success(), out.status.code(), timed_out, summary);
+    if let (HarnessExecResult::Unclassified(detail), Some(context)) =
+        (&mut result, execution_context)
+    {
+        let traceback = crate::profile_results::extract_supervised_traceback(&stderr)
+            .unwrap_or_else(|| stderr.clone());
+        let diagnostic_input = attached_parent
+            .map(|(_, job)| job.input.as_path())
+            .unwrap_or(replay_input);
+        match crate::profile_results::preserve_unclassified(
+            app_paths,
+            context,
+            target,
+            diagnostic_input,
+            &traceback,
+        ) {
+            Ok(location) => {
+                if let Some((root, job)) = attached_parent {
+                    crate::profile_results::attach_diagnostic_to_result(
+                        &location,
+                        root,
+                        job.id,
+                        &job.input,
+                        "local-harness",
+                    )?;
+                }
+                *detail = format!("diagnostic_id: {}\n{traceback}", location.id);
+            }
+            Err(error) => {
+                *detail = format!("diagnostic_preservation_error: {error}\n{traceback}");
+            }
+        }
+    }
+
+    Ok((result, is_session_ok))
 }
 
 // G3: the run pipeline keys off the same exit-code split as triage and the engine
@@ -1338,6 +1845,9 @@ fn harness_exec_result(
     }
     if exit_code == Some(i32::from(crate::EXIT_HARNESS_INPUT_REJECTED)) {
         return HarnessExecResult::Rejected(summary);
+    }
+    if exit_code == Some(i32::from(crate::EXIT_HARNESS_UNCLASSIFIED)) {
+        return HarnessExecResult::Unclassified(summary);
     }
     HarnessExecResult::Failed(summary)
 }
@@ -1378,6 +1888,7 @@ pub(crate) fn write_job_log(
         HarnessExecResult::Failed(s) => ("failed", s.as_str()),
         HarnessExecResult::Timeout(s) => ("timeout", s.as_str()),
         HarnessExecResult::Rejected(s) => ("rejected", s.as_str()),
+        HarnessExecResult::Unclassified(s) => ("unclassified", s.as_str()),
     };
     let body = format!(
         "job_id: {}\ninput: {}\nattempt: {}\nresult: {}\n{}\n",
@@ -1453,6 +1964,7 @@ fn finish_profiled_run(
     run_dir: &Path,
     backend: &str,
     corpus_snapshot_sha256: Option<&str>,
+    input_manifest_sha256: Option<&str>,
     started_unix_ms: u128,
     elapsed_ms: u128,
     verdict: Result<(), String>,
@@ -1465,6 +1977,7 @@ fn finish_profiled_run(
         run_dir,
         backend,
         corpus_snapshot_sha256,
+        input_manifest_sha256,
         started_unix_ms,
         elapsed_ms,
         outcome,
@@ -1492,6 +2005,7 @@ fn write_run_status(
     engine_mode: &str,
     corpus_dir: &Path,
     seed_fixture: Option<&Path>,
+    profile_sha256: Option<&str>,
 ) -> Result<PathBuf, String> {
     let status_path = run_dir.join("status.json");
     // Record the source selected by the caller, never infer it from a mutable
@@ -1502,8 +2016,11 @@ fn write_run_status(
         .filter(|path| !path.as_os_str().is_empty())
         .map(|path| format!("\"{}\"", json_escape(&path.display().to_string())))
         .unwrap_or_else(|| "null".to_string());
+    let profile_sha256_json = profile_sha256
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .unwrap_or_else(|| "null".to_string());
     let status_json = format!(
-        "{{\n  \"run_id\": \"{}\",\n  \"target\": \"{}\",\n  \"backend\": \"{}\",\n  \"total\": {},\n  \"success\": {},\n  \"failed\": {},\n  \"timeout\": {},\n  \"rejected\": {},\n  \"retries\": {},\n  \"job_errors\": {},\n  \"worker_errors\": {},\n  \"workers\": {},\n  \"timeout_sec\": {},\n  \"restart_limit\": {},\n  \"engine_mode\": \"{}\",\n  \"backend_crash_artifacts\": {},\n  \"backend_crashes_triaged\": {},\n  \"backend_crash_triage_errors\": {},\n  \"backend_crash_scan_errors\": {},\n  \"corpus_dir\": \"{}\",\n  \"seed_fixture\": {}\n}}\n",
+        "{{\n  \"schema_version\": \"1.0\",\n  \"run_id\": \"{}\",\n  \"target\": \"{}\",\n  \"backend\": \"{}\",\n  \"total\": {},\n  \"success\": {},\n  \"failed\": {},\n  \"timeout\": {},\n  \"rejected\": {},\n  \"unclassified\": {},\n  \"retries\": {},\n  \"job_errors\": {},\n  \"worker_errors\": {},\n  \"workers\": {},\n  \"timeout_sec\": {},\n  \"restart_limit\": {},\n  \"engine_mode\": \"{}\",\n  \"backend_crash_artifacts\": {},\n  \"backend_crashes_triaged\": {},\n  \"backend_crash_triage_errors\": {},\n  \"backend_crash_scan_errors\": {},\n  \"corpus_dir\": \"{}\",\n  \"seed_fixture\": {},\n  \"profiled_result\": {},\n  \"profile_sha256\": {}\n}}\n",
         run_id,
         target_label(target),
         run_backend_label(backend),
@@ -1512,6 +2029,7 @@ fn write_run_status(
         counts.failed,
         counts.timeout,
         counts.rejected,
+        counts.unclassified,
         counts.retries,
         counts.job_errors,
         counts.worker_errors,
@@ -1524,7 +2042,9 @@ fn write_run_status(
         counts.backend_crash_triage_errors,
         counts.backend_crash_scan_errors,
         json_escape(&corpus_dir.display().to_string()),
-        seed_fixture_json
+        seed_fixture_json,
+        profile_sha256.is_some(),
+        profile_sha256_json
     );
     fs::write(&status_path, status_json)
         .map_err(|e| format!("failed to write '{}': {e}", status_path.display()))?;
@@ -1579,6 +2099,15 @@ mod tests {
             HarnessExecResult::Rejected(_)
         ));
         assert!(matches!(
+            harness_exec_result(
+                false,
+                Some(i32::from(crate::EXIT_HARNESS_UNCLASSIFIED)),
+                false,
+                summary()
+            ),
+            HarnessExecResult::Unclassified(_)
+        ));
+        assert!(matches!(
             harness_exec_result(false, Some(124), true, summary()),
             HarnessExecResult::Timeout(_)
         ));
@@ -1593,6 +2122,9 @@ mod tests {
         assert!(should_retry(&HarnessExecResult::Timeout(String::new())));
         assert!(!should_retry(&HarnessExecResult::Success(String::new())));
         assert!(!should_retry(&HarnessExecResult::Rejected(String::new())));
+        assert!(!should_retry(&HarnessExecResult::Unclassified(
+            String::new()
+        )));
     }
 
     #[test]
@@ -1604,6 +2136,47 @@ mod tests {
         assert!(is_reproducer(&HarnessExecResult::Timeout(String::new())));
         assert!(!is_reproducer(&HarnessExecResult::Success(String::new())));
         assert!(!is_reproducer(&HarnessExecResult::Rejected(String::new())));
+        assert!(!is_reproducer(&HarnessExecResult::Unclassified(
+            String::new()
+        )));
+    }
+
+    #[test]
+    fn profiled_snapshot_order_defines_parent_job_ids() {
+        use super::build_run_jobs;
+
+        let root = unique_temp_dir("profiled-parent-job-order");
+        let source = root.join("source");
+        let result = root.join("result");
+        fs::create_dir_all(&source).expect("create source directory");
+        fs::create_dir(&result).expect("create result directory");
+        let z = source.join("z.onnx");
+        let a = source.join("a.onnx");
+        fs::write(&z, b"z").expect("write z input");
+        fs::write(&a, b"a").expect("write a input");
+
+        let snapshot = crate::profile_results::snapshot_inputs(&result, &[z, a], "inputs")
+            .expect("snapshot inputs");
+        let jobs = build_run_jobs(snapshot.paths);
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(result.join("input-manifest.json")).expect("read input manifest"),
+        )
+        .expect("parse input manifest");
+        let entries = manifest["files"].as_array().expect("manifest file rows");
+
+        assert_eq!(jobs.len(), entries.len());
+        for (index, (job, entry)) in jobs.iter().zip(entries).enumerate() {
+            assert_eq!(job.id, index);
+            let expected_path = format!(
+                "inputs/{}",
+                job.input
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("UTF-8 input name")
+            );
+            assert_eq!(entry["path"].as_str(), Some(expected_path.as_str()));
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     // G2/G4: the engine loops decide whether a run is really native/instrumented or a
@@ -1659,6 +2232,7 @@ mod tests {
                 failed: 0,
                 timeout: 0,
                 rejected: 0,
+                unclassified: 0,
                 retries: 0,
                 job_errors: 0,
                 worker_errors: 0,
@@ -1672,6 +2246,7 @@ mod tests {
             1,
             "blackbox_n",
             std::path::Path::new("seeds/onnx"),
+            None,
             None,
         )
         .expect("write status");
@@ -1808,8 +2383,6 @@ mod tests {
             total: 3,
             ..RunStats::default()
         });
-        let crash_inputs_dir = unique_temp_dir("a26-crash-inputs");
-
         let exec = |job: &RunJob| {
             if job.id == 1 {
                 Err("failed to spawn harness: Too many open files".to_string())
@@ -1818,7 +2391,7 @@ mod tests {
             }
         };
 
-        drain_job_queue(&queue, &stats, &crash_inputs_dir, &exec).expect("drain must not abort");
+        drain_job_queue(&queue, &stats, &exec).expect("drain must not abort");
 
         assert!(
             queue.lock().expect("queue").is_empty(),
@@ -1828,8 +2401,6 @@ mod tests {
         assert_eq!(s.success, 2, "the finished jobs must survive");
         assert_eq!(s.failed, 0, "an unrunnable job is not a failed job");
         assert_eq!(s.job_errors, 1);
-
-        let _ = fs::remove_dir_all(&crash_inputs_dir);
     }
 
     #[test]
@@ -1849,6 +2420,7 @@ mod tests {
                 failed: 0,
                 timeout: 0,
                 rejected: 0,
+                unclassified: 0,
                 retries: 0,
                 job_errors: 1,
                 worker_errors: 0,
@@ -1862,6 +2434,7 @@ mod tests {
             1,
             "local_harness",
             std::path::Path::new("seeds/onnx"),
+            None,
             None,
         )
         .expect("write status");
@@ -1920,6 +2493,7 @@ mod tests {
                 failed: 0,
                 timeout: 0,
                 rejected: 0,
+                unclassified: 0,
                 retries: 0,
                 job_errors: 0,
                 worker_errors: 1,
@@ -1933,6 +2507,7 @@ mod tests {
             1,
             "blackbox",
             std::path::Path::new("seeds/onnx"),
+            None,
             None,
         )
         .expect("write status");
@@ -2009,6 +2584,7 @@ mod tests {
                 failed: 0,
                 timeout: 0,
                 rejected: 0,
+                unclassified: 0,
                 retries: 0,
                 job_errors: 0,
                 worker_errors: 0,
@@ -2022,6 +2598,7 @@ mod tests {
             1,
             "blackbox_n",
             std::path::Path::new("seeds/onnx"),
+            None,
             None,
         )
         .expect("write status");
@@ -2063,10 +2640,10 @@ mod tests {
         let _ = fs::remove_dir_all(&run_dir);
     }
 
-    // The listing reports a symlink's own type, which says nothing about its target,
-    // so the target still has to be consulted.
+    // Crash discovery is an evidence boundary: a backend-controlled symlink must not
+    // make the run ingest bytes from outside its own result directory.
     #[test]
-    fn a_symlinked_crash_file_is_still_collected() {
+    fn a_symlinked_crash_file_is_rejected() {
         let run_dir = unique_temp_dir("aflpp-symlinked-crash");
         let crashes = run_dir.join("afl-out").join("default").join("crashes");
         fs::create_dir_all(&crashes).expect("create crashes dir");
@@ -2075,8 +2652,8 @@ mod tests {
         std::os::unix::fs::symlink(&real, crashes.join("id:000001,sig:06")).expect("symlink");
 
         let scan = collect_backend_crash_artifacts(&run_dir, &RunBackend::Aflpp);
-        assert_eq!(scan.artifacts.len(), 1);
-        assert!(scan.artifacts[0].path.ends_with("id:000001,sig:06"));
+        assert!(scan.artifacts.is_empty());
+        assert_eq!(scan.scan_errors, 1);
 
         let _ = fs::remove_dir_all(&run_dir);
     }
@@ -2095,6 +2672,24 @@ mod tests {
         assert!(scan.artifacts[0].path.ends_with("crash-deadbeef"));
 
         let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn libfuzzer_scan_does_not_follow_a_symlinked_directory() {
+        let run_dir = unique_temp_dir("libfuzzer-symlinked-directory");
+        let artifact_root = run_dir.join("backend-artifacts");
+        let outside = unique_temp_dir("libfuzzer-outside-artifact");
+        fs::create_dir_all(&artifact_root).expect("create artifact root");
+        fs::create_dir_all(&outside).expect("create outside directory");
+        fs::write(outside.join("crash-deadbeef"), b"outside").expect("write outside crash");
+        std::os::unix::fs::symlink(&outside, artifact_root.join("w1")).expect("symlink");
+
+        let scan = collect_backend_crash_artifacts(&run_dir, &RunBackend::Libfuzzer);
+        assert!(scan.artifacts.is_empty());
+        assert_eq!(scan.scan_errors, 1);
+
+        let _ = fs::remove_dir_all(&run_dir);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {

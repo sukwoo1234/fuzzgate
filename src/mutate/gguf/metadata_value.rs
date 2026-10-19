@@ -74,7 +74,6 @@ pub(crate) fn apply(
     })
 }
 
-
 /// Whether the mutated bytes still parse.
 ///
 /// A17/A18: these operators substitute an arbitrary printable byte into a string,

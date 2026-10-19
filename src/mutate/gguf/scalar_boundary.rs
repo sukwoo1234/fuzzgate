@@ -59,7 +59,11 @@ pub(crate) fn apply(
 
     let mut out = bytes.to_vec();
     out[off..off + width].copy_from_slice(pattern);
-    let parse_preserving = if parse_gguf(&out).is_ok() { "yes" } else { "no" };
+    let parse_preserving = if parse_gguf(&out).is_ok() {
+        "yes"
+    } else {
+        "no"
+    };
     Ok(MutationOutput {
         bytes: out,
         operator_params: vec![
@@ -133,7 +137,11 @@ mod tests {
         let scalar_kvs: Vec<usize> = (0..before.kvs.len())
             .filter(|&i| before.kvs[i].value_type.scalar_size().is_some())
             .collect();
-        assert_eq!(scalar_kvs.len(), 3, "fixture should carry three scalar values");
+        assert_eq!(
+            scalar_kvs.len(),
+            3,
+            "fixture should carry three scalar values"
+        );
         let mut seen = std::collections::BTreeSet::new();
         for s in 0..512u64 {
             let mut rng = DeterministicRng::new(s);
