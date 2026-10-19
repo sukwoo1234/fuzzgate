@@ -42,5 +42,8 @@ pub(crate) fn run_mutate_pipeline(
                 target, input, out, input_dir, out_dir, count, seed, &resolved,
             )
         }
+        TargetKind::Tflite => Err(
+            "target 'tflite' is registered but structural mutation is not implemented".to_string(),
+        ),
     }
 }

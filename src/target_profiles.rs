@@ -1001,6 +1001,7 @@ fn validate_depth(target: &str, depth: &str) -> Result<(), String> {
         "gguf" => matches!(depth, "metadata" | "tensor-info" | "full"),
         "onnx" => depth == "session",
         "safetensors" => depth == "deserialize",
+        "tflite" => depth == "load-allocate-access",
         _ => false,
     };
     if accepted {

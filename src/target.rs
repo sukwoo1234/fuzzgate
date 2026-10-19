@@ -19,6 +19,8 @@ pub(crate) enum TargetKind {
     Onnx,
     #[value(name = "safetensors")]
     Safetensors,
+    #[value(name = "tflite")]
+    Tflite,
 }
 
 #[derive(Clone, Copy)]
@@ -158,6 +160,27 @@ const TARGET_SPECS: &[TargetSpec] = &[
                 "https://github.com/huggingface/safetensors/archive/refs/tags/v0.7.0.tar.gz",
             official_owner: "huggingface",
             official_repo: "safetensors",
+        },
+    },
+    TargetSpec {
+        kind: TargetKind::Tflite,
+        target_id: "tflite",
+        seed_subdir: "tflite",
+        input_ext: "tflite",
+        storage_name: "tensorflow-lite",
+        coverage_env_key: None,
+        coverage_runner: None,
+        external_harness_env: "TOOL_TFLITE_HARNESS_CMD",
+        mutation_supported: false,
+        campaign_supported: false,
+        ui_supported: false,
+        preset: TargetPreset {
+            name: "tensorflow-lite",
+            default_version: "v2.20.0",
+            default_url:
+                "https://github.com/tensorflow/tensorflow/archive/refs/tags/v2.20.0.tar.gz",
+            official_owner: "tensorflow",
+            official_repo: "tensorflow",
         },
     },
 ];
@@ -379,17 +402,20 @@ pub(crate) fn run_harness(target: &TargetKind, input: &Path) -> Result<(), Harne
         TargetKind::Safetensors => {
             safetensors_precheck(&bytes).map_err(HarnessError::InputRejected)?
         }
+        TargetKind::Tflite => tflite_precheck(&bytes).map_err(HarnessError::InputRejected)?,
     };
 
     let core_path_step = match target {
         TargetKind::Gguf => "header->llama.cpp parser".to_string(),
         TargetKind::Onnx => "protobuf->onnxruntime session loader".to_string(),
         TargetKind::Safetensors => "header_json->safetensors deserialize".to_string(),
+        TargetKind::Tflite => "verified FlatBuffer->Interpreter->AllocateTensors".to_string(),
     };
     let library_connect = match target {
         TargetKind::Gguf => gguf_library_connect(input),
         TargetKind::Onnx => onnx_library_connect(input),
         TargetKind::Safetensors => safetensors_library_connect(input),
+        TargetKind::Tflite => tflite_library_connect(input),
     };
     let strict_connect = std::env::var("TOOL_REQUIRE_LIBRARY_CONNECT")
         .map(|v| v == "1")
@@ -630,6 +656,19 @@ fn safetensors_precheck(bytes: &[u8]) -> Result<String, String> {
 
     Ok(format!(
         "safetensors header probe ok (header_bytes={header_len})"
+    ))
+}
+
+fn tflite_precheck(bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() < 8 {
+        return Err("TFLite too small: need at least 8 bytes".to_string());
+    }
+    if &bytes[4..8] != b"TFL3" {
+        return Err("TFLite FlatBuffer identifier mismatch".to_string());
+    }
+    Ok(format!(
+        "TFLite FlatBuffer identifier ok (size={} bytes)",
+        bytes.len()
     ))
 }
 
@@ -1017,6 +1056,82 @@ except Exception as e:
             step: format!("onnxruntime probe error ({e})"),
             outcome: LibraryConnectOutcome::Unavailable,
         },
+    }
+}
+
+pub(crate) const TFLITE_NATIVE_BIN: &str = "TOOL_TFLITE_NATIVE_BIN";
+const TFLITE_NATIVE_DEFAULT_BIN: &str = "harnesses/tflite/tflite_loader_replay";
+
+fn tflite_library_connect(input: &Path) -> LibraryConnectResult {
+    let bin = std::env::var_os(TFLITE_NATIVE_BIN)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from(TFLITE_NATIVE_DEFAULT_BIN));
+    if resolve_executable(&bin).is_none() {
+        return LibraryConnectResult {
+            step: format!(
+                "TFLite native loader unavailable (not executable: {}; build it with \
+                 scripts/build_tflite_profiles.sh)",
+                bin.to_string_lossy()
+            ),
+            outcome: LibraryConnectOutcome::Unavailable,
+        };
+    }
+
+    let output = match command_with_core_dump_off(&bin).arg(input).output() {
+        Ok(output) => output,
+        Err(error) => {
+            return LibraryConnectResult {
+                step: format!(
+                    "TFLite native loader unavailable ({}: {error})",
+                    bin.to_string_lossy()
+                ),
+                outcome: LibraryConnectOutcome::Unavailable,
+            }
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        return LibraryConnectResult {
+            step: format!("TFLite loader connected ({})", first_line(&stdout)),
+            outcome: LibraryConnectOutcome::SessionOk,
+        };
+    }
+    if is_core_dump_wrapper_exec_failure(output.status.code(), &stderr) {
+        return LibraryConnectResult {
+            step: format!("TFLite native loader unavailable ({})", first_line(&stderr)),
+            outcome: LibraryConnectOutcome::Unavailable,
+        };
+    }
+    match output.status.code() {
+        Some(code) if code == i32::from(crate::EXIT_HARNESS_INPUT_REJECTED) => {
+            LibraryConnectResult {
+                step: format!("TFLite loader rejected the file ({})", first_line(&stderr)),
+                outcome: LibraryConnectOutcome::Invoked,
+            }
+        }
+        Some(code) if code == i32::from(crate::EXIT_HARNESS_UNAVAILABLE) => LibraryConnectResult {
+            step: format!("TFLite native loader unavailable ({})", first_line(&stderr)),
+            outcome: LibraryConnectOutcome::Unavailable,
+        },
+        _ => {
+            if let Some(result) = crashed_connect_result("TFLite loader", "native replay", &output)
+            {
+                return result;
+            }
+            LibraryConnectResult {
+                step: format!(
+                    "TFLite native loader unavailable (off-contract exit {}: {})",
+                    output
+                        .status
+                        .code()
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    first_evidence_line(&stderr)
+                ),
+                outcome: LibraryConnectOutcome::Unavailable,
+            }
+        }
     }
 }
 

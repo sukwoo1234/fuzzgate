@@ -44,6 +44,8 @@ demo-stage/
 /harnesses/libfuzzer/safetensors_loader_fuzzer
 /harnesses/libfuzzer/safetensors_loader_replay
 /harnesses/aflpp/safetensors_loader_replay
+/harnesses/tflite/tflite_loader_replay
+/harnesses/tflite/tflite_loader_fuzzer
 
 # safetensors Rust fuzz crate build output (vendor/ IS committed for offline reproducibility)
 /fuzz/target
