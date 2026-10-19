@@ -368,6 +368,107 @@ grep -Fq 'fixture: nightly toolchain unavailable' \
   exit 1
 }
 
+TFLITE_SOURCE="$WORK/tflite-source"
+TFLITE_COPY="$WORK/tflite-copy"
+cp -a "$SOURCE/." "$TFLITE_SOURCE/"
+rm "$TFLITE_SOURCE/scripts/check_fail.sh" "$TFLITE_SOURCE/scripts/check_skip.sh"
+mkdir -p "$TFLITE_SOURCE/data/targets/tflite/v2.20.0/source" \
+  "$TFLITE_SOURCE/harnesses/tflite"
+printf 'pinned archive fixture\n' \
+  >"$TFLITE_SOURCE/data/targets/tflite/v2.20.0/source/v2.20.0.tar.gz"
+cat >"$TFLITE_SOURCE/scripts/build_tflite_profiles.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$PWD" == "$PROJECT_ROOT" ]] || { echo 'TFLite builder ran from the wrong cwd' >&2; exit 81; }
+[[ "$TFLITE_TARGET_ROOT" == "$PROJECT_ROOT/data/targets/tflite/.check-suite-v2.20.0-"* \
+   && -d "$TFLITE_TARGET_ROOT" ]] \
+  || { echo 'TFLite builder did not receive a fresh copy-local target root' >&2; exit 82; }
+[[ "$TFLITE_ARCHIVE" == "$PROJECT_ROOT/data/targets/tflite/v2.20.0/source/v2.20.0.tar.gz" ]] \
+  || { echo 'TFLite builder did not receive the verified copy archive' >&2; exit 83; }
+[[ "$TFLITE_REPLAY" == "$PROJECT_ROOT/harnesses/tflite/tflite_loader_replay" \
+   && "$TFLITE_FUZZER" == "$PROJECT_ROOT/harnesses/tflite/tflite_loader_fuzzer" ]] \
+  || { echo 'TFLite builder outputs escaped the copy' >&2; exit 84; }
+[[ "$JOBS" == 4 && ! ${CMAKE+x} && ! ${NINJA+x} && ! ${CLANG+x} && ! ${CLANGXX+x} ]] \
+  || { echo 'TFLite builder inherited a tool or jobs override' >&2; exit 85; }
+printf '#!/usr/bin/env bash\necho copy-local-tflite-replay\n' >"$TFLITE_REPLAY"
+printf '#!/usr/bin/env bash\necho copy-local-tflite-fuzzer\n' >"$TFLITE_FUZZER"
+chmod +x "$TFLITE_REPLAY" "$TFLITE_FUZZER"
+printf '{}\n' >"$TFLITE_TARGET_ROOT/profile.json"
+printf '{}\n' >"$TFLITE_TARGET_ROOT/build-identity.json"
+printf 'copy-local TFLite build\n' >"$TFLITE_TARGET_ROOT/built.marker"
+echo '[fixture-tflite-build] rebuilt copy-local TFLite artifacts'
+EOF
+chmod +x "$TFLITE_SOURCE/scripts/build_tflite_profiles.sh"
+cat >"$TFLITE_SOURCE/scripts/check_tflite_copy.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$TFLITE_TARGET_ROOT" == "$PROJECT_ROOT/data/targets/tflite/.check-suite-v2.20.0-"* ]]
+grep -Fxq 'copy-local TFLite build' "$TFLITE_TARGET_ROOT/built.marker"
+[[ "$("$PROJECT_ROOT/harnesses/tflite/tflite_loader_replay")" == copy-local-tflite-replay ]]
+[[ "$("$PROJECT_ROOT/harnesses/tflite/tflite_loader_fuzzer")" == copy-local-tflite-fuzzer ]]
+EOF
+chmod +x "$TFLITE_SOURCE/scripts/check_tflite_copy.sh"
+cp -a "$TFLITE_SOURCE/." "$TFLITE_COPY/"
+rc=0
+TFLITE_TARGET_ROOT="$SOURCE/escaped-tflite-root" \
+TFLITE_ARCHIVE="$SOURCE/escaped-tflite-archive" \
+TFLITE_REPLAY="$SOURCE/escaped-tflite-replay" \
+TFLITE_FUZZER="$SOURCE/escaped-tflite-fuzzer" \
+CMAKE="$SOURCE/escaped-cmake" NINJA="$SOURCE/escaped-ninja" \
+CLANG="$SOURCE/escaped-clang" CLANGXX="$SOURCE/escaped-clangxx" JOBS=99 \
+bash "$TFLITE_SOURCE/scripts/run_check_suite.sh" --isolated-root "$TFLITE_COPY" \
+  --log-dir "$WORK/tflite-logs" >"$WORK/tflite.log" 2>&1 || rc=$?
+[[ "$rc" -eq 0 ]] || {
+  cat "$WORK/tflite.log"
+  echo "copy-local TFLite artifacts were not rebuilt (rc=$rc)" >&2
+  exit 1
+}
+grep -Fq 'check_tflite_copy.sh: PASS' "$WORK/tflite.log"
+grep -Fq '[fixture-tflite-build] rebuilt copy-local TFLite artifacts' \
+  "$WORK/tflite-logs/setup-tflite.log"
+[[ -z "$(find "$TFLITE_COPY/data/targets/tflite" -maxdepth 1 -type d \
+  -name '.check-suite-v2.20.0-*' -print -quit)" ]] || {
+  echo 'runner left its temporary TFLite target root behind' >&2
+  exit 1
+}
+[[ ! -e "$SOURCE/escaped-tflite-root" \
+   && ! -e "$SOURCE/escaped-tflite-archive" \
+   && ! -e "$SOURCE/escaped-tflite-replay" \
+   && ! -e "$SOURCE/escaped-tflite-fuzzer" ]] || {
+  echo 'copy-local TFLite builder wrote through an inherited output path' >&2
+  exit 1
+}
+
+cat >"$TFLITE_SOURCE/scripts/build_tflite_profiles.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'fixture: dependency download failed\n' >"$TFLITE_TARGET_ROOT/configure.log"
+echo 'fixture: TFLite configure failed' >&2
+exit 77
+EOF
+chmod +x "$TFLITE_SOURCE/scripts/build_tflite_profiles.sh"
+TFLITE_FAILURE_COPY="$WORK/tflite-failure-copy"
+cp -a "$TFLITE_SOURCE/." "$TFLITE_FAILURE_COPY/"
+rc=0
+bash "$TFLITE_SOURCE/scripts/run_check_suite.sh" --isolated-root "$TFLITE_FAILURE_COPY" \
+  --log-dir "$WORK/tflite-build-failure-logs" \
+  >"$WORK/tflite-build-failure.log" 2>&1 || rc=$?
+[[ "$rc" -eq 2 ]] || {
+  cat "$WORK/tflite-build-failure.log"
+  echo "TFLite build failure was not a setup refusal (rc=$rc)" >&2
+  exit 1
+}
+grep -Fq 'copy-local TFLite build failed rc=77' "$WORK/tflite-build-failure.log"
+grep -Fq 'fixture: TFLite configure failed' \
+  "$WORK/tflite-build-failure-logs/setup-tflite.log"
+grep -Fxq 'fixture: dependency download failed' \
+  "$WORK/tflite-build-failure-logs/setup-tflite-configure.log"
+[[ -z "$(find "$TFLITE_FAILURE_COPY/data/targets/tflite" -maxdepth 1 -type d \
+  -name '.check-suite-v2.20.0-*' -print -quit)" ]] || {
+  echo 'failed builder left its temporary TFLite target root behind' >&2
+  exit 1
+}
+
 NATIVE_SOURCE="$WORK/native-source"
 NATIVE_COPY="$WORK/native-copy"
 cp -a "$SOURCE/." "$NATIVE_SOURCE/"

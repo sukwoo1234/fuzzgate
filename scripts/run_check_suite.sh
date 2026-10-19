@@ -159,6 +159,16 @@ while IFS= read -r -d '' assignment; do
   esac
 done < <(env -0)
 
+suite_cleanup_paths=()
+suite_cleanup() {
+  local path
+  for path in "${suite_cleanup_paths[@]}"; do
+    [[ -n "$path" ]] && rm -rf -- "$path"
+  done
+}
+trap suite_cleanup EXIT
+suite_gate_env=()
+
 # R117: a source-built coverage binary embeds absolute source paths, so copying
 # the source-tree binary into the isolated tree makes raw-reset filtering fail.
 # The build script is already covered by the scripts/ identity check above.
@@ -211,6 +221,88 @@ elif [[ -e "$coverage_replay_source" || -L "$coverage_replay_source" \
   fail_setup 'safetensors coverage replay exists without its verified build script'
 fi
 
+# TFLite profile and fixture gates bind absolute paths for flatc, replay, the
+# shared-loader fuzzer, and linked libraries. A byte-for-byte copy therefore
+# cannot be valid in another root. Rebuild those artifacts inside a fresh,
+# runner-owned target root and pass only that root to the gates.
+tflite_builder_source="$SOURCE_ROOT/scripts/build_tflite_profiles.sh"
+tflite_builder_copy="$ISOLATED_ROOT/scripts/build_tflite_profiles.sh"
+tflite_archive_copy="$ISOLATED_ROOT/data/targets/tflite/v2.20.0/source/v2.20.0.tar.gz"
+tflite_replay_copy="$ISOLATED_ROOT/harnesses/tflite/tflite_loader_replay"
+tflite_fuzzer_copy="$ISOLATED_ROOT/harnesses/tflite/tflite_loader_fuzzer"
+if [[ -e "$tflite_builder_source" || -L "$tflite_builder_source" ]]; then
+  [[ -f "$tflite_builder_copy" && ! -L "$tflite_builder_copy" ]] \
+    || fail_setup 'isolated copy needs its own regular TFLite builder'
+  [[ -f "$tflite_archive_copy" && ! -L "$tflite_archive_copy" ]] \
+    || fail_setup 'isolated copy needs the pinned regular TFLite source archive'
+  archive_resolved="$(realpath -e -- "$tflite_archive_copy")" \
+    || fail_setup 'could not resolve copy-local TFLite source archive'
+  case "$archive_resolved/" in
+    "$ISOLATED_ROOT/"*) : ;;
+    *) fail_setup "TFLite source archive escaped isolated root: $archive_resolved" ;;
+  esac
+  [[ -d "$ISOLATED_ROOT/data/targets/tflite" \
+     && ! -L "$ISOLATED_ROOT/data/targets/tflite" ]] \
+    || fail_setup 'isolated copy needs its own regular TFLite target parent'
+  tflite_target_root="$(mktemp -d -- \
+    "$ISOLATED_ROOT/data/targets/tflite/.check-suite-v2.20.0-XXXXXX")" \
+    || fail_setup 'could not create a fresh copy-local TFLite target root'
+  suite_cleanup_paths+=("$tflite_target_root")
+  tflite_build_log="$LOG_DIR/setup-tflite.log"
+  tflite_build_rc=0
+  (
+    cd -- "$ISOLATED_ROOT"
+    env "${shell_env_unsets[@]}" \
+      -u PROJECT_ROOT -u WORKDIR -u TOOL_BIN \
+      -u TFLITE_TARGET_ROOT -u TFLITE_ARCHIVE \
+      -u TFLITE_REPLAY -u TFLITE_FUZZER \
+      -u JOBS -u CMAKE -u NINJA -u CLANG -u CLANGXX -u CC -u CXX \
+      PROJECT_ROOT="$ISOLATED_ROOT" \
+      TFLITE_TARGET_ROOT="$tflite_target_root" \
+      TFLITE_ARCHIVE="$tflite_archive_copy" \
+      TFLITE_REPLAY="$tflite_replay_copy" \
+      TFLITE_FUZZER="$tflite_fuzzer_copy" JOBS=4 \
+      bash -p scripts/build_tflite_profiles.sh
+  ) >"$tflite_build_log" 2>&1 || tflite_build_rc=$?
+  if [[ "$tflite_build_rc" -ne 0 ]]; then
+    for build_log_name in configure.log patch.log build.log; do
+      build_log_path="$tflite_target_root/$build_log_name"
+      if [[ -f "$build_log_path" && ! -L "$build_log_path" ]]; then
+        cp -- "$build_log_path" \
+          "$LOG_DIR/setup-tflite-${build_log_name%.log}.log" \
+          || fail_setup "could not preserve failed TFLite $build_log_name"
+      fi
+    done
+    fail_setup "copy-local TFLite build failed rc=$tflite_build_rc (log: $tflite_build_log)"
+  fi
+  for artifact in \
+    "$tflite_replay_copy" \
+    "$tflite_fuzzer_copy" \
+    "$tflite_target_root/profile.json" \
+    "$tflite_target_root/build-identity.json"
+  do
+    [[ -f "$artifact" && ! -L "$artifact" ]] \
+      || fail_setup "copy-local TFLite build produced no regular artifact: $artifact"
+    artifact_resolved="$(realpath -e -- "$artifact")" \
+      || fail_setup "could not resolve copy-local TFLite artifact: $artifact"
+    case "$artifact_resolved/" in
+      "$ISOLATED_ROOT/"*) : ;;
+      *) fail_setup "TFLite build artifact escaped isolated root: $artifact_resolved" ;;
+    esac
+  done
+  [[ -x "$tflite_replay_copy" && -x "$tflite_fuzzer_copy" ]] \
+    || fail_setup 'copy-local TFLite replay and fuzzer must be executable'
+  suite_gate_env+=(
+    "TFLITE_TARGET_ROOT=$tflite_target_root"
+    "TFLITE_REPLAY=$tflite_replay_copy"
+    "TFLITE_FUZZER=$tflite_fuzzer_copy"
+  )
+  printf '[suite] rebuilt TFLite artifacts target_root=%s log=%s\n' \
+    "$tflite_target_root" "$tflite_build_log"
+elif compgen -G "$SOURCE_ROOT/scripts/check_tflite_*.sh" >/dev/null; then
+  fail_setup 'TFLite gates exist without their verified build script'
+fi
+
 printf '[suite] source=%s\n[suite] isolated=%s\n[suite] logs=%s\n' \
   "$SOURCE_ROOT" "$ISOLATED_ROOT" "$LOG_DIR"
 printf '[suite] ALLOW_SKIPPED_CASES is unset for every gate\n'
@@ -242,6 +334,7 @@ for gate in "${copy_checks[@]}"; do
         -u REPLAY -u FUZZER -u AFLPP_REPLAY -u LEGACY_PROBE -u SRC \
         -u LIBFUZZER_DRIVER -u AFLPP_CONTAINER_TOOL \
         -u TOOL_LIBFUZZER_CMD -u TOOL_AFLPP_CMD \
+        "${suite_gate_env[@]}" \
         PROJECT_ROOT="$ISOLATED_ROOT" WORKDIR="$ISOLATED_ROOT" \
         TOOL_BIN="$ISOLATED_ROOT/target/debug/tool" \
         bash -p "scripts/$name"
