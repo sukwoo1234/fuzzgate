@@ -1959,12 +1959,18 @@ fn handle_entity_view(app_paths: &AppPaths, kind: &str, id: &str) -> Result<Resp
         "run" => (
             format!("Run Detail: {id}"),
             entity("runs", "status.json"),
-            vec![entity("runs", "logs/backend-engine-w1.log")],
+            vec![
+                entity("runs", "input-manifest.json"),
+                entity("runs", "logs/backend-engine-w1.log"),
+            ],
         ),
         "triage" => (
             format!("Triage Detail: {id}"),
             entity("triage", "summary.json"),
-            vec![entity("triage", "attempt-1.log")],
+            vec![
+                entity("triage", "input-manifest.json"),
+                entity("triage", "attempt-1.log"),
+            ],
         ),
         "report" => (
             format!("Report Detail: {id}"),
@@ -3175,6 +3181,67 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // TFL-06: the browser and `tool export` must expose the same preserved-input
+    // manifest. A raw status/summary page without this link cannot be used to
+    // compare the input hash shown by the UI with the exported evidence bundle.
+    #[test]
+    fn tfl06_profiled_result_pages_expose_input_manifest_evidence() {
+        let root = unique_tmp_dir("tfl06-input-manifest");
+        let app_paths = AppPaths {
+            data_dir: root.join("data"),
+            seeds_dir: root.join("seeds"),
+        };
+        for (directory, id, primary, body) in [
+            ("runs", "run-tfl06", "status.json", r#"{"target":"tflite"}"#),
+            (
+                "triage",
+                "triage-tfl06",
+                "summary.json",
+                r#"{"target":"tflite","verdict":"reproduced"}"#,
+            ),
+        ] {
+            let result_dir = app_paths.data_dir.join(directory).join(id);
+            fs::create_dir_all(&result_dir).expect("result dir");
+            fs::write(result_dir.join(primary), body).expect("primary result");
+            fs::write(
+                result_dir.join("input-manifest.json"),
+                r#"{"schema_version":"1","files":[{"path":"input/model.tflite","size_bytes":4,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+            )
+            .expect("input manifest");
+        }
+
+        let security = secured("tok");
+        for path in ["/run/run-tfl06", "/triage/triage-tfl06"] {
+            let response = respond_to_request(&app_paths, &security, &request("GET", path));
+            assert_eq!(response.status, "200 OK", "{}", response.body);
+            assert!(
+                response.body.contains("input-manifest.json"),
+                "{path} omitted the preserved-input manifest: {}",
+                response.body
+            );
+        }
+        let manifest_path = app_paths
+            .data_dir
+            .join("runs")
+            .join("run-tfl06")
+            .join("input-manifest.json");
+        let file_route = format!(
+            "/file?path={}",
+            super::url_encode(&manifest_path.display().to_string())
+        );
+        let manifest = respond_to_request(&app_paths, &security, &request("GET", &file_route));
+        assert_eq!(manifest.status, "200 OK", "{}", manifest.body);
+        assert!(
+            manifest
+                .body
+                .contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "the UI file route changed the preserved-input hash: {}",
+            manifest.body
+        );
+
+        fs::remove_dir_all(&root).expect("remove fixture tree");
     }
 
     #[test]
