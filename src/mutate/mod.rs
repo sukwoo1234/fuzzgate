@@ -2,6 +2,7 @@ pub(crate) mod common;
 mod gguf;
 mod onnx;
 mod safetensors;
+mod tflite;
 
 use std::path::Path;
 
@@ -42,8 +43,11 @@ pub(crate) fn run_mutate_pipeline(
                 target, input, out, input_dir, out_dir, count, seed, &resolved,
             )
         }
-        TargetKind::Tflite => Err(
-            "target 'tflite' is registered but structural mutation is not implemented".to_string(),
-        ),
+        TargetKind::Tflite => {
+            let resolved = tflite::validate_operators(operators)?;
+            tflite::run(
+                target, input, out, input_dir, out_dir, count, seed, &resolved,
+            )
+        }
     }
 }

@@ -171,7 +171,7 @@ const TARGET_SPECS: &[TargetSpec] = &[
         coverage_env_key: None,
         coverage_runner: None,
         external_harness_env: "TOOL_TFLITE_HARNESS_CMD",
-        mutation_supported: false,
+        mutation_supported: true,
         campaign_supported: false,
         ui_supported: false,
         preset: TargetPreset {

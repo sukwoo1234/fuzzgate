@@ -17,6 +17,7 @@ BUILD_DIR="$TARGET_ROOT/build/cmake"
 FIXTURE_DIR="$TARGET_ROOT/fixtures"
 OUT_REPLAY="${TFLITE_REPLAY:-$PROJECT_ROOT/harnesses/tflite/tflite_loader_replay}"
 OUT_FUZZER="${TFLITE_FUZZER:-$PROJECT_ROOT/harnesses/tflite/tflite_loader_fuzzer}"
+OUT_MUTATOR="${TFLITE_MUTATOR:-$PROJECT_ROOT/harnesses/tflite/tflite_structural_mutator}"
 PROFILE="$TARGET_ROOT/profile.json"
 IDENTITY="$TARGET_ROOT/build-identity.json"
 JOBS="${JOBS:-4}"
@@ -37,6 +38,10 @@ case "$TARGET_ROOT" in
 esac
 [[ "$OUT_REPLAY" != "$OUT_FUZZER" ]] \
   || fail "replay and fuzzer outputs must differ: $OUT_REPLAY"
+[[ "$OUT_REPLAY" != "$OUT_MUTATOR" ]] \
+  || fail "replay and mutator outputs must differ: $OUT_REPLAY"
+[[ "$OUT_FUZZER" != "$OUT_MUTATOR" ]] \
+  || fail "fuzzer and mutator outputs must differ: $OUT_FUZZER"
 
 CMAKE="${CMAKE:-$(command -v cmake || true)}"
 NINJA="${NINJA:-$(command -v ninja || true)}"
@@ -171,41 +176,51 @@ done
 [[ -d "$BUILD_DIR/fft2d" ]] || fail "configured fft2d source is missing"
 [[ -d "$BUILD_DIR/neon2sse" ]] || fail "configured neon2sse source is missing"
 
-log "building pinned flatc, replay, and shared-loader fuzzer (jobs=$JOBS)"
-"$CMAKE" --build "$BUILD_DIR" --target flatbuffers-flatc tflite_loader_replay tflite_loader_fuzzer -j"$JOBS" \
+log "building pinned flatc, replay, shared-loader fuzzer, and schema mutator (jobs=$JOBS)"
+"$CMAKE" --build "$BUILD_DIR" --target flatbuffers-flatc tflite_loader_replay tflite_loader_fuzzer tflite_structural_mutator -j"$JOBS" \
   >"$TARGET_ROOT/build.log" 2>&1 \
   || fail "loader build failed; see $TARGET_ROOT/build.log"
 built_replay="$BUILD_DIR/tflite_loader_replay"
 built_fuzzer="$BUILD_DIR/tflite_loader_fuzzer"
+built_mutator="$BUILD_DIR/tflite_structural_mutator"
 flatc_binary="$BUILD_DIR/flatbuffers-flatc/bin/flatc"
 [[ -x "$built_replay" ]] || fail "build produced no replay executable: $built_replay"
 [[ -x "$built_fuzzer" ]] || fail "build produced no fuzzer executable: $built_fuzzer"
+[[ -x "$built_mutator" ]] || fail "build produced no structural mutator executable: $built_mutator"
 [[ -x "$flatc_binary" ]] || fail "build produced no pinned flatc executable: $flatc_binary"
 
 # shellcheck source=lib/staged_install.sh
 . "$SCRIPT_DIR/lib/staged_install.sh"
 staged_target OUT_REPLAY || exit 1
 staged_target OUT_FUZZER || exit 1
+staged_target OUT_MUTATOR || exit 1
 [[ "$OUT_REPLAY" != "$OUT_FUZZER" ]] \
   || fail "replay and fuzzer outputs must differ after symlink resolution: $OUT_REPLAY"
+[[ "$OUT_REPLAY" != "$OUT_MUTATOR" ]] \
+  || fail "replay and mutator outputs must differ after symlink resolution: $OUT_REPLAY"
+[[ "$OUT_FUZZER" != "$OUT_MUTATOR" ]] \
+  || fail "fuzzer and mutator outputs must differ after symlink resolution: $OUT_FUZZER"
 trap staged_cleanup EXIT
 staged_new "$OUT_REPLAY" STAGED_REPLAY || exit 1
 staged_new "$OUT_FUZZER" STAGED_FUZZER || exit 1
+staged_new "$OUT_MUTATOR" STAGED_MUTATOR || exit 1
 cp -- "$built_replay" "$STAGED_REPLAY"
 cp -- "$built_fuzzer" "$STAGED_FUZZER"
+cp -- "$built_mutator" "$STAGED_MUTATOR"
 staged_commit "$STAGED_REPLAY" "$OUT_REPLAY" || exit 1
 staged_commit "$STAGED_FUZZER" "$OUT_FUZZER" || exit 1
+staged_commit "$STAGED_MUTATOR" "$OUT_MUTATOR" || exit 1
 trap - EXIT
 
 mkdir -p -- "$FIXTURE_DIR"
 cp -- "$SOURCE_DIR/tensorflow/lite/testdata/add.bin" "$FIXTURE_DIR/add.tflite"
 
-"$NINJA" -C "$BUILD_DIR" -t commands tflite_loader_replay tflite_loader_fuzzer \
+"$NINJA" -C "$BUILD_DIR" -t commands tflite_loader_replay tflite_loader_fuzzer tflite_structural_mutator \
   >"$TARGET_ROOT/link-commands.txt"
 
 python3 -B - \
   "$IDENTITY" "$PROFILE" "$ARCHIVE" "$SOURCE_DIR" "$BUILD_DIR" \
-  "$OUT_REPLAY" "$OUT_FUZZER" "$FIXTURE_DIR/add.tflite" "$CLANGXX" "$CLANGXX_INVOKE" "$CMAKE" "$PATCH" "$flatc_binary" \
+  "$OUT_REPLAY" "$OUT_FUZZER" "$OUT_MUTATOR" "$FIXTURE_DIR/add.tflite" "$CLANGXX" "$CLANGXX_INVOKE" "$CMAKE" "$PATCH" "$flatc_binary" \
   "$TARGET_ROOT/link-commands.txt" "$TFLITE_URL" "$TFLITE_COMMIT" <<'PY'
 import hashlib
 import json
@@ -222,6 +237,7 @@ import sys
     build_root,
     replay_path,
     fuzzer_path,
+    mutator_path,
     add_model_path,
     compiler_path,
     compiler_invocation_path,
@@ -314,6 +330,10 @@ fuzzer_link_command = next((line for line in reversed(link_lines) if " -o tflite
 if fuzzer_link_command is None:
     raise SystemExit("could not identify fuzzer link command")
 fuzzer_link_command_sha = hashlib.sha256((fuzzer_link_command + "\n").encode()).hexdigest()
+mutator_link_command = next((line for line in reversed(link_lines) if " -o tflite_structural_mutator" in line), None)
+if mutator_link_command is None:
+    raise SystemExit("could not identify structural mutator link command")
+mutator_link_command_sha = hashlib.sha256((mutator_link_command + "\n").encode()).hexdigest()
 
 critical_options = {
     "BUILD_SHARED_LIBS": "OFF",
@@ -337,6 +357,7 @@ compile_flags = [
 compiler_sha = file_sha(compiler_path)
 replay_sha = file_sha(replay_path)
 fuzzer_sha = file_sha(fuzzer_path)
+mutator_sha = file_sha(mutator_path)
 main_library = os.path.join(build_root, "tensorflow-lite", "libtensorflow-lite.a")
 loader_library = os.path.join(build_root, "libtool_tflite_loader.a")
 
@@ -365,8 +386,11 @@ identity = {
     "compile_flags": compile_flags,
     "link_command_sha256": link_command_sha,
     "fuzzer_link_command_sha256": fuzzer_link_command_sha,
+    "structural_mutator_link_command_sha256": mutator_link_command_sha,
     "replay_sha256": replay_sha,
     "fuzzer_sha256": fuzzer_sha,
+    "structural_mutator_path": mutator_path,
+    "structural_mutator_sha256": mutator_sha,
     "add_model_sha256": file_sha(add_model_path),
 }
 
@@ -432,5 +456,5 @@ for path, document in [(identity_path, identity), (profile_path, profile)]:
 PY
 
 log "done"
-printf 'replay=%s\nfuzzer=%s\nprofile=%s\nidentity=%s\n' \
-  "$OUT_REPLAY" "$OUT_FUZZER" "$PROFILE" "$IDENTITY"
+printf 'replay=%s\nfuzzer=%s\nmutator=%s\nprofile=%s\nidentity=%s\n' \
+  "$OUT_REPLAY" "$OUT_FUZZER" "$OUT_MUTATOR" "$PROFILE" "$IDENTITY"

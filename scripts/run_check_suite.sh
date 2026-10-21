@@ -230,6 +230,7 @@ tflite_builder_copy="$ISOLATED_ROOT/scripts/build_tflite_profiles.sh"
 tflite_archive_copy="$ISOLATED_ROOT/data/targets/tflite/v2.20.0/source/v2.20.0.tar.gz"
 tflite_replay_copy="$ISOLATED_ROOT/harnesses/tflite/tflite_loader_replay"
 tflite_fuzzer_copy="$ISOLATED_ROOT/harnesses/tflite/tflite_loader_fuzzer"
+tflite_mutator_copy="$ISOLATED_ROOT/harnesses/tflite/tflite_structural_mutator"
 if [[ -e "$tflite_builder_source" || -L "$tflite_builder_source" ]]; then
   [[ -f "$tflite_builder_copy" && ! -L "$tflite_builder_copy" ]] \
     || fail_setup 'isolated copy needs its own regular TFLite builder'
@@ -255,13 +256,14 @@ if [[ -e "$tflite_builder_source" || -L "$tflite_builder_source" ]]; then
     env "${shell_env_unsets[@]}" \
       -u PROJECT_ROOT -u WORKDIR -u TOOL_BIN \
       -u TFLITE_TARGET_ROOT -u TFLITE_ARCHIVE \
-      -u TFLITE_REPLAY -u TFLITE_FUZZER \
+      -u TFLITE_REPLAY -u TFLITE_FUZZER -u TFLITE_MUTATOR \
       -u JOBS -u CMAKE -u NINJA -u CLANG -u CLANGXX -u CC -u CXX \
       PROJECT_ROOT="$ISOLATED_ROOT" \
       TFLITE_TARGET_ROOT="$tflite_target_root" \
       TFLITE_ARCHIVE="$tflite_archive_copy" \
       TFLITE_REPLAY="$tflite_replay_copy" \
-      TFLITE_FUZZER="$tflite_fuzzer_copy" JOBS=4 \
+      TFLITE_FUZZER="$tflite_fuzzer_copy" \
+      TFLITE_MUTATOR="$tflite_mutator_copy" JOBS=4 \
       bash -p scripts/build_tflite_profiles.sh
   ) >"$tflite_build_log" 2>&1 || tflite_build_rc=$?
   if [[ "$tflite_build_rc" -ne 0 ]]; then
@@ -278,6 +280,7 @@ if [[ -e "$tflite_builder_source" || -L "$tflite_builder_source" ]]; then
   for artifact in \
     "$tflite_replay_copy" \
     "$tflite_fuzzer_copy" \
+    "$tflite_mutator_copy" \
     "$tflite_target_root/profile.json" \
     "$tflite_target_root/build-identity.json"
   do
@@ -290,12 +293,14 @@ if [[ -e "$tflite_builder_source" || -L "$tflite_builder_source" ]]; then
       *) fail_setup "TFLite build artifact escaped isolated root: $artifact_resolved" ;;
     esac
   done
-  [[ -x "$tflite_replay_copy" && -x "$tflite_fuzzer_copy" ]] \
-    || fail_setup 'copy-local TFLite replay and fuzzer must be executable'
+  [[ -x "$tflite_replay_copy" && -x "$tflite_fuzzer_copy" \
+     && -x "$tflite_mutator_copy" ]] \
+    || fail_setup 'copy-local TFLite replay, fuzzer, and mutator must be executable'
   suite_gate_env+=(
     "TFLITE_TARGET_ROOT=$tflite_target_root"
     "TFLITE_REPLAY=$tflite_replay_copy"
     "TFLITE_FUZZER=$tflite_fuzzer_copy"
+    "TFLITE_MUTATOR=$tflite_mutator_copy"
   )
   printf '[suite] rebuilt TFLite artifacts target_root=%s log=%s\n' \
     "$tflite_target_root" "$tflite_build_log"

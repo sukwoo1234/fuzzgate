@@ -22,6 +22,9 @@ target_link_libraries(tool_tflite_loader PUBLIC tensorflow-lite)
 add_executable(tflite_loader_replay replay.cc)
 target_link_libraries(tflite_loader_replay PRIVATE tool_tflite_loader)
 
+add_executable(tflite_structural_mutator structural_mutator.cc)
+target_link_libraries(tflite_structural_mutator PRIVATE tensorflow-lite)
+
 if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   message(FATAL_ERROR "tflite_loader_fuzzer requires Clang libFuzzer support")
 endif()

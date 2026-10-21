@@ -44,6 +44,38 @@ else
     bad "build did not reject colliding replay and fuzzer outputs (rc=$collision_rc)"
     sed -n '1,20p' "$WORK/output-collision.log" >&2
   fi
+
+  replay_mutator_out="$WORK/colliding-replay-mutator"
+  env \
+    TFLITE_TARGET_ROOT="$WORK/missing-target" \
+    TFLITE_REPLAY="$replay_mutator_out" \
+    TFLITE_FUZZER="$WORK/separate-fuzzer" \
+    TFLITE_MUTATOR="$replay_mutator_out" \
+    bash "$BUILD_SCRIPT" >"$WORK/replay-mutator-collision.log" 2>&1
+  replay_mutator_rc=$?
+  if [[ "$replay_mutator_rc" -ne 0 ]] \
+      && grep -Fq 'replay and mutator outputs must differ' "$WORK/replay-mutator-collision.log"; then
+    ok "build refuses colliding replay and mutator outputs before configuration"
+  else
+    bad "build did not reject colliding replay and mutator outputs (rc=$replay_mutator_rc)"
+    sed -n '1,20p' "$WORK/replay-mutator-collision.log" >&2
+  fi
+
+  fuzzer_mutator_out="$WORK/colliding-fuzzer-mutator"
+  env \
+    TFLITE_TARGET_ROOT="$WORK/missing-target" \
+    TFLITE_REPLAY="$WORK/separate-replay" \
+    TFLITE_FUZZER="$fuzzer_mutator_out" \
+    TFLITE_MUTATOR="$fuzzer_mutator_out" \
+    bash "$BUILD_SCRIPT" >"$WORK/fuzzer-mutator-collision.log" 2>&1
+  fuzzer_mutator_rc=$?
+  if [[ "$fuzzer_mutator_rc" -ne 0 ]] \
+      && grep -Fq 'fuzzer and mutator outputs must differ' "$WORK/fuzzer-mutator-collision.log"; then
+    ok "build refuses colliding fuzzer and mutator outputs before configuration"
+  else
+    bad "build did not reject colliding fuzzer and mutator outputs (rc=$fuzzer_mutator_rc)"
+    sed -n '1,20p' "$WORK/fuzzer-mutator-collision.log" >&2
+  fi
 fi
 
 fixtures_ready=1

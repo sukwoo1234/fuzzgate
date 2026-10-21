@@ -2,13 +2,15 @@
 
 > "퍼징으로 찾았다"에서 끝내지 않고, **재현·검증·리포트까지 연결하는 자동화**를 목표로 하는 버그바운티용 퍼징 플랫폼.
 
-## 구현 상태 (2026-09-27)
+## 구현 상태 (2026-10-19)
 
-아래 상태는 공개 개발 브랜치의 [검증 기준 커밋 `12123c7`](https://github.com/sukwoo1234/fuzzgate/tree/12123c71196d05c02a22f59673ca1ccc14c1367f)을 기준으로 한다. 기본 `main`은 구현 범위가 다르다.
+아래 구현 상태는 이 문서가 포함된 공개 개발 브랜치 커밋을 기준으로 한다. 2026-09-27 실행
+검증 기준점은 [`12123c7`](https://github.com/sukwoo1234/fuzzgate/tree/12123c71196d05c02a22f59673ca1ccc14c1367f)이며,
+그 이후 기능의 장비 검증 범위는 각 항목의 설명대로 구분한다. 기본 `main`은 구현 범위가 다르다.
 
 | 기능 | 현재 상태 |
 | --- | --- |
-| 포맷 구조/필드 기반 corpus mutator | ONNX·GGUF·safetensors용 `tool mutate` 구현. 완전한 문법 보존 인프로세스 custom mutator와는 구분 |
+| 포맷 구조/필드 기반 corpus mutator | ONNX·GGUF·safetensors·TFLite용 `tool mutate` 구현. 완전한 문법 보존 인프로세스 custom mutator와는 구분 |
 | 3회 triage·스택 서명 비교 | 코드 구현. 2026-09-27 사용자 WSL 실행에서 정상 ONNX 입력은 `clean_count=3`, `crashed_count=0`, `not_reproduced`. 비공개 크래시 PoC 검증은 남음 |
 | crash severity·CVSS 후보 | 규칙 기반 제안 구현. 최종 등급은 사람이 확인 |
 | 레지스터·PC 제어 기반 RCE 등급화 | 계획 단계 |
@@ -32,12 +34,12 @@
 
 ## RCE 후보 검토 범위
 - 핵심 본체는 **하네스/뮤테이터/triage**이며, 공개 방향은 [first.md](first.md)에 정리한다.
-- **Format-Aware Mutator**: ONNX·GGUF·safetensors의 구조와 필드를 인식하는 corpus mutation CLI를 구현했다.
+- **Format-Aware Mutator**: ONNX·GGUF·safetensors·TFLite의 구조와 필드를 인식하는 corpus mutation CLI를 구현했다.
 - **Targeted Harness**: 포맷 검사와 로더 호출 경로가 있다. 세부 경로 도달 여부는 실행 결과로 확인한다.
 - **Exploitability Triage**: 규칙 기반 severity·CVSS 후보를 제안한다. 레지스터·스택·PC 오염에 따른 RCE 등급 부여는 향후 범위다.
 
 ## 핵심 목표
-- 대상 포맷: **GGUF / ONNX / safetensors**
+- 대상 포맷: **GGUF / ONNX / safetensors / TFLite**
 - 유효 버그 기준: **SEGV/Abort + 동일 입력 3회 재현 + 상위 3프레임 동일**
 - 자동화 범위: **퍼징 실행 → 크래시 감지 → 재현 검증 → 리포트 초안 생성**
 
@@ -110,6 +112,14 @@ Stage E로 GGUF 뮤테이터가 ONNX급으로 넓어지면서 기본 세트가 *
 `byte_flip`은 `--operator byte_flip`으로 지정할 때만 사용한다. 배치에서 적용할 필드가
 없는 시드는 건너뛰므로, 재현할 때는 연산자와 시드를 명시하고 `requested`·`generated`를
 함께 확인한다.
+
+### TFLite 기본 세트
+
+`tool mutate --target tflite`는 고정된 TensorFlow Lite v2.20.0 스키마로 모델을 다시 직렬화한다.
+shape, dtype/quantization, buffer payload, builtin options, tensor reference, name/metadata의
+정상 구조 변이 6종과 의도적 거부형 6종을 제공한다. 각 결과의 manifest에는 바뀐 필드의
+before/after와 예상 loader 분류가 기록되며, 적용할 필드가 없으면 출력 없이 명시적으로 실패한다.
+이 기능은 corpus 생성용이다. 대상 객체 피드백 기반 엔진이나 TFLite campaign 지원을 뜻하지 않는다.
 
 ## 기본 경로
 - 데이터: `./data`

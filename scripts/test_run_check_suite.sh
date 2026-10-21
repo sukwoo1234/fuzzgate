@@ -386,13 +386,15 @@ set -euo pipefail
 [[ "$TFLITE_ARCHIVE" == "$PROJECT_ROOT/data/targets/tflite/v2.20.0/source/v2.20.0.tar.gz" ]] \
   || { echo 'TFLite builder did not receive the verified copy archive' >&2; exit 83; }
 [[ "$TFLITE_REPLAY" == "$PROJECT_ROOT/harnesses/tflite/tflite_loader_replay" \
-   && "$TFLITE_FUZZER" == "$PROJECT_ROOT/harnesses/tflite/tflite_loader_fuzzer" ]] \
+   && "$TFLITE_FUZZER" == "$PROJECT_ROOT/harnesses/tflite/tflite_loader_fuzzer" \
+   && "$TFLITE_MUTATOR" == "$PROJECT_ROOT/harnesses/tflite/tflite_structural_mutator" ]] \
   || { echo 'TFLite builder outputs escaped the copy' >&2; exit 84; }
 [[ "$JOBS" == 4 && ! ${CMAKE+x} && ! ${NINJA+x} && ! ${CLANG+x} && ! ${CLANGXX+x} ]] \
   || { echo 'TFLite builder inherited a tool or jobs override' >&2; exit 85; }
 printf '#!/usr/bin/env bash\necho copy-local-tflite-replay\n' >"$TFLITE_REPLAY"
 printf '#!/usr/bin/env bash\necho copy-local-tflite-fuzzer\n' >"$TFLITE_FUZZER"
-chmod +x "$TFLITE_REPLAY" "$TFLITE_FUZZER"
+printf '#!/usr/bin/env bash\necho copy-local-tflite-mutator\n' >"$TFLITE_MUTATOR"
+chmod +x "$TFLITE_REPLAY" "$TFLITE_FUZZER" "$TFLITE_MUTATOR"
 printf '{}\n' >"$TFLITE_TARGET_ROOT/profile.json"
 printf '{}\n' >"$TFLITE_TARGET_ROOT/build-identity.json"
 printf 'copy-local TFLite build\n' >"$TFLITE_TARGET_ROOT/built.marker"
@@ -406,6 +408,7 @@ set -euo pipefail
 grep -Fxq 'copy-local TFLite build' "$TFLITE_TARGET_ROOT/built.marker"
 [[ "$("$PROJECT_ROOT/harnesses/tflite/tflite_loader_replay")" == copy-local-tflite-replay ]]
 [[ "$("$PROJECT_ROOT/harnesses/tflite/tflite_loader_fuzzer")" == copy-local-tflite-fuzzer ]]
+[[ "$("$PROJECT_ROOT/harnesses/tflite/tflite_structural_mutator")" == copy-local-tflite-mutator ]]
 EOF
 chmod +x "$TFLITE_SOURCE/scripts/check_tflite_copy.sh"
 cp -a "$TFLITE_SOURCE/." "$TFLITE_COPY/"
@@ -414,6 +417,7 @@ TFLITE_TARGET_ROOT="$SOURCE/escaped-tflite-root" \
 TFLITE_ARCHIVE="$SOURCE/escaped-tflite-archive" \
 TFLITE_REPLAY="$SOURCE/escaped-tflite-replay" \
 TFLITE_FUZZER="$SOURCE/escaped-tflite-fuzzer" \
+TFLITE_MUTATOR="$SOURCE/escaped-tflite-mutator" \
 CMAKE="$SOURCE/escaped-cmake" NINJA="$SOURCE/escaped-ninja" \
 CLANG="$SOURCE/escaped-clang" CLANGXX="$SOURCE/escaped-clangxx" JOBS=99 \
 bash "$TFLITE_SOURCE/scripts/run_check_suite.sh" --isolated-root "$TFLITE_COPY" \
@@ -434,7 +438,8 @@ grep -Fq '[fixture-tflite-build] rebuilt copy-local TFLite artifacts' \
 [[ ! -e "$SOURCE/escaped-tflite-root" \
    && ! -e "$SOURCE/escaped-tflite-archive" \
    && ! -e "$SOURCE/escaped-tflite-replay" \
-   && ! -e "$SOURCE/escaped-tflite-fuzzer" ]] || {
+   && ! -e "$SOURCE/escaped-tflite-fuzzer" \
+   && ! -e "$SOURCE/escaped-tflite-mutator" ]] || {
   echo 'copy-local TFLite builder wrote through an inherited output path' >&2
   exit 1
 }

@@ -46,7 +46,7 @@ expected = {
     "coverage_env_key": None,
     "coverage_runner": None,
     "external_harness_env": "TOOL_TFLITE_HARNESS_CMD",
-    "mutation_supported": False,
+    "mutation_supported": True,
     "campaign_supported": False,
     "ui_supported": False,
 }
@@ -55,9 +55,9 @@ for key, value in expected.items():
         raise SystemExit(f"{key}: expected {value!r}, observed {document.get(key)!r}")
 PY
   then
-    ok "registry exposes the TFL-01-only capability boundary"
+    ok "registry exposes loader and structural-mutation capabilities only"
   else
-    bad "registry does not expose the TFL-01-only capability boundary"
+    bad "registry does not expose the loader and structural-mutation capability boundary"
     sed -n '1,12p' "$WORK/target-spec.log" >&2
   fi
 fi
