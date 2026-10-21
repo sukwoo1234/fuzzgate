@@ -46,6 +46,10 @@ fn expected_coverage_runner(target: &TargetKind) -> Result<TrustedCoverageRunner
             name: "scripts/run_coverage_safetensors.sh",
             bytes: include_bytes!("../scripts/run_coverage_safetensors.sh"),
         }),
+        Some("scripts/run_coverage_tflite.sh") => Ok(TrustedCoverageRunner {
+            name: "scripts/run_coverage_tflite.sh",
+            bytes: include_bytes!("../scripts/run_coverage_tflite.sh"),
+        }),
         Some(other) => Err(format!(
             "target '{}' registers unknown coverage runner '{other}'",
             target_label(target)
@@ -666,6 +670,10 @@ mod tests {
             coverage_cmd_env_key(&TargetKind::Safetensors).unwrap(),
             "TOOL_COVERAGE_SAFETENSORS_CMD"
         );
+        assert_eq!(
+            coverage_cmd_env_key(&TargetKind::Tflite).unwrap(),
+            "TOOL_COVERAGE_TFLITE_CMD"
+        );
     }
 
     #[test]
@@ -678,6 +686,7 @@ mod tests {
                 TargetKind::Safetensors,
                 "scripts/run_coverage_safetensors.sh",
             ),
+            (TargetKind::Tflite, "scripts/run_coverage_tflite.sh"),
         ] {
             let runner = root.join(name);
             let configured = format!("bash {}", runner.display());

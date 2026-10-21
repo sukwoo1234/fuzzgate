@@ -43,8 +43,8 @@ expected = {
     "seed_subdir": "tflite",
     "input_ext": "tflite",
     "storage_name": "tensorflow-lite",
-    "coverage_env_key": None,
-    "coverage_runner": None,
+    "coverage_env_key": "TOOL_COVERAGE_TFLITE_CMD",
+    "coverage_runner": "scripts/run_coverage_tflite.sh",
     "external_harness_env": "TOOL_TFLITE_HARNESS_CMD",
     "mutation_supported": True,
     "campaign_supported": False,
@@ -55,9 +55,9 @@ for key, value in expected.items():
         raise SystemExit(f"{key}: expected {value!r}, observed {document.get(key)!r}")
 PY
   then
-    ok "registry exposes loader and structural-mutation capabilities only"
+    ok "registry exposes loader, structural mutation, and source coverage"
   else
-    bad "registry does not expose the loader and structural-mutation capability boundary"
+    bad "registry does not expose the TFLite capability boundary"
     sed -n '1,12p' "$WORK/target-spec.log" >&2
   fi
 fi

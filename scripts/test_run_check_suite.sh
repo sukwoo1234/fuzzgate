@@ -401,6 +401,48 @@ printf 'copy-local TFLite build\n' >"$TFLITE_TARGET_ROOT/built.marker"
 echo '[fixture-tflite-build] rebuilt copy-local TFLite artifacts'
 EOF
 chmod +x "$TFLITE_SOURCE/scripts/build_tflite_profiles.sh"
+cat >"$TFLITE_SOURCE/scripts/build_tflite_guided.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$PWD" == "$PROJECT_ROOT" && "$JOBS" == 4 ]] \
+  || { echo 'guided builder ran with the wrong cwd or jobs' >&2; exit 86; }
+[[ "$TFLITE_ARCHIVE" == "$PROJECT_ROOT/data/targets/tflite/v2.20.0/source/v2.20.0.tar.gz" ]] \
+  || { echo 'guided builder did not receive the verified copy archive' >&2; exit 90; }
+[[ ! ${TFLITE_GUIDED_BUILD_DIR+x} && ! ${TFLITE_SOURCE_DIR+x} \
+   && ! ${TFLITE_BASE_BUILD_DIR+x} && ! ${TFLITE_FIXTURE+x} \
+   && ! ${LLVM_NM+x} && ! ${LLVM_OBJDUMP+x} && ! ${CLANG_BUNDLE_DIR+x} ]] \
+  || { echo 'guided builder inherited a path or tool override' >&2; exit 87; }
+root="$TFLITE_TARGET_ROOT/build/guided-cmake"
+mkdir -p "$root/tensorflow-lite"
+printf 'guided target archive\n' >"$root/tensorflow-lite/libtensorflow-lite.a"
+printf '#!/usr/bin/env bash\necho guided fuzzer\n' >"$root/tflite_loader_fuzzer"
+chmod +x "$root/tflite_loader_fuzzer"
+printf '{}\n' >"$TFLITE_TARGET_ROOT/guided-instrumentation.json"
+printf 'copy-local guided build\n' >"$TFLITE_TARGET_ROOT/guided.marker"
+echo '[fixture-tflite-guided-build] rebuilt copy-local guided artifacts'
+EOF
+cat >"$TFLITE_SOURCE/scripts/build_coverage_tflite.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$PWD" == "$PROJECT_ROOT" && "$JOBS" == 4 ]] \
+  || { echo 'coverage builder ran with the wrong cwd or jobs' >&2; exit 88; }
+[[ "$TFLITE_ARCHIVE" == "$PROJECT_ROOT/data/targets/tflite/v2.20.0/source/v2.20.0.tar.gz" ]] \
+  || { echo 'coverage builder did not receive the verified copy archive' >&2; exit 91; }
+[[ ! ${TFLITE_COVERAGE_BUILD_DIR+x} && ! ${TFLITE_SOURCE_DIR+x} \
+   && ! ${TFLITE_BASE_BUILD_DIR+x} && ! ${TFLITE_FIXTURE+x} \
+   && ! ${LLVM_NM+x} && ! ${LLVM_OBJDUMP+x} && ! ${CLANG_BUNDLE_DIR+x} ]] \
+  || { echo 'coverage builder inherited a path or tool override' >&2; exit 89; }
+root="$TFLITE_TARGET_ROOT/build/coverage-cmake"
+mkdir -p "$root/tensorflow-lite"
+printf 'coverage target archive\n' >"$root/tensorflow-lite/libtensorflow-lite.a"
+printf '#!/usr/bin/env bash\necho coverage replay\n' >"$root/tflite_loader_replay"
+chmod +x "$root/tflite_loader_replay"
+printf '{}\n' >"$TFLITE_TARGET_ROOT/coverage-instrumentation.json"
+printf 'copy-local coverage build\n' >"$TFLITE_TARGET_ROOT/coverage.marker"
+echo '[fixture-tflite-coverage-build] rebuilt copy-local coverage artifacts'
+EOF
+chmod +x "$TFLITE_SOURCE/scripts/build_tflite_guided.sh" \
+  "$TFLITE_SOURCE/scripts/build_coverage_tflite.sh"
 cat >"$TFLITE_SOURCE/scripts/check_tflite_copy.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -409,6 +451,8 @@ grep -Fxq 'copy-local TFLite build' "$TFLITE_TARGET_ROOT/built.marker"
 [[ "$("$PROJECT_ROOT/harnesses/tflite/tflite_loader_replay")" == copy-local-tflite-replay ]]
 [[ "$("$PROJECT_ROOT/harnesses/tflite/tflite_loader_fuzzer")" == copy-local-tflite-fuzzer ]]
 [[ "$("$PROJECT_ROOT/harnesses/tflite/tflite_structural_mutator")" == copy-local-tflite-mutator ]]
+grep -Fxq 'copy-local guided build' "$TFLITE_TARGET_ROOT/guided.marker"
+grep -Fxq 'copy-local coverage build' "$TFLITE_TARGET_ROOT/coverage.marker"
 EOF
 chmod +x "$TFLITE_SOURCE/scripts/check_tflite_copy.sh"
 cp -a "$TFLITE_SOURCE/." "$TFLITE_COPY/"
@@ -418,8 +462,15 @@ TFLITE_ARCHIVE="$SOURCE/escaped-tflite-archive" \
 TFLITE_REPLAY="$SOURCE/escaped-tflite-replay" \
 TFLITE_FUZZER="$SOURCE/escaped-tflite-fuzzer" \
 TFLITE_MUTATOR="$SOURCE/escaped-tflite-mutator" \
+TFLITE_SOURCE_DIR="$SOURCE/escaped-tflite-source" \
+TFLITE_BASE_BUILD_DIR="$SOURCE/escaped-tflite-base" \
+TFLITE_GUIDED_BUILD_DIR="$SOURCE/escaped-tflite-guided" \
+TFLITE_COVERAGE_BUILD_DIR="$SOURCE/escaped-tflite-coverage" \
+TFLITE_FIXTURE="$SOURCE/escaped-tflite-fixture" \
 CMAKE="$SOURCE/escaped-cmake" NINJA="$SOURCE/escaped-ninja" \
-CLANG="$SOURCE/escaped-clang" CLANGXX="$SOURCE/escaped-clangxx" JOBS=99 \
+CLANG="$SOURCE/escaped-clang" CLANGXX="$SOURCE/escaped-clangxx" \
+LLVM_NM="$SOURCE/escaped-llvm-nm" LLVM_OBJDUMP="$SOURCE/escaped-llvm-objdump" \
+CLANG_BUNDLE_DIR="$SOURCE/escaped-clang-bundle" JOBS=99 \
 bash "$TFLITE_SOURCE/scripts/run_check_suite.sh" --isolated-root "$TFLITE_COPY" \
   --log-dir "$WORK/tflite-logs" >"$WORK/tflite.log" 2>&1 || rc=$?
 [[ "$rc" -eq 0 ]] || {
@@ -430,6 +481,10 @@ bash "$TFLITE_SOURCE/scripts/run_check_suite.sh" --isolated-root "$TFLITE_COPY" 
 grep -Fq 'check_tflite_copy.sh: PASS' "$WORK/tflite.log"
 grep -Fq '[fixture-tflite-build] rebuilt copy-local TFLite artifacts' \
   "$WORK/tflite-logs/setup-tflite.log"
+grep -Fq '[fixture-tflite-guided-build] rebuilt copy-local guided artifacts' \
+  "$WORK/tflite-logs/setup-tflite-guided.log"
+grep -Fq '[fixture-tflite-coverage-build] rebuilt copy-local coverage artifacts' \
+  "$WORK/tflite-logs/setup-tflite-coverage.log"
 [[ -z "$(find "$TFLITE_COPY/data/targets/tflite" -maxdepth 1 -type d \
   -name '.check-suite-v2.20.0-*' -print -quit)" ]] || {
   echo 'runner left its temporary TFLite target root behind' >&2
@@ -439,7 +494,12 @@ grep -Fq '[fixture-tflite-build] rebuilt copy-local TFLite artifacts' \
    && ! -e "$SOURCE/escaped-tflite-archive" \
    && ! -e "$SOURCE/escaped-tflite-replay" \
    && ! -e "$SOURCE/escaped-tflite-fuzzer" \
-   && ! -e "$SOURCE/escaped-tflite-mutator" ]] || {
+   && ! -e "$SOURCE/escaped-tflite-mutator" \
+   && ! -e "$SOURCE/escaped-tflite-source" \
+   && ! -e "$SOURCE/escaped-tflite-base" \
+   && ! -e "$SOURCE/escaped-tflite-guided" \
+   && ! -e "$SOURCE/escaped-tflite-coverage" \
+   && ! -e "$SOURCE/escaped-tflite-fixture" ]] || {
   echo 'copy-local TFLite builder wrote through an inherited output path' >&2
   exit 1
 }

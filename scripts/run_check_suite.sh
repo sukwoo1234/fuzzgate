@@ -296,11 +296,61 @@ if [[ -e "$tflite_builder_source" || -L "$tflite_builder_source" ]]; then
   [[ -x "$tflite_replay_copy" && -x "$tflite_fuzzer_copy" \
      && -x "$tflite_mutator_copy" ]] \
     || fail_setup 'copy-local TFLite replay, fuzzer, and mutator must be executable'
+
+  # TFL-05: the normal fuzzer intentionally instruments only its driver. Build
+  # both target-object variants inside this same copy so the new gate cannot
+  # pass by reading absolute mappings or archives left in the source tree.
+  for tflite_variant in guided coverage; do
+    case "$tflite_variant" in
+      guided) tflite_variant_builder=scripts/build_tflite_guided.sh ;;
+      coverage) tflite_variant_builder=scripts/build_coverage_tflite.sh ;;
+    esac
+    tflite_variant_log="$LOG_DIR/setup-tflite-$tflite_variant.log"
+    tflite_variant_rc=0
+    (
+      cd -- "$ISOLATED_ROOT"
+      env "${shell_env_unsets[@]}" \
+        -u PROJECT_ROOT -u WORKDIR -u TOOL_BIN \
+        -u TFLITE_TARGET_ROOT -u TFLITE_ARCHIVE -u TFLITE_SOURCE_DIR \
+        -u TFLITE_BASE_BUILD_DIR -u TFLITE_GUIDED_BUILD_DIR \
+        -u TFLITE_COVERAGE_BUILD_DIR -u TFLITE_FIXTURE \
+        -u JOBS -u CMAKE -u NINJA -u CLANG -u CLANGXX -u CC -u CXX \
+        -u LLVM_NM -u LLVM_OBJDUMP -u CLANG_BUNDLE_DIR \
+        PROJECT_ROOT="$ISOLATED_ROOT" \
+        TFLITE_TARGET_ROOT="$tflite_target_root" \
+        TFLITE_ARCHIVE="$tflite_archive_copy" JOBS=4 \
+        bash -p "$tflite_variant_builder"
+    ) >"$tflite_variant_log" 2>&1 || tflite_variant_rc=$?
+    [[ "$tflite_variant_rc" -eq 0 ]] \
+      || fail_setup "copy-local TFLite $tflite_variant build failed rc=$tflite_variant_rc (log: $tflite_variant_log)"
+  done
+  for artifact in \
+    "$tflite_target_root/build/guided-cmake/tensorflow-lite/libtensorflow-lite.a" \
+    "$tflite_target_root/build/guided-cmake/tflite_loader_fuzzer" \
+    "$tflite_target_root/guided-instrumentation.json" \
+    "$tflite_target_root/build/coverage-cmake/tensorflow-lite/libtensorflow-lite.a" \
+    "$tflite_target_root/build/coverage-cmake/tflite_loader_replay" \
+    "$tflite_target_root/coverage-instrumentation.json"
+  do
+    [[ -f "$artifact" && ! -L "$artifact" ]] \
+      || fail_setup "copy-local TFLite instrumentation build produced no regular artifact: $artifact"
+    artifact_resolved="$(realpath -e -- "$artifact")" \
+      || fail_setup "could not resolve copy-local TFLite instrumentation artifact: $artifact"
+    case "$artifact_resolved/" in
+      "$ISOLATED_ROOT/"*) : ;;
+      *) fail_setup "TFLite instrumentation artifact escaped isolated root: $artifact_resolved" ;;
+    esac
+  done
+  [[ -x "$tflite_target_root/build/guided-cmake/tflite_loader_fuzzer" \
+     && -x "$tflite_target_root/build/coverage-cmake/tflite_loader_replay" ]] \
+    || fail_setup 'copy-local TFLite guided fuzzer and coverage replay must be executable'
   suite_gate_env+=(
     "TFLITE_TARGET_ROOT=$tflite_target_root"
     "TFLITE_REPLAY=$tflite_replay_copy"
     "TFLITE_FUZZER=$tflite_fuzzer_copy"
     "TFLITE_MUTATOR=$tflite_mutator_copy"
+    "TFLITE_GUIDED_BUILD_DIR=$tflite_target_root/build/guided-cmake"
+    "TFLITE_COVERAGE_BUILD_DIR=$tflite_target_root/build/coverage-cmake"
   )
   printf '[suite] rebuilt TFLite artifacts target_root=%s log=%s\n' \
     "$tflite_target_root" "$tflite_build_log"
