@@ -281,6 +281,7 @@ if [[ -e "$tflite_builder_source" || -L "$tflite_builder_source" ]]; then
     "$tflite_replay_copy" \
     "$tflite_fuzzer_copy" \
     "$tflite_mutator_copy" \
+    "$tflite_target_root/meta.json" \
     "$tflite_target_root/profile.json" \
     "$tflite_target_root/build-identity.json"
   do
@@ -346,6 +347,7 @@ if [[ -e "$tflite_builder_source" || -L "$tflite_builder_source" ]]; then
     || fail_setup 'copy-local TFLite guided fuzzer and coverage replay must be executable'
   suite_gate_env+=(
     "TFLITE_TARGET_ROOT=$tflite_target_root"
+    "TFLITE_ARCHIVE=$tflite_archive_copy"
     "TFLITE_REPLAY=$tflite_replay_copy"
     "TFLITE_FUZZER=$tflite_fuzzer_copy"
     "TFLITE_MUTATOR=$tflite_mutator_copy"

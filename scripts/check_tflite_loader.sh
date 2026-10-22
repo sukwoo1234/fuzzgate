@@ -4,6 +4,8 @@ set -u
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}"
 TOOL_BIN="${TOOL_BIN:-$PROJECT_ROOT/target/debug/tool}"
 TARGET_ROOT="${TFLITE_TARGET_ROOT:-$PROJECT_ROOT/data/targets/tflite/v2.20.0}"
+ARCHIVE="${TFLITE_ARCHIVE:-$TARGET_ROOT/source/v2.20.0.tar.gz}"
+META="${TFLITE_META:-$TARGET_ROOT/meta.json}"
 PROFILE="${TFLITE_PROFILE:-$TARGET_ROOT/profile.json}"
 IDENTITY="${TFLITE_BUILD_IDENTITY:-$TARGET_ROOT/build-identity.json}"
 ADD_MODEL="${TFLITE_ADD_MODEL:-$TARGET_ROOT/fixtures/add.tflite}"
@@ -84,7 +86,13 @@ else
 fi
 
 missing=0
-for pair in "profile:$PROFILE" "build identity:$IDENTITY" "ADD model:$ADD_MODEL"; do
+for pair in \
+  "source archive:$ARCHIVE" \
+  "target metadata:$META" \
+  "profile:$PROFILE" \
+  "build identity:$IDENTITY" \
+  "ADD model:$ADD_MODEL"
+do
   label="${pair%%:*}"
   path="${pair#*:}"
   if [[ ! -f "$path" ]]; then
@@ -94,14 +102,15 @@ for pair in "profile:$PROFILE" "build identity:$IDENTITY" "ADD model:$ADD_MODEL"
 done
 
 validate_identity() {
-  python3 -B - "$1" "$PROFILE" "$ADD_MODEL" <<'PY'
+  python3 -B - "$1" "$META" "$PROFILE" "$ADD_MODEL" "$ARCHIVE" <<'PY'
 import hashlib
 import json
 import os
 import sys
 
-identity_path, profile_path, model_path = sys.argv[1:]
+identity_path, meta_path, profile_path, model_path, archive_path = sys.argv[1:]
 identity = json.load(open(identity_path, encoding="utf-8"))
+meta = json.load(open(meta_path, encoding="utf-8"))
 profile = json.load(open(profile_path, encoding="utf-8"))
 
 def digest(path):
@@ -117,6 +126,16 @@ expected_source = {
     "resolved_commit": "72fbba3d20f4616d7312b5e2b7f79daf6e82f2fa",
     "sha256": "a640d1f97be316a09301dfc9347e3d929ad4d9a2336e3ca23c32c93b0ff7e5d0",
     "size_bytes": 84813578,
+}
+expected_meta = {
+    "schema_version": "1.0",
+    "target": "tflite",
+    "version": "v2.20.0",
+    "source_url": expected_source["url"],
+    "source_kind": "official_release",
+    "downloaded_file": archive_path,
+    "downloaded_sha256": expected_source["sha256"],
+    "downloaded_size_bytes": expected_source["size_bytes"],
 }
 expected_dependencies = {
     "abseil-cpp": "d9e4955c65cd4367dd6bf46f4ccb8cd3d100540b",
@@ -143,6 +162,12 @@ expected_options = {
     "TFLITE_KERNEL_TEST": "OFF",
 }
 
+if meta != expected_meta:
+    raise SystemExit("target metadata does not match the pinned official release")
+if digest(archive_path) != meta["downloaded_sha256"]:
+    raise SystemExit("source archive sha256 does not match target metadata")
+if os.path.getsize(archive_path) != meta["downloaded_size_bytes"]:
+    raise SystemExit("source archive size does not match target metadata")
 if identity.get("schema_version") != "1" or identity.get("target_id") != "tflite":
     raise SystemExit("build identity schema/target mismatch")
 if identity.get("source") != expected_source:
@@ -245,7 +270,7 @@ PY
 
 if [[ "$missing" -eq 0 ]]; then
   if validate_identity "$IDENTITY"; then
-    ok "source, dependencies, compiler/CMake options, replay, and ADD model are pinned"
+    ok "official source, dependencies, compiler/CMake options, replay, and ADD model are pinned"
   else
     bad "pinned build/profile identity is invalid"
   fi

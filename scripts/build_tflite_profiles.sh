@@ -20,6 +20,7 @@ OUT_FUZZER="${TFLITE_FUZZER:-$PROJECT_ROOT/harnesses/tflite/tflite_loader_fuzzer
 OUT_MUTATOR="${TFLITE_MUTATOR:-$PROJECT_ROOT/harnesses/tflite/tflite_structural_mutator}"
 PROFILE="$TARGET_ROOT/profile.json"
 IDENTITY="$TARGET_ROOT/build-identity.json"
+META="$TARGET_ROOT/meta.json"
 JOBS="${JOBS:-4}"
 
 fail() {
@@ -219,7 +220,7 @@ cp -- "$SOURCE_DIR/tensorflow/lite/testdata/add.bin" "$FIXTURE_DIR/add.tflite"
   >"$TARGET_ROOT/link-commands.txt"
 
 python3 -B - \
-  "$IDENTITY" "$PROFILE" "$ARCHIVE" "$SOURCE_DIR" "$BUILD_DIR" \
+  "$IDENTITY" "$PROFILE" "$META" "$ARCHIVE" "$SOURCE_DIR" "$BUILD_DIR" \
   "$OUT_REPLAY" "$OUT_FUZZER" "$OUT_MUTATOR" "$FIXTURE_DIR/add.tflite" "$CLANGXX" "$CLANGXX_INVOKE" "$CMAKE" "$PATCH" "$flatc_binary" \
   "$TARGET_ROOT/link-commands.txt" "$TFLITE_URL" "$TFLITE_COMMIT" <<'PY'
 import hashlib
@@ -232,6 +233,7 @@ import sys
 (
     identity_path,
     profile_path,
+    meta_path,
     archive_path,
     source_root,
     build_root,
@@ -301,6 +303,16 @@ source_artifacts = [{
     "sha256": file_sha(archive_path),
     "size_bytes": os.path.getsize(archive_path),
 }]
+target_meta = {
+    "schema_version": "1.0",
+    "target": "tflite",
+    "version": "v2.20.0",
+    "source_url": source_url,
+    "source_kind": "official_release",
+    "downloaded_file": archive_path,
+    "downloaded_sha256": source_artifacts[0]["sha256"],
+    "downloaded_size_bytes": source_artifacts[0]["size_bytes"],
+}
 for name, url, commit, archive_sha in dependency_specs:
     tree_sha, tree_size = tree_identity(os.path.join(build_root, name))
     row = {
@@ -449,12 +461,16 @@ profile = {
     },
 }
 
-for path, document in [(identity_path, identity), (profile_path, profile)]:
+for path, document in [
+    (meta_path, target_meta),
+    (identity_path, identity),
+    (profile_path, profile),
+]:
     with open(path, "w", encoding="utf-8") as stream:
         json.dump(document, stream, indent=2, sort_keys=True)
         stream.write("\n")
 PY
 
 log "done"
-printf 'replay=%s\nfuzzer=%s\nmutator=%s\nprofile=%s\nidentity=%s\n' \
-  "$OUT_REPLAY" "$OUT_FUZZER" "$OUT_MUTATOR" "$PROFILE" "$IDENTITY"
+printf 'replay=%s\nfuzzer=%s\nmutator=%s\nprofile=%s\nidentity=%s\nmeta=%s\n' \
+  "$OUT_REPLAY" "$OUT_FUZZER" "$OUT_MUTATOR" "$PROFILE" "$IDENTITY" "$META"
