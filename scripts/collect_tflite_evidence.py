@@ -843,7 +843,7 @@ def _current_cgroup_parent() -> Path:
 
 
 class SampleCgroup:
-    def __init__(self, parent: Path, sample_id: str, memory_limit: int) -> None:
+    def __init__(self, parent: Path, sample_id: str, _memory_limit: int) -> None:
         if baseline.SAFE_ID.fullmatch(sample_id) is None:
             raise EvidenceError(f"unsafe cgroup sample ID: {sample_id}")
         self.path = parent / sample_id
@@ -855,14 +855,13 @@ class SampleCgroup:
                 f"delegated cgroup-v2 scope: {self.path}: {error}"
             ) from error
         try:
-            (self.path / "memory.max").write_text(f"{memory_limit}\n", encoding="ascii")
             (self.path / "memory.peak").read_text(encoding="ascii")
         except OSError as error:
             try:
                 self.path.rmdir()
             except OSError:
                 pass
-            raise EvidenceError(f"sample cgroup lacks a writable memory controller: {error}") from error
+            raise EvidenceError(f"sample cgroup lacks readable memory.peak: {error}") from error
 
     def child_setup(self) -> None:
         os.setsid()

@@ -250,6 +250,41 @@ def collector_performance_cli_runs_workload() -> None:
         raise AssertionError("performance still imports caller-authored observations")
 
 
+def read_only_cgroup_limit_still_collects_peak() -> None:
+    collector = load_collector()
+    sample_id = "read-only-memory-limit"
+    with tempfile.TemporaryDirectory(prefix="tflite-read-only-cgroup-") as raw:
+        parent = Path(raw)
+        leaf = parent / sample_id
+        original_mkdir = Path.mkdir
+        original_write_text = Path.write_text
+
+        def seeded_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+            original_mkdir(path, *args, **kwargs)
+            if path == leaf:
+                original_write_text(path / "memory.max", "max\n", encoding="ascii")
+                original_write_text(path / "memory.peak", "0\n", encoding="ascii")
+
+        def deny_limit_write(path: Path, *args: Any, **kwargs: Any) -> int:
+            if path == leaf / "memory.max":
+                raise PermissionError(13, "read-only delegated resource control", str(path))
+            return original_write_text(path, *args, **kwargs)
+
+        try:
+            Path.mkdir = seeded_mkdir
+            Path.write_text = deny_limit_write
+            group = collector.SampleCgroup(parent, sample_id, 1_073_741_824)
+        finally:
+            Path.mkdir = original_mkdir
+            Path.write_text = original_write_text
+            for name in ("memory.max", "memory.peak"):
+                (leaf / name).unlink(missing_ok=True)
+            if leaf.exists():
+                leaf.rmdir()
+        if group.path != leaf:
+            raise AssertionError("collector changed the private sample cgroup identity")
+
+
 def collector_builds_nonqualifying_selftest_observations() -> None:
     collector = load_collector()
 
@@ -909,6 +944,10 @@ CASES = (
     ("wrong profile is refused", wrong_profile_is_rejected),
     ("wrong soak binary role is refused", wrong_soak_binary_role_is_rejected),
     ("performance CLI runs workload directly", collector_performance_cli_runs_workload),
+    (
+        "read-only cgroup limit still permits peak collection",
+        read_only_cgroup_limit_still_collects_peak,
+    ),
     (
         "performance builder selftest stays nonqualifying",
         collector_builds_nonqualifying_selftest_observations,
