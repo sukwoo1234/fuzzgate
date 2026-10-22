@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -666,6 +667,7 @@ def _validate_target_profile_shape(profile: dict[str, Any], label: str) -> None:
         "onnx": {"session"},
         "gguf": {"metadata", "tensor-info", "full"},
         "safetensors": {"deserialize"},
+        "tflite": {"load-allocate-access"},
     }
     target_id = profile["target_id"]
     if target_id not in allowed_depths or depth not in allowed_depths[target_id]:
@@ -1929,7 +1931,250 @@ def _validate_sample(
     return observed
 
 
-def _validate_operations(value: Any) -> tuple[dict[str, Any], str]:
+OPERATION_FIELDS = {
+    "schema_version",
+    "operation",
+    "mode",
+    "target_id",
+    "tool_commit",
+    "dirty_diff_sha256",
+    "profile_sha256",
+    "command",
+    "command_sha256",
+    "corpus_before_sha256",
+    "corpus_after_sha256",
+    "started_utc",
+    "ended_utc",
+    "duration_seconds",
+    "target_api_calls",
+    "worker_count",
+    "expected_outcome",
+    "observed_outcome",
+    "exit_code",
+    "signal",
+    "residual_processes",
+    "resource_samples",
+    "budgets",
+    "artifacts",
+}
+
+
+def _utc_timestamp(value: Any, label: str) -> datetime:
+    text = _string(value, label)
+    if not text.endswith("Z"):
+        raise ContractError(f"{label} must be an RFC3339 UTC timestamp ending in Z")
+    try:
+        parsed = datetime.fromisoformat(text[:-1] + "+00:00")
+    except ValueError as error:
+        raise ContractError(f"{label} must be an RFC3339 UTC timestamp") from error
+    if parsed.tzinfo != timezone.utc:
+        raise ContractError(f"{label} must use UTC")
+    return parsed
+
+
+def _validate_operation_raw(
+    value: Any,
+    *,
+    name: str,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    label = f"operations.{name}.raw_json"
+    raw = _object(value, label, OPERATION_FIELDS)
+    if raw["schema_version"] != "tflite-v7-operation-v1":
+        raise ContractError(f"{label}.schema_version is unsupported")
+    if raw["operation"] != name:
+        raise ContractError(f"{label}.operation does not match its operation slot")
+    if raw["mode"] != "real":
+        raise ContractError(f"{label}.mode must be real")
+    fixed = identity["fixed"]
+    if raw["target_id"] != fixed["target_id"]:
+        raise ContractError(f"{label}.target_id does not match the fixed identity")
+    if _commit(raw["tool_commit"], f"{label}.tool_commit") != identity["candidate_tool_commit"]:
+        raise ContractError(f"{label}.tool_commit does not match the candidate identity")
+    dirty = raw["dirty_diff_sha256"]
+    if dirty is not None:
+        dirty = _sha256(dirty, f"{label}.dirty_diff_sha256")
+    if dirty != identity["candidate_dirty_diff_sha256"]:
+        raise ContractError(f"{label}.dirty_diff_sha256 does not match the candidate identity")
+    if _sha256(raw["profile_sha256"], f"{label}.profile_sha256") != identity["candidate_profile_sha256"]:
+        raise ContractError(f"{label}.profile_sha256 does not match the candidate identity")
+    command = _object(
+        raw["command"],
+        f"{label}.command",
+        {"argv", "allowed_env", "cwd", "executable_sha256"},
+    )
+    argv = command["argv"]
+    if not isinstance(argv, list) or not argv:
+        raise ContractError(f"{label}.command.argv must be a non-empty list")
+    for index, item in enumerate(argv):
+        _string(item, f"{label}.command.argv[{index}]")
+    if not os.path.isabs(argv[0]):
+        raise ContractError(f"{label}.command.argv[0] must be absolute")
+    allowed_env = command["allowed_env"]
+    if not isinstance(allowed_env, dict):
+        raise ContractError(f"{label}.command.allowed_env must be an object")
+    for key, item in allowed_env.items():
+        _string(key, f"{label}.command.allowed_env key")
+        _string(item, f"{label}.command.allowed_env.{key}", nonempty=False)
+    _validate_command_environment(
+        command,
+        identity["candidate_profile"],
+        f"{label}.command",
+    )
+    if "PATH" not in allowed_env:
+        raise ContractError(f"{label}.command.allowed_env must pin PATH")
+    cwd = _string(command["cwd"], f"{label}.command.cwd")
+    if not os.path.isabs(cwd) or cwd == "/mnt" or cwd.startswith("/mnt/"):
+        raise ContractError(f"{label}.command.cwd must be an absolute WSL ext4 path")
+    executable_sha = _sha256(
+        command["executable_sha256"], f"{label}.command.executable_sha256"
+    )
+    command_sha = _sha256(raw["command_sha256"], f"{label}.command_sha256")
+    if _sha256_bytes(_canonical_json(command)) != command_sha:
+        raise ContractError(f"{label}.command_sha256 does not match the embedded command")
+    if name == "actual_parser_performance" and (
+        command != identity["candidate_command"]
+        or command_sha != identity["candidate_command_sha256"]
+    ):
+        raise ContractError(f"{label}.command does not match the candidate replay identity")
+    matching_binaries = [
+        binary
+        for binary in identity["candidate_profile"]["binaries"]
+        if isinstance(binary, dict)
+        and binary.get("path") == argv[0]
+        and binary.get("sha256") == executable_sha
+    ]
+    if len(matching_binaries) != 1:
+        raise ContractError(
+            f"{label}.command executable does not match exactly one candidate profile binary"
+        )
+    expected_binary_role = (
+        "fuzzer" if name in {"single_worker_soak", "parallel_soak"} else "replay"
+    )
+    if matching_binaries[0].get("role") != expected_binary_role:
+        raise ContractError(
+            f"{label}.command must use the profile-pinned {expected_binary_role} binary"
+        )
+    if expected_binary_role == "fuzzer":
+        required_flags = {"-print_final_stats=1", "-max_total_time=21600"}
+        missing_flags = sorted(required_flags - set(argv))
+        if missing_flags:
+            raise ContractError(
+                f"{label}.command misses required libFuzzer flags: {missing_flags}"
+            )
+    if expected_binary_role == "fuzzer" and argv.count("{corpus_dir}") != 1:
+        raise ContractError(
+            f"{label}.command must contain exactly one {{corpus_dir}} placeholder"
+        )
+    before = _sha256(raw["corpus_before_sha256"], f"{label}.corpus_before_sha256")
+    after = _sha256(raw["corpus_after_sha256"], f"{label}.corpus_after_sha256")
+    if before != fixed["corpus_sha256"] or after != before:
+        raise ContractError(f"{label} corpus identity changed")
+
+    started = _utc_timestamp(raw["started_utc"], f"{label}.started_utc")
+    ended = _utc_timestamp(raw["ended_utc"], f"{label}.ended_utc")
+    duration = _number(raw["duration_seconds"], f"{label}.duration_seconds", minimum=0.0)
+    if duration <= 0:
+        raise ContractError(f"{label}.duration_seconds must be > 0")
+    elapsed = (ended - started).total_seconds()
+    if elapsed <= 0 or abs(elapsed - duration) > max(0.001, duration * 0.000001):
+        raise ContractError(f"{label} timestamps do not match duration_seconds")
+    minimum_duration = 21_600.0 if name in {"single_worker_soak", "parallel_soak"} else 60.0
+    if name in {"engine_smoke", "fault_injection"}:
+        minimum_duration = 0.001
+    if duration < minimum_duration:
+        raise ContractError(
+            f"{label}.duration_seconds must be at least {minimum_duration:g} for {name}"
+        )
+    target_calls = _integer(
+        raw["target_api_calls"], f"{label}.target_api_calls", minimum=1, maximum=MAX_U64
+    )
+    if target_calls == 0:
+        raise ContractError(f"{label}.target_api_calls must be > 0")
+    expected_workers = 2 if name == "parallel_soak" else 1
+    if _integer(raw["worker_count"], f"{label}.worker_count", minimum=1) != expected_workers:
+        raise ContractError(f"{label}.worker_count must be {expected_workers}")
+    expected_outcome = "worker_failure" if name == "fault_injection" else "completed"
+    if raw["expected_outcome"] != expected_outcome or raw["observed_outcome"] != expected_outcome:
+        raise ContractError(f"{label} outcome does not match the required {expected_outcome!r}")
+    exit_code = _integer(raw["exit_code"], f"{label}.exit_code", minimum=0)
+    if (name == "fault_injection" and exit_code == 0) or (
+        name != "fault_injection" and exit_code != 0
+    ):
+        raise ContractError(f"{label}.exit_code contradicts the required outcome")
+    if raw["signal"] is not None:
+        _string(raw["signal"], f"{label}.signal")
+        raise ContractError(f"{label}.signal must be null for a qualifying operation")
+    if _integer(raw["residual_processes"], f"{label}.residual_processes", minimum=0) != 0:
+        raise ContractError(f"{label}.residual_processes must be zero")
+
+    budgets = _object(raw["budgets"], f"{label}.budgets", {"peak_rss_bytes", "log_bytes", "disk_bytes"})
+    checked_budgets = {
+        key: _integer(budgets[key], f"{label}.budgets.{key}", minimum=1, maximum=MAX_U64)
+        for key in budgets
+    }
+    expected_peak_budget = fixed["memory_limit_bytes"] * expected_workers
+    if checked_budgets["peak_rss_bytes"] != expected_peak_budget:
+        raise ContractError(
+            f"{label}.budgets.peak_rss_bytes must equal the pinned per-worker limit times workers"
+        )
+    samples = raw["resource_samples"]
+    if not isinstance(samples, list) or len(samples) < 2:
+        raise ContractError(f"{label}.resource_samples must contain start and final samples")
+    previous_elapsed = -1.0
+    previous_peak = -1
+    previous_log = -1
+    for index, sample_value in enumerate(samples):
+        sample_label = f"{label}.resource_samples[{index}]"
+        sample = _object(
+            sample_value,
+            sample_label,
+            {"elapsed_seconds", "peak_rss_bytes", "log_bytes", "disk_bytes", "owned_processes"},
+        )
+        sample_elapsed = _number(sample["elapsed_seconds"], f"{sample_label}.elapsed_seconds", minimum=0.0)
+        if sample_elapsed <= previous_elapsed or sample_elapsed > duration:
+            raise ContractError(f"{sample_label}.elapsed_seconds must increase within the operation")
+        previous_elapsed = sample_elapsed
+        for key in ("peak_rss_bytes", "log_bytes", "disk_bytes"):
+            observed = _integer(sample[key], f"{sample_label}.{key}", minimum=0, maximum=MAX_U64)
+            if observed > checked_budgets[key]:
+                raise ContractError(f"{sample_label}.{key} exceeds its precommitted budget")
+            if key == "peak_rss_bytes":
+                if observed < previous_peak:
+                    raise ContractError(f"{sample_label}.{key} is not a cumulative peak")
+                previous_peak = observed
+            elif key == "log_bytes":
+                if observed < previous_log:
+                    raise ContractError(f"{sample_label}.{key} decreased")
+                previous_log = observed
+        _integer(sample["owned_processes"], f"{sample_label}.owned_processes", minimum=0)
+    if abs(previous_elapsed - duration) > max(0.001, duration * 0.000001):
+        raise ContractError(f"{label}.resource_samples do not reach the operation end")
+    if samples[-1]["owned_processes"] != 0:
+        raise ContractError(f"{label}.resource_samples final owned_processes must be zero")
+
+    artifacts = raw["artifacts"]
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ContractError(f"{label}.artifacts must be a non-empty list")
+    artifact_paths: set[str] = set()
+    for index, artifact_value in enumerate(artifacts):
+        artifact_label = f"{label}.artifacts[{index}]"
+        artifact = _object(artifact_value, artifact_label, {"path", "sha256", "size_bytes"})
+        path = _string(artifact["path"], f"{artifact_label}.path")
+        if os.path.isabs(path) or ".." in Path(path).parts or path in artifact_paths:
+            raise ContractError(f"{artifact_label}.path is unsafe or duplicated")
+        artifact_paths.add(path)
+        _sha256(artifact["sha256"], f"{artifact_label}.sha256")
+        _integer(artifact["size_bytes"], f"{artifact_label}.size_bytes", minimum=0)
+    return raw
+
+
+def _validate_operations(
+    value: Any,
+    *,
+    identity: dict[str, Any],
+    mode: str,
+) -> tuple[dict[str, Any], str]:
     names = {
         "actual_parser_performance",
         "engine_smoke",
@@ -1940,19 +2185,51 @@ def _validate_operations(value: Any) -> tuple[dict[str, Any], str]:
     operations = _object(value, "operations", names)
     statuses: list[str] = []
     for name in sorted(names):
-        row = _object(operations[name], f"operations.{name}", {"status", "reason", "evidence_sha256"})
+        row = _object(
+            operations[name],
+            f"operations.{name}",
+            {"status", "reason", "evidence_sha256", "raw_json"},
+        )
         status = row["status"]
         if status == "pass":
-            raise ContractError(
-                f"operations.{name}.status pass is unsupported until raw V7 evidence has a strict validator"
-            )
+            if row["raw_json"] is None or row["evidence_sha256"] is None:
+                raise ContractError(
+                    f"operations.{name}.status pass requires strict raw V7 evidence"
+                )
+            if mode != "real":
+                raise ContractError(f"operations.{name}.status pass requires real mode")
+            if row["reason"] is not None:
+                raise ContractError(f"operations.{name}.reason must be null for pass")
+            raw_text = _string(row["raw_json"], f"operations.{name}.raw_json")
+            raw_sha = _sha256(row["evidence_sha256"], f"operations.{name}.evidence_sha256")
+            if _sha256_bytes(raw_text.encode("utf-8")) != raw_sha:
+                raise ContractError(f"operations.{name}.evidence_sha256 does not match raw_json")
+            raw = _parse_json_text(raw_text, f"operations.{name}.raw_json")
+            _validate_operation_raw(raw, name=name, identity=identity)
         if status not in {"fail", "pending"}:
-            raise ContractError(f"operations.{name}.status is unsupported")
-        _string(row["reason"], f"operations.{name}.reason")
-        if status == "pending" and row["evidence_sha256"] is not None:
-            raise ContractError(f"operations.{name}.evidence_sha256 must be null while pending")
-        if status == "fail" and row["evidence_sha256"] is not None:
-            _sha256(row["evidence_sha256"], f"operations.{name}.evidence_sha256")
+            if status != "pass":
+                raise ContractError(f"operations.{name}.status is unsupported")
+        if status != "pass":
+            _string(row["reason"], f"operations.{name}.reason")
+            if status == "pending" and (
+                row["evidence_sha256"] is not None or row["raw_json"] is not None
+            ):
+                raise ContractError(
+                    f"operations.{name} evidence_sha256/raw_json must be null while pending"
+                )
+            if status == "fail":
+                if (row["evidence_sha256"] is None) != (row["raw_json"] is None):
+                    raise ContractError(
+                        f"operations.{name} failed raw_json and evidence_sha256 must appear together"
+                    )
+                if row["raw_json"] is not None:
+                    raw_text = _string(row["raw_json"], f"operations.{name}.raw_json")
+                    if _sha256_bytes(raw_text.encode("utf-8")) != _sha256(
+                        row["evidence_sha256"], f"operations.{name}.evidence_sha256"
+                    ):
+                        raise ContractError(
+                            f"operations.{name}.evidence_sha256 does not match raw_json"
+                        )
         statuses.append(status)
     overall = "fail" if "fail" in statuses else "pending" if "pending" in statuses else "pass"
     return operations, overall
@@ -2298,7 +2575,9 @@ def evaluate_document(document: dict[str, Any]) -> dict[str, Any]:
         calibration_context_sha256,
         calibration_raw_sha256,
     )
-    operations, operations_status = _validate_operations(document["operations"])
+    operations, operations_status = _validate_operations(
+        document["operations"], identity=identity, mode=mode
+    )
 
     throughput_inputs = sorted(
         (row for row in corpus_inputs if row["throughput_order_index"] is not None),
@@ -2633,6 +2912,7 @@ def publish_evidence(
     destination_fd: int | None = None
     samples_fd: int | None = None
     profiles_fd: int | None = None
+    operations_fd: int | None = None
     try:
         root_metadata = os.stat(output_root, follow_symlinks=False)
         if not stat.S_ISDIR(root_metadata.st_mode):
@@ -2653,13 +2933,15 @@ def publish_evidence(
         destination_fd = os.open(comparison_id, directory_flags, dir_fd=root_fd)
         destination_metadata = os.fstat(destination_fd)
         destination_identity = (destination_metadata.st_dev, destination_metadata.st_ino)
-        for name in ("samples", "profiles"):
+        for name in ("samples", "profiles", "operations"):
             os.mkdir(name, 0o700, dir_fd=destination_fd)
         os.fsync(destination_fd)
         samples_fd = os.open("samples", directory_flags, dir_fd=destination_fd)
         profiles_fd = os.open("profiles", directory_flags, dir_fd=destination_fd)
+        operations_fd = os.open("operations", directory_flags, dir_fd=destination_fd)
         samples_identity = _fd_identity(samples_fd)
         profiles_identity = _fd_identity(profiles_fd)
+        operations_identity = _fd_identity(operations_fd)
 
         if test_hook is not None:
             test_hook("directory_ready", destination, comparison_id)
@@ -2678,6 +2960,8 @@ def publish_evidence(
                     parent_fd = samples_fd
                 elif prefix == "profiles":
                     parent_fd = profiles_fd
+                elif prefix == "operations":
+                    parent_fd = operations_fd
                 else:
                     raise EvidenceError(f"unsafe evidence path: {relative}")
             _atomic_write_at(parent_fd, name, data)
@@ -2690,6 +2974,9 @@ def publish_evidence(
         _verify_child_identity(root_fd, comparison_id, destination_identity, "evidence directory")
         _verify_child_identity(destination_fd, "samples", samples_identity, "samples directory")
         _verify_child_identity(destination_fd, "profiles", profiles_identity, "profiles directory")
+        _verify_child_identity(
+            destination_fd, "operations", operations_identity, "operations directory"
+        )
         index = {
             "schema_version": INDEX_VERSION,
             "state": "complete",
@@ -2709,6 +2996,9 @@ def publish_evidence(
         _verify_child_identity(root_fd, comparison_id, destination_identity, "evidence directory")
         _verify_child_identity(destination_fd, "samples", samples_identity, "samples directory")
         _verify_child_identity(destination_fd, "profiles", profiles_identity, "profiles directory")
+        _verify_child_identity(
+            destination_fd, "operations", operations_identity, "operations directory"
+        )
         os.fsync(destination_fd)
         os.fsync(root_fd)
         return destination
@@ -2717,7 +3007,13 @@ def publish_evidence(
     except (OSError, TypeError, ValueError) as error:
         raise EvidenceError(f"could not publish evidence without replacement: {error}") from error
     finally:
-        for descriptor in (profiles_fd, samples_fd, destination_fd, root_fd):
+        for descriptor in (
+            operations_fd,
+            profiles_fd,
+            samples_fd,
+            destination_fd,
+            root_fd,
+        ):
             if descriptor is not None:
                 try:
                     os.close(descriptor)
@@ -2869,6 +3165,9 @@ def _evidence_payloads(
         corpus_path: identity["fixed"]["corpus_index_raw_json"].encode("utf-8"),
         "profiles/evaluator-source.py": _EVALUATOR_SOURCE_BYTES,
     }
+    for name, row in sorted(document["operations"].items()):
+        if row["raw_json"] is not None:
+            payload_by_path[f"operations/{name}.json"] = row["raw_json"].encode("utf-8")
     refs: dict[str, list[dict[str, Any]]] = {
         "warmups": [],
         "calibration": [],
@@ -3033,7 +3332,12 @@ def _set_peak_metric_value(metric: dict[str, Any], value: int) -> None:
 
 
 def _pending(reason: str) -> dict[str, Any]:
-    return {"status": "pending", "reason": reason, "evidence_sha256": None}
+    return {
+        "status": "pending",
+        "reason": reason,
+        "evidence_sha256": None,
+        "raw_json": None,
+    }
 
 
 def _sample(
@@ -4285,6 +4589,7 @@ class BaselineSelftest:
             "status": "fail",
             "reason": "fuzz-PC engine smoke failed",
             "evidence_sha256": None,
+            "raw_json": None,
         }
         result = evaluate_document(document)
         _require(result["performance_status"] == "pass", "performance fixture unexpectedly failed")

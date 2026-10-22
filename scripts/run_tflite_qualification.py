@@ -13,6 +13,8 @@ import subprocess
 import sys
 from typing import Any
 
+import collect_tflite_evidence as tflite_evidence
+
 
 SUITES: dict[str, tuple[tuple[str, str | None, str], ...]] = {
     "unit": (
@@ -114,32 +116,47 @@ def add_if_file(paths: set[Path], path: Path) -> None:
         paths.add(resolved)
 
 
-def identity_paths(project_root: Path, target_root: Path, checker: Path | None) -> list[Path]:
+def identity_paths(
+    project_root: Path,
+    target_root: Path,
+    checker: Path | None,
+    bundle_files: list[Path] | None = None,
+) -> list[Path]:
     paths: set[Path] = {
         (project_root / "scripts" / "tflite_qualification_task.py").resolve(strict=True),
-        *(command_path(name) for name in SYSTEM_COMMANDS),
     }
+    if bundle_files is not None:
+        paths.update(
+            {
+                (project_root / "scripts" / "collect_tflite_evidence.py").resolve(strict=True),
+                (project_root / "scripts" / "measure_format_baseline.py").resolve(strict=True),
+                *bundle_files,
+            }
+        )
+    else:
+        paths.update(command_path(name) for name in SYSTEM_COMMANDS)
     if checker is not None:
         paths.add(checker.resolve(strict=True))
-    for name in EXTRA_SCRIPT_DEPENDENCIES:
-        add_if_file(paths, project_root / "scripts" / name)
-    for path in (
-        project_root / "target/debug/tool",
-        project_root / "src/main.rs",
-        target_root / "profile.json",
-        target_root / "build-identity.json",
-        target_root / "fixtures/manifest.json",
-        target_root / "guided-instrumentation.json",
-        target_root / "coverage-instrumentation.json",
-        project_root / "harnesses/tflite/tflite_loader_replay",
-        project_root / "harnesses/tflite/tflite_loader_fuzzer",
-        project_root / "harnesses/tflite/tflite_structural_mutator",
-    ):
-        add_if_file(paths, path)
-    fixtures = target_root / "fixtures"
-    if fixtures.is_dir():
-        for path in fixtures.iterdir():
+    if bundle_files is None:
+        for name in EXTRA_SCRIPT_DEPENDENCIES:
+            add_if_file(paths, project_root / "scripts" / name)
+        for path in (
+            project_root / "target/debug/tool",
+            project_root / "src/main.rs",
+            target_root / "profile.json",
+            target_root / "build-identity.json",
+            target_root / "fixtures/manifest.json",
+            target_root / "guided-instrumentation.json",
+            target_root / "coverage-instrumentation.json",
+            project_root / "harnesses/tflite/tflite_loader_replay",
+            project_root / "harnesses/tflite/tflite_loader_fuzzer",
+            project_root / "harnesses/tflite/tflite_structural_mutator",
+        ):
             add_if_file(paths, path)
+        fixtures = target_root / "fixtures"
+        if fixtures.is_dir():
+            for path in fixtures.iterdir():
+                add_if_file(paths, path)
     ordered = sorted(paths, key=str)
     if len(ordered) > 64:
         raise RunError(f"task identity inventory exceeds FND-03 limit: {len(ordered)}")
@@ -154,11 +171,31 @@ def task(
     checker_name: str | None,
     marker_or_reason: str,
     allowed_env: dict[str, str],
+    evidence_bundle: Path | None,
+    evidence_files: list[Path] | None,
+    expected_commit: str,
+    expected_profile_sha256: str,
 ) -> dict[str, Any]:
     helper = (project_root / "scripts/tflite_qualification_task.py").resolve(strict=True)
     task_id = f"{requirement.lower()}-tflite"
     checker = (project_root / "scripts" / checker_name).resolve(strict=True) if checker_name else None
-    if checker is None:
+    if evidence_bundle is not None:
+        argv = [
+            str(python),
+            "-B",
+            str(helper),
+            "evidence",
+            "--bundle",
+            str(evidence_bundle),
+            "--requirement",
+            requirement,
+            "--expected-commit",
+            expected_commit,
+            "--expected-profile-sha256",
+            expected_profile_sha256,
+            "--require-current-aa",
+        ]
+    elif checker is None:
         argv = [str(python), "-B", str(helper), "blocked", "--reason", marker_or_reason]
     else:
         argv = [
@@ -178,7 +215,10 @@ def task(
         "requirement_id": requirement,
         "command_argv": argv,
         "cwd": str(project_root),
-        "identity_files": [regular_identity(path) for path in identity_paths(project_root, target_root, checker)],
+        "identity_files": [
+            regular_identity(path)
+            for path in identity_paths(project_root, target_root, checker, evidence_files)
+        ],
         "allowed_env": allowed_env,
         "timeout_ms": 900000,
         "stdout_limit_bytes": 8 * 1024 * 1024,
@@ -195,6 +235,8 @@ def main() -> int:
     parser.add_argument("--evidence-root", required=True, type=Path)
     parser.add_argument("--requirements-root", required=True, type=Path)
     parser.add_argument("--qualification-output", required=True, type=Path)
+    parser.add_argument("--q10-evidence", type=Path)
+    parser.add_argument("--q11-evidence", type=Path)
     parser.add_argument("--status", choices=("smoke_passed", "verified"), default="smoke_passed")
     args = parser.parse_args()
 
@@ -206,9 +248,34 @@ def main() -> int:
     qualification_output = args.qualification_output.absolute()
     if evidence_root.exists() or requirements_root.exists():
         raise RunError("evidence and requirements roots must be new paths")
+    profile_hash = digest(profile)
+    expected_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project_root,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    evidence_by_requirement: dict[str, tuple[Path, list[Path]]] = {}
+    for requirement, value in (("Q10", args.q10_evidence), ("Q11", args.q11_evidence)):
+        if value is None:
+            continue
+        bundle = value.resolve(strict=True)
+        try:
+            files = tflite_evidence.validate_bundle(
+                bundle,
+                requirement=requirement,
+                expected_commit=expected_commit,
+                expected_profile_sha256=profile_hash,
+                require_current_aa=True,
+            )
+        except tflite_evidence.EvidenceError as error:
+            raise RunError(f"{requirement} evidence bundle is invalid: {error}") from error
+        evidence_by_requirement[requirement] = (bundle, files)
     evidence_root.mkdir(mode=0o700, parents=False)
     requirements_root.mkdir(mode=0o700, parents=False)
-    profile_hash = digest(profile)
     python = Path(sys.executable).resolve(strict=True)
     acceptance = (project_root / "scripts/check_format_acceptance.py").resolve(strict=True)
     assembler = (project_root / "scripts/qualify_tflite.py").resolve(strict=True)
@@ -232,10 +299,27 @@ def main() -> int:
         allowed_env["NM"] = os.environ["NM"]
 
     for suite, entries in SUITES.items():
-        tasks = [
-            task(project_root, target_root, python, requirement, checker, marker, allowed_env)
-            for requirement, checker, marker in entries
-        ]
+        tasks = []
+        suite_is_blocked = False
+        for requirement, checker, marker in entries:
+            evidence = evidence_by_requirement.get(requirement)
+            if checker is None and evidence is None:
+                suite_is_blocked = True
+            tasks.append(
+                task(
+                    project_root,
+                    target_root,
+                    python,
+                    requirement,
+                    checker,
+                    marker,
+                    allowed_env,
+                    evidence[0] if evidence is not None else None,
+                    evidence[1] if evidence is not None else None,
+                    expected_commit,
+                    profile_hash,
+                )
+            )
         requirements = {
             "schema_version": "1",
             "target_id": "tflite",
@@ -275,7 +359,7 @@ def main() -> int:
         )
         sys.stdout.write(completed.stdout)
         sys.stderr.write(completed.stderr)
-        expected_rc = 2 if any(checker is None for _requirement, checker, _marker in entries) else 0
+        expected_rc = 2 if suite_is_blocked else 0
         if completed.returncode != expected_rc:
             raise RunError(f"{suite} acceptance suite returned rc={completed.returncode}, expected {expected_rc}")
         print(f"TFL07_SUITE_OK=yes suite={suite} rc={completed.returncode}")
@@ -311,6 +395,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (RunError, OSError, ValueError) as error:
+    except (RunError, OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"[tflite-qualification-run] fail: {error}", file=sys.stderr)
         raise SystemExit(1)

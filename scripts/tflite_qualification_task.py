@@ -68,10 +68,43 @@ def main() -> int:
     gate.add_argument("--isolated-cwd", action="store_true")
     blocked = subparsers.add_parser("blocked")
     blocked.add_argument("--reason", required=True)
+    evidence = subparsers.add_parser("evidence")
+    evidence.add_argument("--bundle", required=True, type=Path)
+    evidence.add_argument("--requirement", required=True, choices=("Q10", "Q11"))
+    evidence.add_argument("--expected-commit", required=True)
+    evidence.add_argument("--expected-profile-sha256", required=True)
+    evidence.add_argument("--require-current-aa", action="store_true")
     args = parser.parse_args()
 
     if args.mode == "blocked":
         emit("blocked", args.reason, "independent measured evidence", None)
+        return 0
+
+    if args.mode == "evidence":
+        import collect_tflite_evidence as tflite_evidence
+
+        try:
+            identities = tflite_evidence.validate_bundle(
+                args.bundle,
+                requirement=args.requirement,
+                expected_commit=args.expected_commit,
+                expected_profile_sha256=args.expected_profile_sha256,
+                require_current_aa=args.require_current_aa,
+            )
+        except tflite_evidence.EvidenceError as error:
+            emit(
+                "fail",
+                "complete Q10/Q11 bundle failed full revalidation",
+                {"requirement": args.requirement, "verdict": "pass"},
+                {"error": str(error)},
+            )
+            return 0
+        emit(
+            "pass",
+            "complete Q10/Q11 bundle passed full revalidation",
+            {"requirement": args.requirement, "verdict": "pass"},
+            {"identity_file_count": len(identities)},
+        )
         return 0
 
     checker = args.checker

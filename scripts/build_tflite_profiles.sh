@@ -428,16 +428,28 @@ profile = {
         "runtime_env": {"LC_ALL": "C", "OMP_NUM_THREADS": "1"},
         "rust_panic": "abort",
     },
-    "binaries": [{
-        "role": "replay",
-        "path": replay_path,
-        "sha256": replay_sha,
-        "argv": ["{input}"],
-        "linked_libraries": [
-            {"path": main_library, "sha256": file_sha(main_library)},
-            {"path": loader_library, "sha256": file_sha(loader_library)},
-        ],
-    }],
+    "binaries": [
+        {
+            "role": "replay",
+            "path": replay_path,
+            "sha256": replay_sha,
+            "argv": ["{input}"],
+            "linked_libraries": [
+                {"path": main_library, "sha256": file_sha(main_library)},
+                {"path": loader_library, "sha256": file_sha(loader_library)},
+            ],
+        },
+        {
+            "role": "fuzzer",
+            "path": fuzzer_path,
+            "sha256": fuzzer_sha,
+            "argv": ["{corpus_dir}"],
+            "linked_libraries": [
+                {"path": main_library, "sha256": file_sha(main_library)},
+                {"path": loader_library, "sha256": file_sha(loader_library)},
+            ],
+        },
+    ],
     "input_kind": {"kind": "single", "extensions": ["tflite"], "subformats": []},
     "depth": "load-allocate-access",
     "engine_capabilities": [{
