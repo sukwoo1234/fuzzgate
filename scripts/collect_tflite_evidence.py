@@ -842,6 +842,136 @@ def _current_cgroup_parent() -> Path:
     return parent
 
 
+def _cgroup_tokens(path: Path, label: str) -> set[str]:
+    try:
+        text = path.read_text(encoding="ascii")
+    except OSError as error:
+        raise EvidenceError(f"could not read {label}: {path}: {error}") from error
+    tokens = text.split()
+    if any(re.fullmatch(r"[a-z][a-z0-9_.-]*", token) is None for token in tokens):
+        raise EvidenceError(f"{label} contains an invalid controller name")
+    return set(tokens)
+
+
+def _cgroup_pids(path: Path, label: str) -> list[int]:
+    try:
+        rows = path.read_text(encoding="ascii").splitlines()
+    except OSError as error:
+        raise EvidenceError(f"could not read {label}: {path}: {error}") from error
+    result: list[int] = []
+    seen: set[int] = set()
+    for row in rows:
+        if re.fullmatch(r"[1-9][0-9]*", row) is None:
+            raise EvidenceError(f"{label} contains an invalid PID")
+        pid = int(row)
+        if pid not in seen:
+            seen.add(pid)
+            result.append(pid)
+    return result
+
+
+def _write_cgroup_value(path: Path, value: str, label: str) -> None:
+    try:
+        with path.open("w", encoding="ascii") as stream:
+            stream.write(f"{value}\n")
+    except OSError as error:
+        raise EvidenceError(f"could not write {label}: {path}: {error}") from error
+
+
+class MemoryCgroupSession:
+    def __init__(self, parent: Path) -> None:
+        self.parent = parent
+        self.manager = parent / f"tflite-collector-{os.getpid()}"
+        self.manager_created = False
+        self.memory_enabled = False
+
+    def _move_all(self, source: Path, destination: Path, label: str) -> None:
+        for pid in _cgroup_pids(source / "cgroup.procs", f"{label} source processes"):
+            _write_cgroup_value(
+                destination / "cgroup.procs",
+                str(pid),
+                f"{label} process {pid}",
+            )
+        residual = _cgroup_pids(source / "cgroup.procs", f"{label} residual processes")
+        if residual:
+            raise EvidenceError(f"{label} left processes in {source}: {residual}")
+
+    def _restore(self) -> None:
+        if self.memory_enabled:
+            _write_cgroup_value(
+                self.parent / "cgroup.subtree_control",
+                "-memory",
+                "delegated memory controller disable",
+            )
+            if "memory" in _cgroup_tokens(
+                self.parent / "cgroup.subtree_control",
+                "delegated subtree controls after disable",
+            ):
+                raise EvidenceError("delegated memory controller remained enabled")
+            self.memory_enabled = False
+        if self.manager_created:
+            self._move_all(self.manager, self.parent, "collector cgroup restore")
+            try:
+                self.manager.rmdir()
+            except OSError as error:
+                raise EvidenceError(
+                    f"could not remove collector manager cgroup: {self.manager}: {error}"
+                ) from error
+            self.manager_created = False
+
+    def __enter__(self) -> Path:
+        controllers = _cgroup_tokens(
+            self.parent / "cgroup.controllers", "delegated cgroup controllers"
+        )
+        if "memory" not in controllers:
+            raise EvidenceError("delegated cgroup does not make the memory controller available")
+        if "memory" in _cgroup_tokens(
+            self.parent / "cgroup.subtree_control", "delegated subtree controls before setup"
+        ):
+            raise EvidenceError("delegated cgroup memory controller was already enabled")
+        if self.manager.exists() or self.manager.is_symlink():
+            raise EvidenceError(f"collector manager cgroup already exists: {self.manager}")
+        try:
+            self.manager.mkdir(mode=0o700)
+        except OSError as error:
+            raise EvidenceError(
+                f"could not create collector manager cgroup: {self.manager}: {error}"
+            ) from error
+        self.manager_created = True
+        try:
+            self._move_all(self.parent, self.manager, "collector cgroup isolation")
+            _write_cgroup_value(
+                self.parent / "cgroup.subtree_control",
+                "+memory",
+                "delegated memory controller enable",
+            )
+            self.memory_enabled = True
+            if "memory" not in _cgroup_tokens(
+                self.parent / "cgroup.subtree_control",
+                "delegated subtree controls after enable",
+            ):
+                raise EvidenceError("delegated memory controller was not enabled")
+            try:
+                (self.manager / "memory.peak").read_text(encoding="ascii")
+            except OSError as error:
+                raise EvidenceError(
+                    f"collector manager cgroup lacks readable memory.peak: {error}"
+                ) from error
+        except Exception as error:
+            try:
+                self._restore()
+            except Exception as cleanup_error:
+                raise EvidenceError(
+                    f"memory cgroup setup failed and cleanup failed: {cleanup_error}"
+                ) from error
+            raise
+        return self.parent
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        self._restore()
+        return False
+
+
 class SampleCgroup:
     def __init__(self, parent: Path, sample_id: str, _memory_limit: int) -> None:
         if baseline.SAFE_ID.fullmatch(sample_id) is None:
@@ -1650,7 +1780,8 @@ def performance(args: argparse.Namespace) -> int:
         "/sys/fs/cgroup/"
     ):
         raise EvidenceError("cgroup parent must be a delegated child below /sys/fs/cgroup")
-    document = _performance_document(prepared, cgroup_parent)
+    with MemoryCgroupSession(cgroup_parent) as sample_parent:
+        document = _performance_document(prepared, sample_parent)
     if read_prepare(run_root, recheck=True) != prepared:
         raise EvidenceError("prepared identity changed during Q10 collection")
     _require_current_aa(document, prepared)

@@ -250,6 +250,103 @@ def collector_performance_cli_runs_workload() -> None:
         raise AssertionError("performance still imports caller-authored observations")
 
 
+def memory_controller_is_enabled_for_private_sample_leaves() -> None:
+    collector = load_collector()
+    sample_id = "controller-enabled-sample"
+    with tempfile.TemporaryDirectory(prefix="tflite-cgroup-controller-") as raw:
+        parent = Path(raw)
+        manager = parent / f"tflite-collector-{os.getpid()}"
+        sample = parent / sample_id
+        pids = {
+            parent: [os.getpid(), os.getppid()],
+            manager: [],
+        }
+        memory_enabled = False
+        events: list[str] = []
+        original_mkdir = Path.mkdir
+        original_tokens = collector._cgroup_tokens
+        original_pids = collector._cgroup_pids
+        original_write = collector._write_cgroup_value
+
+        def seeded_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+            original_mkdir(path, *args, **kwargs)
+            if path == sample and memory_enabled:
+                (path / "memory.peak").write_text("0\n", encoding="ascii")
+
+        def fake_tokens(path: Path, _label: str) -> set[str]:
+            if path == parent / "cgroup.controllers":
+                return {"cpu", "memory", "pids"}
+            if path == parent / "cgroup.subtree_control":
+                return {"memory"} if memory_enabled else set()
+            raise AssertionError(f"unexpected token read: {path}")
+
+        def fake_pids(path: Path, _label: str) -> list[int]:
+            group = path.parent
+            if group not in pids:
+                raise AssertionError(f"unexpected PID read: {path}")
+            return list(pids[group])
+
+        def fake_write(path: Path, value: str, _label: str) -> None:
+            nonlocal memory_enabled
+            if path == manager / "cgroup.procs":
+                pid = int(value)
+                pids[parent].remove(pid)
+                pids[manager].append(pid)
+                events.append(f"move-in:{pid}")
+                return
+            if path == parent / "cgroup.procs":
+                pid = int(value)
+                pids[manager].remove(pid)
+                pids[parent].append(pid)
+                events.append(f"move-out:{pid}")
+                return
+            if path == parent / "cgroup.subtree_control" and value == "+memory":
+                if pids[parent]:
+                    raise AssertionError("memory controller enabled before parent was empty")
+                memory_enabled = True
+                (manager / "memory.peak").write_text("0\n", encoding="ascii")
+                events.append("enable-memory")
+                return
+            if path == parent / "cgroup.subtree_control" and value == "-memory":
+                memory_enabled = False
+                (manager / "memory.peak").unlink()
+                events.append("disable-memory")
+                return
+            raise AssertionError(f"unexpected cgroup write: {path}={value!r}")
+
+        try:
+            Path.mkdir = seeded_mkdir
+            collector._cgroup_tokens = fake_tokens
+            collector._cgroup_pids = fake_pids
+            collector._write_cgroup_value = fake_write
+            with collector.MemoryCgroupSession(parent) as sample_parent:
+                if sample_parent != parent or not memory_enabled or pids[parent]:
+                    raise AssertionError("collector did not prepare an empty controller parent")
+                group = collector.SampleCgroup(sample_parent, sample_id, 1_073_741_824)
+                if not (group.path / "memory.peak").is_file():
+                    raise AssertionError("private sample leaf lacks memory.peak after activation")
+                (group.path / "memory.peak").unlink()
+                group.path.rmdir()
+        finally:
+            Path.mkdir = original_mkdir
+            collector._cgroup_tokens = original_tokens
+            collector._cgroup_pids = original_pids
+            collector._write_cgroup_value = original_write
+            (sample / "memory.peak").unlink(missing_ok=True)
+            if sample.exists():
+                sample.rmdir()
+            if manager.exists():
+                manager.rmdir()
+        if memory_enabled or pids[manager] or sorted(pids[parent]) != sorted((os.getpid(), os.getppid())):
+            raise AssertionError("collector did not restore the delegated parent")
+        if events[-3:] != [
+            "disable-memory",
+            f"move-out:{os.getpid()}",
+            f"move-out:{os.getppid()}",
+        ]:
+            raise AssertionError(f"wrong cgroup cleanup order: {events}")
+
+
 def read_only_cgroup_limit_still_collects_peak() -> None:
     collector = load_collector()
     sample_id = "read-only-memory-limit"
@@ -944,6 +1041,10 @@ CASES = (
     ("wrong profile is refused", wrong_profile_is_rejected),
     ("wrong soak binary role is refused", wrong_soak_binary_role_is_rejected),
     ("performance CLI runs workload directly", collector_performance_cli_runs_workload),
+    (
+        "memory controller is enabled for private sample leaves",
+        memory_controller_is_enabled_for_private_sample_leaves,
+    ),
     (
         "read-only cgroup limit still permits peak collection",
         read_only_cgroup_limit_still_collects_peak,
