@@ -42,6 +42,16 @@ exit 0
 TOOL
 chmod +x "$WORK/bin/tool"
 
+# The host preflight checks that Cargo is discoverable, but this suite only
+# verifies registry routing.  Supply a fixture command so the result does not
+# depend on whether the acceptance runner's deliberately minimal PATH happens
+# to contain the host's Cargo installation.
+cat >"$WORK/bin/cargo" <<'CARGO'
+#!/usr/bin/env bash
+exit 0
+CARGO
+chmod +x "$WORK/bin/cargo"
+
 cat >"$WORK/net-bin/curl" <<'CURL'
 #!/usr/bin/env bash
 set -eu
@@ -236,6 +246,7 @@ extra_env=(
   SPEC_MUTATION_SUPPORTED=1
   SPEC_CAMPAIGN_SUPPORTED=1
   HOME="$WORK"
+  PATH="$WORK/bin:$PATH"
 )
 
 run_success "host preflight resolves registry seed_subdir and input_ext" \
