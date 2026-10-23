@@ -45,6 +45,15 @@ PERFORMANCE_SOURCE_PATHS = (
     "scripts/collect_tflite_evidence.py",
     "scripts/measure_format_baseline.py",
 )
+INITIAL_PERFORMANCE_PAIRS = 5
+MAX_PERFORMANCE_PAIRS = 10
+EXTENDABLE_INTERVAL_REASONS = frozenset(
+    {
+        "throughput interval crosses the allowed boundary",
+        "peak_rss interval crosses the allowed boundary",
+        "latency_p95 interval crosses the allowed boundary",
+    }
+)
 LOAD_EVENT = "LoadAndAllocate"
 LOAD_MARKER = re.compile(rb"(?m)^TFLITE_LOAD_(?:OK|REJECT)\b")
 LOAD_OK_MARKER = re.compile(rb"(?m)^TFLITE_LOAD_OK\b")
@@ -1446,6 +1455,31 @@ def _collect_sample(
     }
 
 
+def _performance_extension_blocker(prepared: dict[str, Any]) -> str | None:
+    active = active_workloads()
+    if active:
+        return (
+            "concurrent fuzz/build workload appeared before Q10 comparison extension: "
+            f"{active[0]}"
+        )
+    try:
+        _memory_total, memory_available, _swap_total, swap_free = _system_memory()
+    except EvidenceError as error:
+        return str(error)
+    if memory_available + swap_free < (
+        prepared["budgets"]["peak_rss_bytes"]
+        + prepared["budgets"]["peak_rss_bytes"] // 2
+    ):
+        return "current WSL memory/swap cannot safely extend Q10 comparison"
+    try:
+        disk = os.statvfs(Path(prepared["corpus_index"]).parent)
+    except OSError as error:
+        return f"could not recheck disk space before Q10 comparison extension: {error}"
+    if disk.f_bavail * disk.f_frsize < prepared["budgets"]["disk_bytes"]:
+        return "current disk space cannot safely extend Q10 comparison"
+    return None
+
+
 def _performance_document(
     prepared: dict[str, Any],
     cgroup_parent: Path,
@@ -1579,7 +1613,7 @@ def _performance_document(
         for index, arm in enumerate(("calibration", "baseline", "candidate"), start=1)
     ]
     calibration: list[dict[str, Any]] = []
-    for index in range(1, 6):
+    for index in range(1, INITIAL_PERFORMANCE_PAIRS + 1):
         calibration.append(
             {
                 "pair_index": index,
@@ -1608,33 +1642,36 @@ def _performance_document(
     comparison_context = baseline._comparison_measurement_context_sha256(
         calibration_context, sha256_bytes(canonical(calibration))
     )
-    comparison: list[dict[str, Any]] = []
-    for index in range(1, 6):
-        comparison.append(
-            {
-                "pair_index": index,
-                "baseline": _collect_sample(
-                    sample_id=f"q10-pair-{index}-base",
-                    phase="comparison",
-                    arm="baseline",
-                    pair_index=index,
-                    order_index=index * 2 - 1,
-                    minimum_seconds=sample_seconds,
-                    context_sha256=comparison_context,
-                    **common_sample,
-                ),
-                "candidate": _collect_sample(
-                    sample_id=f"q10-pair-{index}-candidate",
-                    phase="comparison",
-                    arm="candidate",
-                    pair_index=index,
-                    order_index=index * 2,
-                    minimum_seconds=sample_seconds,
-                    context_sha256=comparison_context,
-                    **common_sample,
-                ),
-            }
-        )
+
+    def collect_comparison_pair(index: int) -> dict[str, Any]:
+        return {
+            "pair_index": index,
+            "baseline": _collect_sample(
+                sample_id=f"q10-pair-{index}-base",
+                phase="comparison",
+                arm="baseline",
+                pair_index=index,
+                order_index=index * 2 - 1,
+                minimum_seconds=sample_seconds,
+                context_sha256=comparison_context,
+                **common_sample,
+            ),
+            "candidate": _collect_sample(
+                sample_id=f"q10-pair-{index}-candidate",
+                phase="comparison",
+                arm="candidate",
+                pair_index=index,
+                order_index=index * 2,
+                minimum_seconds=sample_seconds,
+                context_sha256=comparison_context,
+                **common_sample,
+            ),
+        }
+
+    comparison = [
+        collect_comparison_pair(index)
+        for index in range(1, INITIAL_PERFORMANCE_PAIRS + 1)
+    ]
     source_artifacts = {
         path: sha256_bytes(regular_bytes(Path(prepared["project_root"]) / path, path))
         for path in PERFORMANCE_SOURCE_PATHS
@@ -1689,74 +1726,118 @@ def _performance_document(
             for name in OPERATION_NAMES
         },
     }
-    all_samples = warmups + [
-        sample
-        for pair in [*calibration, *comparison]
-        for key, sample in pair.items()
-        if key != "pair_index"
-    ]
-    performance_ended = datetime.now(timezone.utc)
-    operation_duration = (performance_ended - operation_started).total_seconds()
-    observed_peak = max(sample["peak_rss"]["value"] for sample in all_samples)
-    observed_output = sum(sample["output_bytes"]["value"] for sample in all_samples)
-    observed_calls = sum(sample["target_api_calls"]["value"] for sample in all_samples)
-    raw_operation = {
-        "schema_version": "tflite-v7-operation-v1",
-        "operation": "actual_parser_performance",
-        "mode": "real",
-        "target_id": profile["target_id"],
-        "tool_commit": prepared["tool_commit"],
-        "dirty_diff_sha256": None,
-        "profile_sha256": prepared["profile_sha256"],
-        "command": command,
-        "command_sha256": command_sha,
-        "corpus_before_sha256": prepared["corpus_sha256"],
-        "corpus_after_sha256": audit_corpus(Path(prepared["corpus_index"]))[0],
-        "started_utc": operation_started.isoformat().replace("+00:00", "Z"),
-        "ended_utc": performance_ended.isoformat().replace("+00:00", "Z"),
-        "duration_seconds": operation_duration,
-        "target_api_calls": observed_calls,
-        "worker_count": 1,
-        "expected_outcome": "completed",
-        "observed_outcome": "completed",
-        "exit_code": 0,
-        "signal": None,
-        "residual_processes": sum(
-            sample["residual_processes"]["value"] for sample in all_samples
-        ),
-        "resource_samples": [
-            {
-                "elapsed_seconds": 0.0,
-                "peak_rss_bytes": 0,
-                "log_bytes": 0,
-                "disk_bytes": 0,
-                "owned_processes": 0,
-            },
-            {
-                "elapsed_seconds": operation_duration,
-                "peak_rss_bytes": observed_peak,
-                "log_bytes": observed_output,
-                "disk_bytes": 0,
-                "owned_processes": 0,
-            },
-        ],
-        "budgets": dict(prepared["budgets"]),
-        "artifacts": [
-            {
-                "path": "corpus-index.json",
-                "sha256": prepared["corpus_index_sha256"],
-                "size_bytes": len(corpus_payload),
-            }
-        ],
-    }
-    raw_text = canonical(raw_operation).decode("utf-8")
-    if mode == "real":
-        document["operations"]["actual_parser_performance"] = {
-            "status": "pass",
-            "reason": None,
-            "evidence_sha256": sha256_bytes(raw_text.encode("utf-8")),
-            "raw_json": raw_text,
+
+    def finalize_actual_parser_operation() -> None:
+        all_samples = warmups + [
+            sample
+            for pair in [*calibration, *comparison]
+            for key, sample in pair.items()
+            if key != "pair_index"
+        ]
+        performance_ended = datetime.now(timezone.utc)
+        operation_duration = (performance_ended - operation_started).total_seconds()
+        observed_peak = max(sample["peak_rss"]["value"] for sample in all_samples)
+        observed_output = sum(sample["output_bytes"]["value"] for sample in all_samples)
+        observed_calls = sum(sample["target_api_calls"]["value"] for sample in all_samples)
+        raw_operation = {
+            "schema_version": "tflite-v7-operation-v1",
+            "operation": "actual_parser_performance",
+            "mode": "real",
+            "target_id": profile["target_id"],
+            "tool_commit": prepared["tool_commit"],
+            "dirty_diff_sha256": None,
+            "profile_sha256": prepared["profile_sha256"],
+            "command": command,
+            "command_sha256": command_sha,
+            "corpus_before_sha256": prepared["corpus_sha256"],
+            "corpus_after_sha256": audit_corpus(Path(prepared["corpus_index"]))[0],
+            "started_utc": operation_started.isoformat().replace("+00:00", "Z"),
+            "ended_utc": performance_ended.isoformat().replace("+00:00", "Z"),
+            "duration_seconds": operation_duration,
+            "target_api_calls": observed_calls,
+            "worker_count": 1,
+            "expected_outcome": "completed",
+            "observed_outcome": "completed",
+            "exit_code": 0,
+            "signal": None,
+            "residual_processes": sum(
+                sample["residual_processes"]["value"] for sample in all_samples
+            ),
+            "resource_samples": [
+                {
+                    "elapsed_seconds": 0.0,
+                    "peak_rss_bytes": 0,
+                    "log_bytes": 0,
+                    "disk_bytes": 0,
+                    "owned_processes": 0,
+                },
+                {
+                    "elapsed_seconds": operation_duration,
+                    "peak_rss_bytes": observed_peak,
+                    "log_bytes": observed_output,
+                    "disk_bytes": 0,
+                    "owned_processes": 0,
+                },
+            ],
+            "budgets": dict(prepared["budgets"]),
+            "artifacts": [
+                {
+                    "path": "corpus-index.json",
+                    "sha256": prepared["corpus_index_sha256"],
+                    "size_bytes": len(corpus_payload),
+                }
+            ],
         }
+        raw_text = canonical(raw_operation).decode("utf-8")
+        if mode == "real":
+            document["operations"]["actual_parser_performance"] = {
+                "status": "pass",
+                "reason": None,
+                "evidence_sha256": sha256_bytes(raw_text.encode("utf-8")),
+                "raw_json": raw_text,
+            }
+
+    finalize_actual_parser_operation()
+    try:
+        initial_evaluation = baseline.evaluate_document(document)
+    except baseline.ContractError:
+        return document
+    initial_reasons = set(initial_evaluation.get("reasons", ()))
+    should_extend = (
+        initial_evaluation.get("performance_status") == "inconclusive"
+        and bool(initial_reasons)
+        and initial_reasons <= EXTENDABLE_INTERVAL_REASONS
+    )
+    if should_extend:
+        if mode == "real":
+            try:
+                blocker = _performance_extension_blocker(prepared)
+            except Exception as error:
+                blocker = f"resource_recheck_error: {error}"
+            if blocker is not None:
+                print(
+                    "TFLITE_EVIDENCE_Q10_EXTENSION_BLOCKED="
+                    + blocker.replace("\n", " "),
+                    file=sys.stderr,
+                )
+                return document
+        try:
+            extension = [
+                collect_comparison_pair(index)
+                for index in range(
+                    INITIAL_PERFORMANCE_PAIRS + 1,
+                    MAX_PERFORMANCE_PAIRS + 1,
+                )
+            ]
+        except Exception as error:
+            print(
+                "TFLITE_EVIDENCE_Q10_EXTENSION_BLOCKED=collection_error: "
+                + str(error).replace("\n", " "),
+                file=sys.stderr,
+            )
+            return document
+        comparison.extend(extension)
+        finalize_actual_parser_operation()
     return document
 
 

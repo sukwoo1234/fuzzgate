@@ -718,7 +718,19 @@ def collector_builds_nonqualifying_selftest_observations() -> None:
         )
         prepared = collector.read_prepare(run_root, recheck=True)
         original_cgroup = collector.SampleCgroup
+        original_evaluator = collector.baseline.evaluate_document
+        evaluation_calls = 0
+
+        def force_initial_inconclusive(_document: dict[str, Any]) -> dict[str, Any]:
+            nonlocal evaluation_calls
+            evaluation_calls += 1
+            return {
+                "performance_status": "inconclusive",
+                "reasons": ["throughput interval crosses the allowed boundary"],
+            }
+
         collector.SampleCgroup = FakeCgroup
+        collector.baseline.evaluate_document = force_initial_inconclusive
         try:
             document = collector._performance_document(
                 prepared,
@@ -729,14 +741,29 @@ def collector_builds_nonqualifying_selftest_observations() -> None:
             )
         finally:
             collector.SampleCgroup = original_cgroup
+            collector.baseline.evaluate_document = original_evaluator
         result = baseline.evaluate_document(document)
         if (
             document["mode"] != "selftest"
             or document["identity"]["allowed_profile_differences"]
             or document["identity"]["allowed_tool_changes"]
             or result["operations"]["actual_parser_performance"]["status"] != "pending"
+            or len(document["calibration"]) != 5
+            or len(document["comparison"]) != 10
+            or evaluation_calls != 1
         ):
-            raise AssertionError("selftest builder crossed the actual-evidence boundary")
+            raise AssertionError(
+                "selftest builder did not extend one inconclusive comparison without recalibrating"
+            )
+
+        original_active = collector.active_workloads
+        collector.active_workloads = lambda: ["123 synthetic-competing-fuzzer"]
+        try:
+            blocker = collector._performance_extension_blocker(prepared)
+        finally:
+            collector.active_workloads = original_active
+        if "concurrent fuzz/build workload" not in blocker:
+            raise AssertionError(f"extension blocker did not preserve its reason: {blocker!r}")
 
 
 def zero_byte_artifact_is_preserved() -> None:

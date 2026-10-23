@@ -2646,8 +2646,8 @@ def evaluate_document(document: dict[str, Any]) -> dict[str, Any]:
         raise ContractError(f"calibration must contain {MIN_PAIRS} to {MAX_PAIRS} complete pairs")
     if not isinstance(comparison_value, list) or not MIN_PAIRS <= len(comparison_value) <= MAX_PAIRS:
         raise ContractError(f"comparison must contain {MIN_PAIRS} to {MAX_PAIRS} complete pairs")
-    if len(calibration_value) != len(comparison_value):
-        raise ContractError("calibration and comparison pair counts must match")
+    # Calibration is fixed before candidate observations.  A boundary-crossing
+    # comparison may therefore grow to ten pairs without recalibrating delta.
 
     calibration_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     comparison_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -4288,6 +4288,52 @@ class BaselineSelftest:
         document["comparison"] = document["comparison"][:4]
         _expect_contract_error(document, "5")
 
+    def comparison_can_extend_without_recalibration(self) -> None:
+        document = _valid_document()
+        identity = document["identity"]
+        fixed = identity["fixed"]
+        for offset in range(5, 10):
+            pair_index = offset + 1
+            document["comparison"].append(
+                {
+                    "pair_index": pair_index,
+                    "baseline": _sample(
+                        phase="comparison",
+                        arm="baseline",
+                        pair_index=pair_index,
+                        order_index=2 * offset + 1,
+                        profile_sha256=identity["baseline_profile_sha256"],
+                        tool_commit=identity["baseline_tool_commit"],
+                        dirty_diff_sha256=identity["baseline_dirty_diff_sha256"],
+                        command_sha256=identity["baseline_command_sha256"],
+                        corpus_sha256=fixed["corpus_sha256"],
+                        corpus_index_sha256=fixed["corpus_index_sha256"],
+                    ),
+                    "candidate": _sample(
+                        phase="comparison",
+                        arm="candidate",
+                        pair_index=pair_index,
+                        order_index=2 * offset + 2,
+                        profile_sha256=identity["candidate_profile_sha256"],
+                        tool_commit=identity["candidate_tool_commit"],
+                        dirty_diff_sha256=identity["candidate_dirty_diff_sha256"],
+                        command_sha256=identity["candidate_command_sha256"],
+                        corpus_sha256=fixed["corpus_sha256"],
+                        corpus_index_sha256=fixed["corpus_index_sha256"],
+                        wall=60.0,
+                        rss=990_000,
+                        latency_scale=0.99,
+                    ),
+                }
+            )
+        _refresh_measurement_context(document)
+        result = evaluate_document(document)
+        _require(
+            result["pair_counts"] == {"calibration": 5, "comparison": 10},
+            f"wrong extended pair counts: {result['pair_counts']}",
+        )
+        _require(result["status"] == "pass", f"extended comparison status={result['status']}")
+
     def short_real_sample_is_rejected(self) -> None:
         document = _valid_document()
         document["mode"] = "real"
@@ -4850,6 +4896,10 @@ SELFTEST_CASES = [
     ("pair indexes are contiguous", "pair_gap_is_rejected"),
     ("arms alternate", "alternation_is_rejected"),
     ("at least five pairs are required", "too_few_pairs_is_rejected"),
+    (
+        "comparison can extend without recalibrating",
+        "comparison_can_extend_without_recalibration",
+    ),
     ("real samples last sixty seconds", "short_real_sample_is_rejected"),
     ("tree RSS collector is truthful", "forged_tree_rss_collector_is_rejected"),
     ("memory collector aliases are rejected", "memory_collector_alias_is_rejected"),
