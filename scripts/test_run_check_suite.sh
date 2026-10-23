@@ -505,6 +505,41 @@ grep -Fq '[fixture-tflite-coverage-build] rebuilt copy-local coverage artifacts'
   exit 1
 }
 
+cat >"$TFLITE_SOURCE/scripts/build_tflite_guided.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'fixture: guided configure detail\n' >"$TFLITE_TARGET_ROOT/guided-configure.log"
+printf 'fixture: guided build detail\n' >"$TFLITE_TARGET_ROOT/guided-build.log"
+echo 'fixture: guided TFLite build failed' >&2
+exit 77
+EOF
+chmod +x "$TFLITE_SOURCE/scripts/build_tflite_guided.sh"
+TFLITE_VARIANT_FAILURE_COPY="$WORK/tflite-variant-failure-copy"
+cp -a "$TFLITE_SOURCE/." "$TFLITE_VARIANT_FAILURE_COPY/"
+rc=0
+bash "$TFLITE_SOURCE/scripts/run_check_suite.sh" \
+  --isolated-root "$TFLITE_VARIANT_FAILURE_COPY" \
+  --log-dir "$WORK/tflite-variant-failure-logs" \
+  >"$WORK/tflite-variant-failure.log" 2>&1 || rc=$?
+[[ "$rc" -eq 2 ]] || {
+  cat "$WORK/tflite-variant-failure.log"
+  echo "TFLite variant failure was not a setup refusal (rc=$rc)" >&2
+  exit 1
+}
+grep -Fq 'copy-local TFLite guided build failed rc=77' \
+  "$WORK/tflite-variant-failure.log"
+grep -Fq 'fixture: guided TFLite build failed' \
+  "$WORK/tflite-variant-failure-logs/setup-tflite-guided.log"
+grep -Fxq 'fixture: guided configure detail' \
+  "$WORK/tflite-variant-failure-logs/setup-tflite-guided-configure.log"
+grep -Fxq 'fixture: guided build detail' \
+  "$WORK/tflite-variant-failure-logs/setup-tflite-guided-build.log"
+[[ -z "$(find "$TFLITE_VARIANT_FAILURE_COPY/data/targets/tflite" -maxdepth 1 -type d \
+  -name '.check-suite-v2.20.0-*' -print -quit)" ]] || {
+  echo 'failed TFLite variant builder left its temporary target root behind' >&2
+  exit 1
+}
+
 cat >"$TFLITE_SOURCE/scripts/build_tflite_profiles.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail

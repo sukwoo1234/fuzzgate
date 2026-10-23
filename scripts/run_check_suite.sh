@@ -322,8 +322,16 @@ if [[ -e "$tflite_builder_source" || -L "$tflite_builder_source" ]]; then
         TFLITE_ARCHIVE="$tflite_archive_copy" JOBS=4 \
         bash -p "$tflite_variant_builder"
     ) >"$tflite_variant_log" 2>&1 || tflite_variant_rc=$?
-    [[ "$tflite_variant_rc" -eq 0 ]] \
-      || fail_setup "copy-local TFLite $tflite_variant build failed rc=$tflite_variant_rc (log: $tflite_variant_log)"
+    if [[ "$tflite_variant_rc" -ne 0 ]]; then
+      for variant_detail_log in "$tflite_target_root/$tflite_variant-"*.log; do
+        if [[ -f "$variant_detail_log" && ! -L "$variant_detail_log" ]]; then
+          variant_detail_name="${variant_detail_log##*/}"
+          cp -- "$variant_detail_log" "$LOG_DIR/setup-tflite-$variant_detail_name" \
+            || fail_setup "could not preserve failed TFLite $variant_detail_name"
+        fi
+      done
+      fail_setup "copy-local TFLite $tflite_variant build failed rc=$tflite_variant_rc (log: $tflite_variant_log)"
+    fi
   done
   for artifact in \
     "$tflite_target_root/build/guided-cmake/tensorflow-lite/libtensorflow-lite.a" \
