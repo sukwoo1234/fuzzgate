@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -380,6 +381,44 @@ def read_only_cgroup_limit_still_collects_peak() -> None:
                 leaf.rmdir()
         if group.path != leaf:
             raise AssertionError("collector changed the private sample cgroup identity")
+
+
+def operation_cgroup_peak_survives_short_child() -> None:
+    collector = load_collector()
+    sample_id = "short-operation-child"
+    expected_peak = 155_189_248
+    with tempfile.TemporaryDirectory(prefix="tflite-short-operation-cgroup-") as raw:
+        parent = Path(raw)
+        leaf = parent / sample_id
+        original_mkdir = Path.mkdir
+
+        def seeded_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+            original_mkdir(path, *args, **kwargs)
+            if path == leaf:
+                (path / "memory.peak").write_text(f"{expected_peak}\n", encoding="ascii")
+                (path / "cgroup.procs").write_text("", encoding="ascii")
+
+        try:
+            Path.mkdir = seeded_mkdir
+            group = collector.SampleCgroup(parent, sample_id, 1_073_741_824)
+            if group.pids():
+                raise AssertionError("short child still appears in the operation cgroup")
+            sample = collector._operation_resource_sample(
+                group=group,
+                started_wall=time.monotonic() - 0.01,
+                descriptors=(),
+                operation_root=parent,
+            )
+            if sample["peak_rss_bytes"] != expected_peak:
+                raise AssertionError("operation cgroup lost the exited child's peak RSS")
+            if sample["owned_processes"] != 0:
+                raise AssertionError("completed short child remained owned")
+        finally:
+            Path.mkdir = original_mkdir
+            for name in ("cgroup.procs", "memory.peak"):
+                (leaf / name).unlink(missing_ok=True)
+            if leaf.exists():
+                leaf.rmdir()
 
 
 def collector_builds_nonqualifying_selftest_observations() -> None:
@@ -905,7 +944,9 @@ def collector_state_machine_selftest_is_nonqualifying() -> None:
         operation_root.mkdir(parents=True)
         child_code = (
             "import time; "
-            "time.sleep(0.03); "
+            "time.sleep(0.05); "
+            "payload=bytearray(64*1024*1024); "
+            "[payload.__setitem__(index,1) for index in range(0,len(payload),4096)]; "
             "print('TFLITE_LOAD_OK stage=allocate_tensors inputs=1 outputs=1 tensors=1 threads=1'); "
             "print('TFLITE_ACCESS_OK tensors=1 constants=0 constant_bytes=0')"
         )
@@ -915,34 +956,60 @@ def collector_state_machine_selftest_is_nonqualifying() -> None:
             "allowed_env": {},
         }
         (operation_root / "command.json").write_bytes(canonical(command))
-        ready_read_fd, ready_write_fd = os.pipe()
-        supervisor = subprocess.Popen(
-            [
-                sys.executable,
-                "-B",
-                str(SCRIPTS / "collect_tflite_evidence.py"),
-                "_supervise",
-                "--run-root",
-                str(run_root),
-                "--operation",
-                "engine_smoke",
-                "--sample-seconds",
-                "0.01",
-                "--ready-fd",
-                str(ready_write_fd),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            pass_fds=(ready_write_fd,),
-            close_fds=True,
-        )
-        os.close(ready_write_fd)
+        class FakeMemoryCgroupSession:
+            def __init__(self, parent: Path) -> None:
+                self.parent = parent
+
+            def __enter__(self) -> Path:
+                return self.parent
+
+            def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> bool:
+                return False
+
+        class FakeOperationCgroup:
+            def __init__(self, _parent: Path, _sample_id: str, _memory_limit: int) -> None:
+                pass
+
+            def child_setup(self) -> None:
+                (operation_root / "cgroup-child-setup").write_text("yes\n", encoding="ascii")
+                os.setsid()
+
+            def peak(self) -> int:
+                return 4096
+
+            def pids(self) -> list[int]:
+                return []
+
+            def finish(self) -> tuple[int, str]:
+                return 0, "4096\n"
+
+        original_parent = collector._current_cgroup_parent
+        original_session = collector.MemoryCgroupSession
+        original_group = collector.SampleCgroup
+        original_sigterm = signal.getsignal(signal.SIGTERM)
+        original_sigint = signal.getsignal(signal.SIGINT)
+        real_cgroup = os.environ.get("TFLITE_SELFTEST_REAL_CGROUP") == "1"
         try:
-            collector._wait_for_supervisor_ready(supervisor, ready_read_fd)
+            if not real_cgroup:
+                collector._current_cgroup_parent = lambda: root
+                collector.MemoryCgroupSession = FakeMemoryCgroupSession
+                collector.SampleCgroup = FakeOperationCgroup
+            supervisor_rc = collector._supervise_operation(
+                argparse.Namespace(
+                    run_root=run_root,
+                    operation="engine_smoke",
+                    sample_seconds=1.0,
+                    ready_fd=None,
+                )
+            )
         finally:
-            os.close(ready_read_fd)
-        if supervisor.wait() != 0 or not (operation_root / "operation.json").is_file():
+            if not real_cgroup:
+                collector._current_cgroup_parent = original_parent
+                collector.MemoryCgroupSession = original_session
+                collector.SampleCgroup = original_group
+            signal.signal(signal.SIGTERM, original_sigterm)
+            signal.signal(signal.SIGINT, original_sigint)
+        if supervisor_rc != 0 or not (operation_root / "operation.json").is_file():
             raise AssertionError("selftest supervisor did not preserve raw operation evidence")
         raw_operation = json.loads(
             (operation_root / "operation.json").read_text(encoding="utf-8")
@@ -952,6 +1019,17 @@ def collector_state_machine_selftest_is_nonqualifying() -> None:
             path.startswith("child-result") for path in artifact_paths
         ):
             raise AssertionError("supervisor trusted a child result instead of raw log markers")
+        if not real_cgroup:
+            if not (operation_root / "cgroup-child-setup").is_file():
+                raise AssertionError("supervisor did not place the operation child in its cgroup")
+            if raw_operation["resource_samples"][-1]["peak_rss_bytes"] != 4096:
+                raise AssertionError("supervisor did not publish the operation cgroup peak")
+        if raw_operation["residual_processes"] != 0:
+            raise AssertionError("supervisor changed the cgroup residual-process result")
+        if real_cgroup and max(
+            row["peak_rss_bytes"] for row in raw_operation["resource_samples"]
+        ) < 64 * 1024 * 1024:
+            raise AssertionError("real operation cgroup missed the short child's peak RSS")
         controller = {
             "schema_version": "tflite-operation-controller-v1",
             "state": "running",
@@ -1048,6 +1126,10 @@ CASES = (
     (
         "read-only cgroup limit still permits peak collection",
         read_only_cgroup_limit_still_collects_peak,
+    ),
+    (
+        "operation cgroup peak survives a short child",
+        operation_cgroup_peak_survives_short_child,
     ),
     (
         "performance builder selftest stays nonqualifying",

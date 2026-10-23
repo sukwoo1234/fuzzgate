@@ -833,12 +833,14 @@ def _current_cgroup_parent() -> Path:
         raise EvidenceError(f"could not read the collector cgroup: {error}") from error
     unified = [row.split(":", 2)[2] for row in rows if row.startswith("0::")]
     if len(unified) != 1:
-        raise EvidenceError("performance collection requires a unified cgroup-v2 hierarchy")
+        raise EvidenceError("evidence collection requires a unified cgroup-v2 hierarchy")
     relative = unified[0].lstrip("/")
+    if not relative:
+        raise EvidenceError("evidence collection refuses the cgroup-v2 hierarchy root")
     parent = Path("/sys/fs/cgroup") / relative
     directory(parent, "delegated cgroup parent")
     if not (parent / "cgroup.controllers").is_file():
-        raise EvidenceError("performance collection requires cgroup v2")
+        raise EvidenceError("evidence collection requires cgroup v2")
     return parent
 
 
@@ -981,7 +983,7 @@ class SampleCgroup:
             self.path.mkdir(mode=0o700)
         except OSError as error:
             raise EvidenceError(
-                "could not create a private sample cgroup; run performance inside a "
+                "could not create a private sample cgroup; run collection inside a "
                 f"delegated cgroup-v2 scope: {self.path}: {error}"
             ) from error
         try:
@@ -1019,6 +1021,15 @@ class SampleCgroup:
             except ProcessLookupError:
                 pass
 
+    def peak(self) -> int:
+        try:
+            raw_peak = (self.path / "memory.peak").read_text(encoding="ascii")
+        except OSError as error:
+            raise EvidenceError(f"could not read sample cgroup memory.peak: {error}") from error
+        if re.fullmatch(r"(?:0|[1-9][0-9]*)\n", raw_peak) is None:
+            raise EvidenceError("sample cgroup memory.peak is not an unsigned byte count")
+        return int(raw_peak.strip())
+
     def finish(self) -> tuple[int, str]:
         residual = len(self.pids())
         if residual:
@@ -1026,9 +1037,8 @@ class SampleCgroup:
             deadline = time.monotonic() + 2.0
             while self.pids() and time.monotonic() < deadline:
                 time.sleep(0.01)
-        raw_peak = (self.path / "memory.peak").read_text(encoding="ascii")
-        if re.fullmatch(r"(?:0|[1-9][0-9]*)\n", raw_peak) is None:
-            raise EvidenceError("sample cgroup memory.peak is not an unsigned byte count")
+        peak = self.peak()
+        raw_peak = f"{peak}\n"
         try:
             self.path.rmdir()
         except OSError as error:
@@ -1857,28 +1867,6 @@ def _wait_for_supervisor_ready(
             raise EvidenceError("supervisor returned an invalid readiness marker")
 
 
-def process_group_sample(group: int) -> tuple[int, int]:
-    count = 0
-    rss = 0
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            stat_text = (entry / "stat").read_text(encoding="ascii")
-            closing = stat_text.rfind(")")
-            fields = stat_text[closing + 2 :].split()
-            if int(fields[2]) != group:
-                continue
-            count += 1
-            for line in (entry / "status").read_text(encoding="ascii").splitlines():
-                if line.startswith("VmRSS:"):
-                    rss += int(line.split()[1]) * 1024
-                    break
-        except (OSError, ValueError, IndexError):
-            continue
-    return count, rss
-
-
 def command_document(path: Path) -> tuple[dict[str, Any], bytes]:
     value, payload = read_json(path, "operation command")
     if set(value) != {"argv", "cwd", "allowed_env"}:
@@ -1920,6 +1908,22 @@ def operation_disk_bytes(operation_root: Path) -> int:
                 raise EvidenceError(f"operation tree contains a non-regular file: {path}")
             total += metadata.st_size
     return total
+
+
+def _operation_resource_sample(
+    *,
+    group: SampleCgroup,
+    started_wall: float,
+    descriptors: Sequence[int],
+    operation_root: Path,
+) -> dict[str, Any]:
+    return {
+        "elapsed_seconds": time.monotonic() - started_wall,
+        "peak_rss_bytes": group.peak(),
+        "log_bytes": sum(os.fstat(descriptor).st_size for descriptor in descriptors),
+        "disk_bytes": operation_disk_bytes(operation_root),
+        "owned_processes": len(group.pids()),
+    }
 
 
 def _copy_worker_corpus(prepared: dict[str, Any], destination: Path) -> None:
@@ -2290,7 +2294,19 @@ def _supervise_operation(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
     samples: list[dict[str, Any]] = []
-    peak_rss = 0
+    cgroup_session = MemoryCgroupSession(_current_cgroup_parent())
+    sample_parent = cgroup_session.__enter__()
+    try:
+        operation_group = SampleCgroup(
+            sample_parent,
+            f"operation-{args.operation}",
+            operation_budgets["peak_rss_bytes"],
+        )
+    except Exception:
+        cgroup_session.__exit__(*sys.exc_info())
+        raise
+    cgroup_residual = 0
+    cgroup_peak_raw = "0\n"
 
     def enforce_budgets(sample: dict[str, Any]) -> None:
         nonlocal resource_failure, stop_requested_at
@@ -2336,7 +2352,7 @@ def _supervise_operation(args: argparse.Namespace) -> int:
                     stdin=subprocess.DEVNULL,
                     stdout=stdout_fd,
                     stderr=stderr_fd,
-                    start_new_session=True,
+                    preexec_fn=operation_group.child_setup,
                     close_fds=True,
                 )
             )
@@ -2348,32 +2364,23 @@ def _supervise_operation(args: argparse.Namespace) -> int:
                     view = view[os.write(ready_fd, view) :]
             finally:
                 os.close(ready_fd)
-        initial_groups = [process_group_sample(child.pid) for child in children]
         samples.append(
-            {
-                "elapsed_seconds": time.monotonic() - started_wall,
-                "peak_rss_bytes": sum(row[1] for row in initial_groups),
-                "log_bytes": sum(os.fstat(descriptor).st_size for descriptor in descriptors),
-                "disk_bytes": operation_disk_bytes(operation_root),
-                "owned_processes": sum(row[0] for row in initial_groups),
-            }
+            _operation_resource_sample(
+                group=operation_group,
+                started_wall=started_wall,
+                descriptors=descriptors,
+                operation_root=operation_root,
+            )
         )
-        peak_rss = samples[0]["peak_rss_bytes"]
         enforce_budgets(samples[-1])
         while any(child.poll() is None for child in children):
-            elapsed = time.monotonic() - started_wall
-            group_samples = [process_group_sample(child.pid) for child in children]
-            owned = sum(row[0] for row in group_samples)
-            rss = sum(row[1] for row in group_samples)
-            peak_rss = max(peak_rss, rss)
             samples.append(
-                {
-                    "elapsed_seconds": elapsed,
-                    "peak_rss_bytes": peak_rss,
-                    "log_bytes": sum(os.fstat(descriptor).st_size for descriptor in descriptors),
-                    "disk_bytes": operation_disk_bytes(operation_root),
-                    "owned_processes": owned,
-                }
+                _operation_resource_sample(
+                    group=operation_group,
+                    started_wall=started_wall,
+                    descriptors=descriptors,
+                    operation_root=operation_root,
+                )
             )
             enforce_budgets(samples[-1])
             if stop_requested_at is not None and time.monotonic() - stop_requested_at >= 10.0:
@@ -2386,21 +2393,20 @@ def _supervise_operation(args: argparse.Namespace) -> int:
             time.sleep(min(args.sample_seconds, 1.0 if stop_requested else args.sample_seconds))
         exit_codes = [child.wait() for child in children]
         duration = time.monotonic() - started_wall
-        group_samples = [process_group_sample(child.pid) for child in children]
-        owned = sum(row[0] for row in group_samples)
-        rss = sum(row[1] for row in group_samples)
-        peak_rss = max(peak_rss, rss)
         samples.append(
             {
+                **_operation_resource_sample(
+                    group=operation_group,
+                    started_wall=started_wall,
+                    descriptors=descriptors,
+                    operation_root=operation_root,
+                ),
                 "elapsed_seconds": duration,
-                "peak_rss_bytes": peak_rss,
-                "log_bytes": sum(os.fstat(descriptor).st_size for descriptor in descriptors),
-                "disk_bytes": operation_disk_bytes(operation_root),
-                "owned_processes": owned,
             }
         )
         enforce_budgets(samples[-1])
     finally:
+        operation_exception = sys.exc_info()
         if sys.exc_info()[0] is not None:
             for child in children:
                 if child.poll() is None:
@@ -2413,24 +2419,21 @@ def _supervise_operation(args: argparse.Namespace) -> int:
                     child.wait(timeout=2.0)
                 except (subprocess.TimeoutExpired, ChildProcessError):
                     pass
-        for descriptor in descriptors:
-            os.close(descriptor)
+        try:
+            for descriptor in descriptors:
+                os.close(descriptor)
+        finally:
+            try:
+                cgroup_residual, cgroup_peak_raw = operation_group.finish()
+            finally:
+                cgroup_session.__exit__(*operation_exception)
     if not children:
         raise EvidenceError("operation child did not start")
-    residual_processes = samples[-1]["owned_processes"]
-    if residual_processes:
-        for child in children:
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        time.sleep(0.2)
-        for child in children:
-            if process_group_sample(child.pid)[0]:
-                try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+    final_cgroup_peak = int(cgroup_peak_raw.strip())
+    if final_cgroup_peak > samples[-1]["peak_rss_bytes"]:
+        samples[-1]["peak_rss_bytes"] = final_cgroup_peak
+        enforce_budgets(samples[-1])
+    residual_processes = cgroup_residual
     if stop_requested:
         failure = {
             "schema_version": "tflite-operation-failure-v1",
