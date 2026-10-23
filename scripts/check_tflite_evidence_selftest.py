@@ -251,6 +251,171 @@ def collector_performance_cli_runs_workload() -> None:
         raise AssertionError("performance still imports caller-authored observations")
 
 
+def performance_failure_preserves_observations() -> None:
+    collector = load_collector()
+
+    class FakeMemoryCgroupSession:
+        def __init__(self, parent: Path) -> None:
+            self.parent = parent
+
+        def __enter__(self) -> Path:
+            return self.parent
+
+        def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> bool:
+            return False
+
+    with tempfile.TemporaryDirectory(prefix="tflite-performance-failure-") as raw:
+        run_root = Path(raw) / "run"
+        run_root.mkdir()
+        prepared = {
+            "mode": "real",
+            "budgets": {
+                "peak_rss_bytes": 1,
+                "log_bytes": 1,
+                "disk_bytes": 1,
+            },
+            "evidence_root": str(Path(raw) / "evidence"),
+            "tool_commit": "a" * 40,
+            "profile_sha256": "b" * 64,
+        }
+        document = {
+            "schema_version": "format-comparison-observations-v1",
+            "comparison_id": "measured-regression",
+            "mode": "real",
+        }
+        evaluation = {
+            "schema_version": "format-comparison-evaluation-v1",
+            "comparison_id": "measured-regression",
+            "mode": "real",
+            "performance_status": "fail",
+            "gate_status": "fail",
+            "reasons": ["wall_time exceeded the calibrated regression threshold"],
+            "operations": {"actual_parser_performance": {"status": "pass"}},
+        }
+        originals = {
+            "read_prepare": collector.read_prepare,
+            "active_workloads": collector.active_workloads,
+            "system_memory": collector._system_memory,
+            "cgroup_parent": collector._current_cgroup_parent,
+            "cgroup_session": collector.MemoryCgroupSession,
+            "performance_document": collector._performance_document,
+            "require_current_aa": collector._require_current_aa,
+            "evaluate_document": collector.baseline.evaluate_document,
+        }
+        collector.read_prepare = lambda _root, recheck: prepared
+        collector.active_workloads = lambda: []
+        collector._system_memory = lambda: (10_000, 10_000, 10_000, 10_000)
+        collector._current_cgroup_parent = lambda: Path("/sys/fs/cgroup/tflite-selftest")
+        collector.MemoryCgroupSession = FakeMemoryCgroupSession
+        collector._performance_document = lambda _prepared, _parent: document
+        collector._require_current_aa = lambda _document, _prepared: None
+        collector.baseline.evaluate_document = lambda _document: evaluation
+        try:
+            try:
+                collector.performance(argparse.Namespace(run_root=run_root, cgroup_parent=None))
+            except collector.EvidenceError as error:
+                if "preserved failure evidence" not in str(error):
+                    raise AssertionError(f"failure did not identify preserved evidence: {error}") from error
+            else:
+                raise AssertionError("failed Q10 observations were accepted")
+
+            observations_path = run_root / "performance-failure-observations.json"
+            evaluation_path = run_root / "performance-failure-evaluation.json"
+            failure_path = run_root / "performance-failure.json"
+            for path in (observations_path, evaluation_path, failure_path):
+                if not path.is_file() or path.is_symlink():
+                    raise AssertionError(f"failed Q10 evidence is missing: {path.name}")
+                if path.stat().st_mode & 0o777 != 0o600:
+                    raise AssertionError(f"failed Q10 evidence mode is not private: {path.name}")
+            if json.loads(observations_path.read_text(encoding="utf-8")) != document:
+                raise AssertionError("failed Q10 observations changed while being preserved")
+            if json.loads(evaluation_path.read_text(encoding="utf-8")) != evaluation:
+                raise AssertionError("failed Q10 evaluation changed while being preserved")
+            failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            if (
+                failure.get("schema_version") != "tflite-evidence-performance-failure-v1"
+                or failure.get("state") != "failed"
+                or failure.get("failure_kind") != "qualification_failed"
+                or failure.get("performance_status") != "fail"
+                or failure.get("actual_parser_performance_status") != "pass"
+                or failure.get("reasons") != evaluation["reasons"]
+            ):
+                raise AssertionError(f"failed Q10 index is incomplete: {failure}")
+            for key, path in (
+                ("observations", observations_path),
+                ("evaluation", evaluation_path),
+            ):
+                reference = failure.get(key)
+                payload = path.read_bytes()
+                if reference != {
+                    "path": path.name,
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "size_bytes": len(payload),
+                }:
+                    raise AssertionError(f"failed Q10 {key} reference is invalid")
+            for path in (run_root / "observations.json", run_root / "performance.json"):
+                if path.exists() or path.is_symlink():
+                    raise AssertionError(f"failed Q10 created success state: {path.name}")
+            try:
+                collector.performance(argparse.Namespace(run_root=run_root, cgroup_parent=None))
+            except collector.EvidenceError as error:
+                if "failure evidence already exists" not in str(error):
+                    raise AssertionError(f"wrong failed-root rerun refusal: {error}") from error
+            else:
+                raise AssertionError("collector reused a failed Q10 run root")
+
+            invalid_root = Path(raw) / "invalid-run"
+            invalid_root.mkdir()
+
+            def reject_observations(_document: dict[str, Any]) -> dict[str, Any]:
+                raise collector.baseline.ContractError("synthetic invalid observations")
+
+            collector.baseline.evaluate_document = reject_observations
+            try:
+                collector.performance(
+                    argparse.Namespace(run_root=invalid_root, cgroup_parent=None)
+                )
+            except collector.EvidenceError as error:
+                if (
+                    "preserved failure evidence" not in str(error)
+                    or "synthetic invalid observations" not in str(error)
+                ):
+                    raise AssertionError(
+                        f"invalid observations did not identify preserved evidence: {error}"
+                    ) from error
+            else:
+                raise AssertionError("invalid Q10 observations were accepted")
+            invalid_observations = invalid_root / "performance-failure-observations.json"
+            invalid_failure = invalid_root / "performance-failure.json"
+            if not invalid_observations.is_file() or not invalid_failure.is_file():
+                raise AssertionError("invalid Q10 observations were not preserved")
+            if (invalid_root / "performance-failure-evaluation.json").exists():
+                raise AssertionError("invalid observations fabricated an evaluation")
+            invalid_index = json.loads(invalid_failure.read_text(encoding="utf-8"))
+            if (
+                invalid_index.get("failure_kind") != "invalid_observations"
+                or invalid_index.get("error") != "synthetic invalid observations"
+                or invalid_index.get("evaluation") is not None
+            ):
+                raise AssertionError(f"invalid Q10 failure index is incomplete: {invalid_index}")
+            invalid_payload = invalid_observations.read_bytes()
+            if invalid_index.get("observations") != {
+                "path": invalid_observations.name,
+                "sha256": hashlib.sha256(invalid_payload).hexdigest(),
+                "size_bytes": len(invalid_payload),
+            }:
+                raise AssertionError("invalid Q10 observation reference is invalid")
+        finally:
+            collector.read_prepare = originals["read_prepare"]
+            collector.active_workloads = originals["active_workloads"]
+            collector._system_memory = originals["system_memory"]
+            collector._current_cgroup_parent = originals["cgroup_parent"]
+            collector.MemoryCgroupSession = originals["cgroup_session"]
+            collector._performance_document = originals["performance_document"]
+            collector._require_current_aa = originals["require_current_aa"]
+            collector.baseline.evaluate_document = originals["evaluate_document"]
+
+
 def memory_controller_is_enabled_for_private_sample_leaves() -> None:
     collector = load_collector()
     sample_id = "controller-enabled-sample"
@@ -1119,6 +1284,7 @@ CASES = (
     ("wrong profile is refused", wrong_profile_is_rejected),
     ("wrong soak binary role is refused", wrong_soak_binary_role_is_rejected),
     ("performance CLI runs workload directly", collector_performance_cli_runs_workload),
+    ("performance failure preserves observations", performance_failure_preserves_observations),
     (
         "memory controller is enabled for private sample leaves",
         memory_controller_is_enabled_for_private_sample_leaves,

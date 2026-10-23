@@ -1769,6 +1769,13 @@ def performance(args: argparse.Namespace) -> int:
         raise EvidenceError("Q10 performance collection was already completed")
     if (run_root / "observations.json").exists() or (run_root / "observations.json").is_symlink():
         raise EvidenceError("Q10 observations destination already exists")
+    failure_paths = (
+        run_root / "performance-failure-observations.json",
+        run_root / "performance-failure-evaluation.json",
+        run_root / "performance-failure.json",
+    )
+    if any(path.exists() or path.is_symlink() for path in failure_paths):
+        raise EvidenceError("Q10 performance failure evidence already exists")
     active = active_workloads()
     if active:
         raise EvidenceError(f"concurrent fuzz/build workload is active: {active[0]}")
@@ -1798,9 +1805,82 @@ def performance(args: argparse.Namespace) -> int:
     try:
         evaluation = baseline.evaluate_document(document)
     except baseline.ContractError as error:
-        raise EvidenceError(f"collected performance observations are invalid: {error}") from error
+        observations_payload = canonical(document)
+        observations_path = run_root / "performance-failure-observations.json"
+        failure_path = run_root / "performance-failure.json"
+        exclusive_write(observations_path, observations_payload)
+        exclusive_write(
+            failure_path,
+            canonical(
+                {
+                    "schema_version": "tflite-evidence-performance-failure-v1",
+                    "state": "failed",
+                    "failure_kind": "invalid_observations",
+                    "created_utc": utc_now(),
+                    "tool_commit": prepared["tool_commit"],
+                    "profile_sha256": prepared["profile_sha256"],
+                    "performance_status": None,
+                    "actual_parser_performance_status": None,
+                    "reasons": [],
+                    "error": str(error),
+                    "observations": {
+                        "path": observations_path.name,
+                        "sha256": sha256_bytes(observations_payload),
+                        "size_bytes": len(observations_payload),
+                    },
+                    "evaluation": None,
+                }
+            ),
+        )
+        raise EvidenceError(
+            "collected performance observations are invalid; "
+            f"preserved failure evidence: {failure_path}: {error}"
+        ) from error
     if evaluation["performance_status"] != "pass" or evaluation["operations"]["actual_parser_performance"]["status"] != "pass":
-        raise EvidenceError("collected performance observations do not pass Q10 and actual-parser validation")
+        observations_payload = canonical(document)
+        evaluation_payload = canonical(evaluation)
+        observations_path = run_root / "performance-failure-observations.json"
+        evaluation_path = run_root / "performance-failure-evaluation.json"
+        failure_path = run_root / "performance-failure.json"
+        exclusive_write(observations_path, observations_payload)
+        exclusive_write(evaluation_path, evaluation_payload)
+        actual_parser_status = evaluation["operations"]["actual_parser_performance"]["status"]
+        reasons = evaluation["reasons"]
+        exclusive_write(
+            failure_path,
+            canonical(
+                {
+                    "schema_version": "tflite-evidence-performance-failure-v1",
+                    "state": "failed",
+                    "failure_kind": "qualification_failed",
+                    "created_utc": utc_now(),
+                    "tool_commit": prepared["tool_commit"],
+                    "profile_sha256": prepared["profile_sha256"],
+                    "performance_status": evaluation["performance_status"],
+                    "actual_parser_performance_status": actual_parser_status,
+                    "reasons": reasons,
+                    "error": None,
+                    "observations": {
+                        "path": observations_path.name,
+                        "sha256": sha256_bytes(observations_payload),
+                        "size_bytes": len(observations_payload),
+                    },
+                    "evaluation": {
+                        "path": evaluation_path.name,
+                        "sha256": sha256_bytes(evaluation_payload),
+                        "size_bytes": len(evaluation_payload),
+                    },
+                }
+            ),
+        )
+        reason_summary = "; ".join(reasons) if reasons else "none recorded"
+        raise EvidenceError(
+            "collected performance observations do not pass Q10 and actual-parser validation; "
+            f"preserved failure evidence: {failure_path}; "
+            f"performance_status={evaluation['performance_status']} "
+            f"actual_parser_performance_status={actual_parser_status}; "
+            f"reasons={reason_summary}"
+        )
     observations_payload = canonical(document)
     exclusive_write(run_root / "observations.json", observations_payload)
     output_root = Path(prepared["evidence_root"])
