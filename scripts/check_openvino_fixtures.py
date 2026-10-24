@@ -175,6 +175,40 @@ def main() -> int:
         codec = import_bundle_codec(bundle_codec_path)
         with tempfile.TemporaryDirectory(prefix="openvino-fixtures-check-") as temporary:
             work = Path(temporary)
+            profile_probe_build = work / "profile-probe-build"
+            run(
+                [
+                    str(cmake),
+                    "-S",
+                    str(cmake_source),
+                    "-B",
+                    str(profile_probe_build),
+                    "-G",
+                    "Ninja",
+                    "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+                    f"-DCMAKE_CXX_COMPILER={clangxx}",
+                    f"-DCMAKE_MAKE_PROGRAM={ninja}",
+                    f"-DOpenVINO_DIR={target / 'install/runtime/cmake'}",
+                    "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                ]
+            )
+            profile_commands = json.loads(
+                (profile_probe_build / "compile_commands.json").read_text(encoding="utf-8")
+            )
+            if not isinstance(profile_commands, list):
+                fail("profile-only compile_commands.json is not a list")
+            profile_sources = [
+                Path(str(row.get("file", ""))).name
+                for row in profile_commands
+                if isinstance(row, dict)
+            ]
+            if profile_sources != ["profile_probe.cc"]:
+                fail(
+                    "clean OVI-01 profile configure leaked other translation units: "
+                    f"{profile_sources!r}"
+                )
+            results.ok("clean OVI-01 profile configure excludes the OVI-02 fixture probe")
+
             probe_build = work / "probe-build"
             run(
                 [
@@ -189,6 +223,7 @@ def main() -> int:
                     f"-DCMAKE_CXX_COMPILER={clangxx}",
                     f"-DCMAKE_MAKE_PROGRAM={ninja}",
                     f"-DOpenVINO_DIR={target / 'install/runtime/cmake'}",
+                    "-DOPENVINO_BUILD_FIXTURE_PROBE=ON",
                 ]
             )
             run([str(cmake), "--build", str(probe_build), "--target", "openvino_ir_fixture_probe"])
