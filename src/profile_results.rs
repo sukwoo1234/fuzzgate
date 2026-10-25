@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     common::{artifact_contract, now_unix_millis, AppPaths},
     execution_context::{self, ExecutionContext},
+    model_bundle,
     target::{parse_target_id, target_label, HarnessError, TargetKind},
     target_profiles::{
         load_profile_snapshot, load_qualification_snapshot_for_profile, sha256_bytes, LoadedProfile,
@@ -1645,6 +1646,18 @@ fn validate_input_manifest(
                 "input manifest sha256 mismatch for '{}': expected {}, observed {}",
                 entry.path, entry.sha256, file.sha256
             ));
+        }
+        if loaded.profile.input_kind.kind == "fzb1" {
+            let allowlist = loaded
+                .profile
+                .input_kind
+                .subformats
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            model_bundle::decode_with_allowlist(&file.bytes, &allowlist).map_err(|error| {
+                format!("invalid preserved FZB1 input '{}': {error}", entry.path)
+            })?;
         }
         listed_paths.insert(relative.to_path_buf());
     }

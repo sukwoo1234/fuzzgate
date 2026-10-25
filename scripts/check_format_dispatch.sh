@@ -533,7 +533,19 @@ run_fail "unclassified count cannot bypass evidence validation with a string" \
 
 clone_profiled_run "$DATA/runs/run-fzb"
 rm "$DATA/runs/run-fzb/inputs/sample.onnx"
-printf 'FZB1\0whole-bundle\0tail' >"$DATA/runs/run-fzb/inputs/sample.fzb"
+python3 -B - "$DATA/runs/run-fzb/inputs/sample.fzb" <<'PY'
+import pathlib
+import struct
+import sys
+
+entries = [(b"model.bin", b"\x00\x00\xc0\x3f"), (b"model.xml", b"<net/>")]
+payload = bytearray(b"FZBNDL1\0" + struct.pack("<I", len(entries)))
+for name, data in entries:
+    payload.extend(struct.pack("<HQ", len(name), len(data)))
+    payload.extend(name)
+    payload.extend(data)
+pathlib.Path(sys.argv[1]).write_bytes(payload)
+PY
 mkdir -p "$WORK/fzb-profile"
 python3 -B - "$DATA/runs/run-fzb" "$WORK/profile/profile.json" "$WORK/fzb-profile" <<'PY'
 import hashlib
@@ -544,7 +556,11 @@ import sys
 result_root, source_profile, _profile_root = sys.argv[1:]
 sha = lambda path: hashlib.sha256(open(path, "rb").read()).hexdigest()
 profile = json.load(open(source_profile, encoding="utf-8"))
-profile["input_kind"] = {"kind": "fzb1", "extensions": ["fzb"], "subformats": []}
+profile["input_kind"] = {
+    "kind": "fzb1",
+    "extensions": ["fzb"],
+    "subformats": ["model.bin", "model.xml"],
+}
 profile_path = os.path.join(result_root, "profile.json")
 open(profile_path, "w", encoding="utf-8").write(json.dumps(profile, sort_keys=True) + "\n")
 profile_hash = sha(profile_path)
@@ -596,6 +612,56 @@ open(marker_path, "w", encoding="utf-8").write(json.dumps(marker) + "\n")
 PY
 run_ok "FZB1 profiled export accepts the complete original bundle" '[export] done' \
   "${BASE[@]}" export run-fzb
+cp -a "$DATA/runs/run-fzb" "$DATA/runs/run-fzb-xml-only"
+rebind_result_identity "$DATA/runs/run-fzb-xml-only"
+python3 -B - "$DATA/runs/run-fzb-xml-only" <<'PY'
+import hashlib
+import json
+import os
+import struct
+import sys
+
+root = sys.argv[1]
+input_path = os.path.join(root, "inputs", "sample.fzb")
+name = b"model.xml"
+data = b"<net/>"
+payload = bytearray(b"FZBNDL1\0" + struct.pack("<I", 1))
+payload.extend(struct.pack("<HQ", len(name), len(data)))
+payload.extend(name)
+payload.extend(data)
+open(input_path, "wb").write(payload)
+
+digest = hashlib.sha256(payload).hexdigest()
+manifest_path = os.path.join(root, "input-manifest.json")
+manifest = {
+    "schema_version": "1",
+    "files": [{
+        "path": "inputs/sample.fzb",
+        "size_bytes": len(payload),
+        "sha256": digest,
+    }],
+}
+open(manifest_path, "w", encoding="utf-8").write(
+    json.dumps(manifest, indent=2) + "\n"
+)
+
+execution_path = os.path.join(root, "execution.json")
+execution = json.load(open(execution_path, encoding="utf-8"))
+execution["input_manifest_sha256"] = hashlib.sha256(
+    open(manifest_path, "rb").read()
+).hexdigest()
+row = f"sample.fzb\0{len(payload)}\0{digest}\n".encode()
+execution["corpus_snapshot_sha256"] = hashlib.sha256(row).hexdigest()
+open(execution_path, "w", encoding="utf-8").write(json.dumps(execution) + "\n")
+
+status_path = os.path.join(root, "status.json")
+status = json.load(open(status_path, encoding="utf-8"))
+status["run_id"] = "fzb-xml-only"
+open(status_path, "w", encoding="utf-8").write(json.dumps(status) + "\n")
+PY
+run_fail "FZB1 export rejects an XML-only bundle even when all hashes are rebound" \
+  "FZB1 entries do not match target allowlist" \
+  "${BASE[@]}" export run-fzb-xml-only
 cp -a "$DATA/runs/run-fzb" "$DATA/runs/run-fzb-missing"
 rebind_result_identity "$DATA/runs/run-fzb-missing"
 rm "$DATA/runs/run-fzb-missing/inputs/sample.fzb"
