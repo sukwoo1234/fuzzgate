@@ -9,6 +9,7 @@ bundles are reconstructed from their indexed files before FND-03 consumes them.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -38,13 +39,6 @@ OPERATION_NAMES = (
     "fault_injection",
 )
 BACKGROUND_OPERATIONS = OPERATION_NAMES[1:]
-PERFORMANCE_SOURCE_PATHS = (
-    "harnesses/tflite/loader.cc",
-    "harnesses/tflite/loader.h",
-    "harnesses/tflite/replay.cc",
-    "scripts/collect_tflite_evidence.py",
-    "scripts/measure_format_baseline.py",
-)
 INITIAL_PERFORMANCE_PAIRS = 5
 MAX_PERFORMANCE_PAIRS = 10
 EXTENDABLE_INTERVAL_REASONS = frozenset(
@@ -54,11 +48,6 @@ EXTENDABLE_INTERVAL_REASONS = frozenset(
         "latency_p95 interval crosses the allowed boundary",
     }
 )
-LOAD_EVENT = "LoadAndAllocate"
-LOAD_MARKER = re.compile(rb"(?m)^TFLITE_LOAD_(?:OK|REJECT)\b")
-LOAD_OK_MARKER = re.compile(rb"(?m)^TFLITE_LOAD_OK\b")
-LOAD_REJECT_MARKER = re.compile(rb"(?m)^TFLITE_LOAD_REJECT\b")
-ACCESS_OK_MARKER = re.compile(rb"(?m)^TFLITE_ACCESS_OK\b")
 LIBFUZZER_EXECUTED_UNITS = re.compile(
     rb"(?m)^stat::number_of_executed_units:\s*([0-9]+)\s*$"
 )
@@ -69,6 +58,96 @@ ACTIVE_SCRIPT = re.compile(
 
 class EvidenceError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class TargetContract:
+    target_id: str
+    label: str
+    marker_prefix: str
+    api_event: str
+    load_marker: re.Pattern[bytes]
+    load_ok_marker: re.Pattern[bytes]
+    load_reject_marker: re.Pattern[bytes]
+    access_ok_marker: re.Pattern[bytes]
+    accepted_detail: str
+    rejected_detail: str
+    prepare_schema: str
+    operation_schema: str
+    source_paths: tuple[str, ...]
+
+
+_TARGET_CONTRACTS = {
+    "tflite": TargetContract(
+        target_id="tflite",
+        label="TFLite",
+        marker_prefix="TFLITE_EVIDENCE",
+        api_event="LoadAndAllocate",
+        load_marker=re.compile(rb"(?m)^TFLITE_LOAD_(?:OK|REJECT)\b"),
+        load_ok_marker=re.compile(rb"(?m)^TFLITE_LOAD_OK\b"),
+        load_reject_marker=re.compile(rb"(?m)^TFLITE_LOAD_REJECT\b"),
+        access_ok_marker=re.compile(rb"(?m)^TFLITE_ACCESS_OK\b"),
+        accepted_detail="load-allocate-access-complete",
+        rejected_detail="load-allocate-rejected",
+        prepare_schema="tflite-evidence-run-v1",
+        operation_schema="tflite-v7-operation-v1",
+        source_paths=(
+            "harnesses/tflite/loader.cc",
+            "harnesses/tflite/loader.h",
+            "harnesses/tflite/replay.cc",
+            "scripts/collect_tflite_evidence.py",
+            "scripts/measure_format_baseline.py",
+        ),
+    ),
+    "openvino-ir": TargetContract(
+        target_id="openvino-ir",
+        label="OpenVINO",
+        marker_prefix="OPENVINO_EVIDENCE",
+        api_event="ReadValidateConstants",
+        load_marker=re.compile(
+            rb"(?m)^OPENVINO_LOAD_(?:OK stage=read_validate_constants|REJECT stage=frontend)\b"
+        ),
+        load_ok_marker=re.compile(rb"(?m)^OPENVINO_LOAD_OK\b"),
+        load_reject_marker=re.compile(rb"(?m)^OPENVINO_LOAD_REJECT\b"),
+        access_ok_marker=re.compile(rb"(?m)^OPENVINO_ACCESS_OK\b"),
+        accepted_detail="read-validate-constants-complete",
+        rejected_detail="read-validate-constants-rejected",
+        prepare_schema="format-evidence-run-v1",
+        operation_schema="format-v7-operation-v1",
+        source_paths=(
+            "harnesses/openvino/loader.cc",
+            "harnesses/openvino/loader.h",
+            "harnesses/openvino/replay.cc",
+            "scripts/collect_tflite_evidence.py",
+            "scripts/collect_openvino_evidence.py",
+            "scripts/measure_format_baseline.py",
+        ),
+    ),
+}
+
+
+def target_contract(target_id: str) -> TargetContract:
+    try:
+        return _TARGET_CONTRACTS[target_id]
+    except KeyError as error:
+        raise EvidenceError(f"unsupported evidence target: {target_id}") from error
+
+
+def prepared_contract(prepared: dict[str, Any]) -> TargetContract:
+    return target_contract(prepared.get("target_id", "tflite"))
+
+
+def target_schema(contract: TargetContract, legacy_tflite: str, generic: str) -> str:
+    return legacy_tflite if contract.target_id == "tflite" else generic
+
+
+def failure_contract(
+    run_root: Path, fallback_target_id: str = "tflite"
+) -> TargetContract:
+    try:
+        return prepared_contract(read_prepare(run_root, recheck=False))
+    except (EvidenceError, OSError, KeyError, ValueError):
+        return target_contract(fallback_target_id)
 
 
 def canonical(value: Any) -> bytes:
@@ -640,6 +719,7 @@ def audit_profile_files(profile: dict[str, Any]) -> None:
 
 def prepare(args: argparse.Namespace) -> int:
     project_root = Path(__file__).resolve().parent.parent
+    contract = target_contract(getattr(args, "target_id", "tflite"))
     commit, dirty = git_identity(project_root)
     if commit != args.expected_commit:
         raise EvidenceError(f"HEAD {commit} does not match expected commit {args.expected_commit}")
@@ -661,17 +741,21 @@ def prepare(args: argparse.Namespace) -> int:
         require_wsl_ext4(path, label)
     for path, label in ((profile, "profile"), (replay, "replay"), (corpus_index, "corpus index")):
         regular_bytes(path, label)
-    profile_value, profile_payload = read_json(profile, "TFLite profile", 4 * 1024 * 1024)
+    profile_value, profile_payload = read_json(
+        profile, f"{contract.label} profile", 4 * 1024 * 1024
+    )
     try:
-        baseline._validate_target_profile_shape(profile_value, "TFLite profile")
+        baseline._validate_target_profile_shape(profile_value, f"{contract.label} profile")
     except baseline.ContractError as error:
-        raise EvidenceError(f"TFLite profile is invalid: {error}") from error
+        raise EvidenceError(f"{contract.label} profile is invalid: {error}") from error
     audit_profile_files(profile_value)
-    if profile_value.get("target_id") != "tflite":
-        raise EvidenceError("profile target_id must be tflite")
+    if profile_value.get("target_id") != contract.target_id:
+        raise EvidenceError(f"profile target_id must be {contract.target_id}")
     limits = profile_value.get("limits")
     if not isinstance(limits, dict) or limits.get("workers") != 1 or limits.get("threads") != 1:
-        raise EvidenceError("TFLite evidence profile must pin one worker and one thread")
+        raise EvidenceError(
+            f"{contract.label} evidence profile must pin one worker and one thread"
+        )
     if limits.get("memory_bytes") != args.peak_rss_bytes:
         raise EvidenceError("peak RSS budget must equal the pinned profile memory limit")
     replay_sha = sha256_bytes(regular_bytes(replay, "replay", 1024 * 1024 * 1024))
@@ -691,7 +775,9 @@ def prepare(args: argparse.Namespace) -> int:
         if isinstance(row, dict) and row.get("role") == "fuzzer"
     ]
     if len(fuzzers) != 1:
-        raise EvidenceError("TFLite evidence profile must pin exactly one fuzzer binary")
+        raise EvidenceError(
+            f"{contract.label} evidence profile must pin exactly one fuzzer binary"
+        )
     fuzzer = Path(fuzzers[0].get("path", "")).resolve(strict=True)
     require_wsl_ext4(fuzzer, "fuzzer")
     fuzzer_sha = sha256_bytes(regular_bytes(fuzzer, "fuzzer", 1024 * 1024 * 1024))
@@ -722,8 +808,9 @@ def prepare(args: argparse.Namespace) -> int:
     if not isinstance(cpu_count, int) or cpu_count < 1:
         raise EvidenceError("could not determine the WSL CPU allocation")
     value = {
-        "schema_version": "tflite-evidence-run-v1",
+        "schema_version": contract.prepare_schema,
         "state": "prepared",
+        "target_id": contract.target_id,
         "mode": args.mode,
         "comparison_id": args.comparison_id,
         "project_root": str(project_root),
@@ -762,7 +849,10 @@ def prepare(args: argparse.Namespace) -> int:
         },
     }
     exclusive_write(run_root / "prepare.json", canonical(value))
-    print(f"TFLITE_EVIDENCE_PREPARED=yes run_root={run_root} commit={commit} mode={args.mode}")
+    print(
+        f"{contract.marker_prefix}_PREPARED=yes "
+        f"run_root={run_root} commit={commit} mode={args.mode}"
+    )
     return 0
 
 
@@ -770,7 +860,8 @@ def read_prepare(run_root: Path, *, recheck: bool) -> dict[str, Any]:
     run_root = run_root.absolute()
     directory(run_root, "run root")
     value, _ = read_json(run_root / "prepare.json", "prepared run manifest")
-    if value.get("schema_version") != "tflite-evidence-run-v1" or value.get("state") != "prepared":
+    contract = prepared_contract(value)
+    if value.get("schema_version") != contract.prepare_schema or value.get("state") != "prepared":
         raise EvidenceError("prepared run manifest state mismatch")
     if recheck:
         project_root = Path(value["project_root"])
@@ -890,9 +981,10 @@ def _write_cgroup_value(path: Path, value: str, label: str) -> None:
 
 
 class MemoryCgroupSession:
-    def __init__(self, parent: Path) -> None:
+    def __init__(self, parent: Path, target_id: str = "tflite") -> None:
         self.parent = parent
-        self.manager = parent / f"tflite-collector-{os.getpid()}"
+        safe_target = target_id.replace("-", "_")
+        self.manager = parent / f"{safe_target}-collector-{os.getpid()}"
         self.manager_created = False
         self.memory_enabled = False
 
@@ -1083,6 +1175,7 @@ def _run_replay_once(
     input_path: Path,
     cgroup: SampleCgroup,
     timeout_seconds: float,
+    contract: TargetContract,
 ) -> dict[str, Any]:
     started = time.monotonic()
     process = subprocess.Popen(
@@ -1107,19 +1200,20 @@ def _run_replay_once(
         stdout, stderr = process.communicate()
     elapsed = time.monotonic() - started
     combined = stdout + stderr
-    calls = len(LOAD_MARKER.findall(combined))
+    calls = len(contract.load_marker.findall(combined))
     return {
         "exit_code": 124 if timed_out else process.returncode,
         "elapsed_seconds": elapsed,
         "output_bytes": len(combined),
         "target_api_calls": calls,
-        "load_ok": len(LOAD_OK_MARKER.findall(combined)),
-        "load_reject": len(LOAD_REJECT_MARKER.findall(combined)),
-        "access_ok": len(ACCESS_OK_MARKER.findall(combined)),
+        "load_ok": len(contract.load_ok_marker.findall(combined)),
+        "load_reject": len(contract.load_reject_marker.findall(combined)),
+        "access_ok": len(contract.access_ok_marker.findall(combined)),
     }
 
 
 def _corpus_document(prepared: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
+    contract = prepared_contract(prepared)
     document, payload = read_json(Path(prepared["corpus_index"]), "performance corpus index")
     if set(document) != {"schema_version", "inputs"} or document.get(
         "schema_version"
@@ -1158,11 +1252,17 @@ def _corpus_document(prepared: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
         if row["expected_exit_code"] != expected_exit:
             raise EvidenceError(f"{label} outcome and expected exit code disagree")
         events = row["required_api_events"]
-        if not isinstance(events, list) or any(event != LOAD_EVENT for event in events):
-            raise EvidenceError(f"{label} required API events must name {LOAD_EVENT}")
+        if not isinstance(events, list) or any(event != contract.api_event for event in events):
+            raise EvidenceError(
+                f"{label} required API events must name {contract.api_event}"
+            )
         stage = row["target_api_stage"]
         if stage == "target-parser":
-            if row["minimum_target_api_calls"] != 1 or events != [LOAD_EVENT] or row["zero_call_reason"] is not None:
+            if (
+                row["minimum_target_api_calls"] != 1
+                or events != [contract.api_event]
+                or row["zero_call_reason"] is not None
+            ):
                 raise EvidenceError(f"{label} target-parser expectations are invalid")
         elif stage == "pre-parser-reject":
             if row["minimum_target_api_calls"] != 0 or events or not isinstance(
@@ -1232,7 +1332,8 @@ def _profile_replay_command(
         "cwd": prepared["project_root"],
         "executable_sha256": prepared["replay_sha256"],
     }
-    _expand_replay_argv(command, Path("/tmp/input.tflite"))
+    extension = profile["input_kind"]["extensions"][0]
+    _expand_replay_argv(command, Path(f"/tmp/input.{extension}"))
     return command, rows[0]
 
 
@@ -1247,6 +1348,7 @@ def _correctness_snapshot(
     memory_limit: int,
     timeout_seconds: float,
 ) -> str:
+    contract = prepared_contract(prepared)
     records: list[dict[str, Any]] = []
     for index, row in enumerate(rows, start=1):
         sample_id = f"correctness-{arm}-{index}"
@@ -1256,15 +1358,20 @@ def _correctness_snapshot(
             Path(prepared["corpus_index"]).parent / row["path"],
             group,
             timeout_seconds,
+            contract,
         )
         residual, _raw_peak = group.finish()
         expected_outcome = row["expected_outcome"]
         if result["load_ok"] == 1 and result["access_ok"] == 1 and result["load_reject"] == 0:
             outcome = "accepted"
-            detail = "load-allocate-access-complete"
+            detail = contract.accepted_detail
         elif result["load_reject"] == 1 and result["load_ok"] == 0:
             outcome = "rejected"
-            detail = "load-allocate-rejected"
+            detail = (
+                contract.rejected_detail
+                if result["target_api_calls"] > 0
+                else "pre-parser-rejected"
+            )
         elif result["target_api_calls"] == 0 and result["exit_code"] == 9:
             outcome = "rejected"
             detail = "pre-parser-rejected"
@@ -1279,7 +1386,7 @@ def _correctness_snapshot(
                 "outcome_class": outcome,
                 "outcome_detail": detail,
                 "target_api_calls": calls,
-                "api_events": [LOAD_EVENT] * calls,
+                "api_events": [contract.api_event] * calls,
                 "exit_code": result["exit_code"],
                 "residual_processes": residual,
             }
@@ -1321,6 +1428,7 @@ def _collect_sample(
     memory_limit: int,
     timeout_seconds: float,
 ) -> dict[str, Any]:
+    contract = prepared_contract(prepared)
     throughput = sorted(
         (row for row in rows if row["throughput_order_index"] is not None),
         key=lambda row: row["throughput_order_index"],
@@ -1348,6 +1456,7 @@ def _collect_sample(
                 Path(prepared["corpus_index"]).parent / row["path"],
                 group,
                 timeout_seconds,
+                contract,
             )
             input_count += 1
             target_calls += result["target_api_calls"]
@@ -1374,6 +1483,7 @@ def _collect_sample(
                 Path(prepared["corpus_index"]).parent / row["path"],
                 group,
                 timeout_seconds,
+                contract,
             )
             probe_calls += result["target_api_calls"]
             if result["exit_code"] != row["expected_exit_code"] and observed_exit == 0:
@@ -1488,13 +1598,16 @@ def _performance_document(
     sample_seconds: float = 60.0,
     latency_batch_iterations: int = 10,
 ) -> dict[str, Any]:
+    contract = prepared_contract(prepared)
     if mode not in {"real", "selftest"}:
         raise EvidenceError(f"unsupported performance collection mode: {mode}")
     if mode == "real" and (
         sample_seconds != 60.0 or latency_batch_iterations != 10
     ):
         raise EvidenceError("real performance collection protocol cannot be shortened")
-    profile, profile_payload = read_json(Path(prepared["profile"]), "prepared TFLite profile")
+    profile, profile_payload = read_json(
+        Path(prepared["profile"]), f"prepared {contract.label} profile"
+    )
     corpus, corpus_payload = _corpus_document(prepared)
     rows = corpus["inputs"]
     command, replay_row = _profile_replay_command(prepared, profile)
@@ -1526,7 +1639,7 @@ def _performance_document(
     }
     budgets = {
         "peak_rss_bytes": memory_limit,
-        "latency_p95_seconds": 5.0,
+        "latency_p95_seconds": profile["limits"]["input_timeout_ms"] / 1000.0,
     }
     fixed = {
         "target_id": profile["target_id"],
@@ -1674,7 +1787,7 @@ def _performance_document(
     ]
     source_artifacts = {
         path: sha256_bytes(regular_bytes(Path(prepared["project_root"]) / path, path))
-        for path in PERFORMANCE_SOURCE_PATHS
+        for path in contract.source_paths
     }
     profile_raw = profile_payload.decode("utf-8", "strict")
     command_sha = sha256_bytes(canonical(command))
@@ -1740,7 +1853,7 @@ def _performance_document(
         observed_output = sum(sample["output_bytes"]["value"] for sample in all_samples)
         observed_calls = sum(sample["target_api_calls"]["value"] for sample in all_samples)
         raw_operation = {
-            "schema_version": "tflite-v7-operation-v1",
+            "schema_version": contract.operation_schema,
             "operation": "actual_parser_performance",
             "mode": "real",
             "target_id": profile["target_id"],
@@ -1816,7 +1929,7 @@ def _performance_document(
                 blocker = f"resource_recheck_error: {error}"
             if blocker is not None:
                 print(
-                    "TFLITE_EVIDENCE_Q10_EXTENSION_BLOCKED="
+                    f"{contract.marker_prefix}_Q10_EXTENSION_BLOCKED="
                     + blocker.replace("\n", " "),
                     file=sys.stderr,
                 )
@@ -1831,7 +1944,7 @@ def _performance_document(
             ]
         except Exception as error:
             print(
-                "TFLITE_EVIDENCE_Q10_EXTENSION_BLOCKED=collection_error: "
+                f"{contract.marker_prefix}_Q10_EXTENSION_BLOCKED=collection_error: "
                 + str(error).replace("\n", " "),
                 file=sys.stderr,
             )
@@ -1844,6 +1957,7 @@ def _performance_document(
 def performance(args: argparse.Namespace) -> int:
     run_root = args.run_root.absolute()
     prepared = read_prepare(run_root, recheck=True)
+    contract = prepared_contract(prepared)
     if prepared["mode"] != "real":
         raise EvidenceError("selftest run roots cannot publish actual Q10 evidence")
     if (run_root / "performance.json").exists() or (run_root / "performance.json").is_symlink():
@@ -1894,7 +2008,11 @@ def performance(args: argparse.Namespace) -> int:
             failure_path,
             canonical(
                 {
-                    "schema_version": "tflite-evidence-performance-failure-v1",
+                    "schema_version": target_schema(
+                        contract,
+                        "tflite-evidence-performance-failure-v1",
+                        "format-evidence-performance-failure-v1",
+                    ),
                     "state": "failed",
                     "failure_kind": "invalid_observations",
                     "created_utc": utc_now(),
@@ -1931,7 +2049,11 @@ def performance(args: argparse.Namespace) -> int:
             failure_path,
             canonical(
                 {
-                    "schema_version": "tflite-evidence-performance-failure-v1",
+                    "schema_version": target_schema(
+                        contract,
+                        "tflite-evidence-performance-failure-v1",
+                        "format-evidence-performance-failure-v1",
+                    ),
                     "state": "failed",
                     "failure_kind": "qualification_failed",
                     "created_utc": utc_now(),
@@ -1980,14 +2102,18 @@ def performance(args: argparse.Namespace) -> int:
         run_root / "performance.json",
         canonical(
             {
-                "schema_version": "tflite-evidence-performance-v1",
+                "schema_version": target_schema(
+                    contract,
+                    "tflite-evidence-performance-v1",
+                    "format-evidence-performance-v1",
+                ),
                 "state": "complete",
                 "bundle": str(destination),
                 "bundle_index_sha256": sha256_bytes(regular_bytes(destination / "index.json", "bundle index")),
             }
         ),
     )
-    print(f"TFLITE_EVIDENCE_Q10_OK=yes bundle={destination}")
+    print(f"{contract.marker_prefix}_Q10_OK=yes bundle={destination}")
     return 0
 
 
@@ -2201,6 +2327,7 @@ def validate_operation_file(
 def soak_start(args: argparse.Namespace) -> int:
     run_root = args.run_root.absolute()
     prepared = read_prepare(run_root, recheck=True)
+    contract = prepared_contract(prepared)
     if prepared["mode"] != "real":
         raise EvidenceError("selftest run roots cannot start qualifying operations")
     active = active_workloads()
@@ -2209,7 +2336,11 @@ def soak_start(args: argparse.Namespace) -> int:
     if not (run_root / "performance.json").is_file():
         raise EvidenceError("Q10 performance evidence must complete before V7 operations start")
     command, command_payload = command_document(args.command.resolve(strict=True))
-    profile, _ = read_json(Path(prepared["profile"]), "prepared TFLite profile", 4 * 1024 * 1024)
+    profile, _ = read_json(
+        Path(prepared["profile"]),
+        f"prepared {contract.label} profile",
+        4 * 1024 * 1024,
+    )
     try:
         baseline._validate_command_environment(command, profile, "operation command")
     except baseline.ContractError as error:
@@ -2351,7 +2482,11 @@ def soak_start(args: argparse.Namespace) -> int:
             supervisor.wait()
         raise EvidenceError("supervisor exited before its identity could be captured")
     controller = {
-        "schema_version": "tflite-operation-controller-v1",
+        "schema_version": target_schema(
+            contract,
+            "tflite-operation-controller-v1",
+            "format-operation-controller-v1",
+        ),
         "state": "running",
         "operation": args.operation,
         "supervisor_pid": supervisor.pid,
@@ -2362,7 +2497,7 @@ def soak_start(args: argparse.Namespace) -> int:
     }
     exclusive_write(operation_root / "controller.json", canonical(controller))
     print(
-        "TFLITE_EVIDENCE_SOAK_STARTED=yes "
+        f"{contract.marker_prefix}_SOAK_STARTED=yes "
         f"operation={args.operation} supervisor_pid={supervisor.pid} start_ticks={ticks} "
         f"run_root={run_root}"
     )
@@ -2406,20 +2541,25 @@ def status(args: argparse.Namespace) -> int:
 
 def stop(args: argparse.Namespace) -> int:
     run_root = args.run_root.absolute()
-    read_prepare(run_root, recheck=False)
+    prepared = read_prepare(run_root, recheck=False)
+    contract = prepared_contract(prepared)
     _operation_root, controller = _operation_paths(run_root, args.operation)
     pid = controller.get("supervisor_pid")
     ticks = controller.get("supervisor_start_ticks")
     if not isinstance(pid, int) or process_start_ticks(pid) != ticks:
         raise EvidenceError("supervisor identity is absent or changed; refusing to signal")
     os.kill(pid, signal.SIGTERM)
-    print(f"TFLITE_EVIDENCE_STOP_REQUESTED=yes operation={args.operation} supervisor_pid={pid}")
+    print(
+        f"{contract.marker_prefix}_STOP_REQUESTED=yes "
+        f"operation={args.operation} supervisor_pid={pid}"
+    )
     return 0
 
 
 def _supervise_operation(args: argparse.Namespace) -> int:
     run_root = args.run_root.absolute()
     prepared = read_prepare(run_root, recheck=True)
+    contract = prepared_contract(prepared)
     operation_root = run_root / "operations" / args.operation
     command, command_payload = command_document(operation_root / "command.json")
     executable_path = Path(command["argv"][0])
@@ -2597,7 +2737,11 @@ def _supervise_operation(args: argparse.Namespace) -> int:
     residual_processes = cgroup_residual
     if stop_requested:
         failure = {
-            "schema_version": "tflite-operation-failure-v1",
+            "schema_version": target_schema(
+                contract,
+                "tflite-operation-failure-v1",
+                "format-operation-failure-v1",
+            ),
             "reason": "user_stop",
             "exit_codes": exit_codes,
             "residual_processes_before_cleanup": residual_processes,
@@ -2606,7 +2750,11 @@ def _supervise_operation(args: argparse.Namespace) -> int:
         return 1
     if resource_failure is not None:
         failure = {
-            "schema_version": "tflite-operation-failure-v1",
+            "schema_version": target_schema(
+                contract,
+                "tflite-operation-failure-v1",
+                "format-operation-failure-v1",
+            ),
             "reason": resource_failure,
             "exit_codes": exit_codes,
             "residual_processes_before_cleanup": residual_processes,
@@ -2617,7 +2765,9 @@ def _supervise_operation(args: argparse.Namespace) -> int:
         regular_bytes(executable_path, "operation executable", 1024 * 1024 * 1024)
     ) != executable_sha:
         raise EvidenceError("operation executable changed during the run")
-    profile, _ = read_json(Path(prepared["profile"]), "prepared TFLite profile")
+    profile, _ = read_json(
+        Path(prepared["profile"]), f"prepared {contract.label} profile"
+    )
     expected_outcome = "worker_failure" if args.operation == "fault_injection" else "completed"
     corpus_after_sha, _ = audit_corpus(Path(prepared["corpus_index"]))
     target_calls: list[int] = []
@@ -2626,13 +2776,15 @@ def _supervise_operation(args: argparse.Namespace) -> int:
         stdout = regular_bytes(operation_root / f"stdout{suffix}.log", "operation stdout")
         stderr = regular_bytes(operation_root / f"stderr{suffix}.log", "operation stderr")
         if args.operation in {"engine_smoke", "fault_injection"}:
-            calls = len(LOAD_MARKER.findall(stdout + stderr))
+            calls = len(contract.load_marker.findall(stdout + stderr))
             if args.operation == "engine_smoke" and not (
-                LOAD_OK_MARKER.search(stdout + stderr)
-                and ACCESS_OK_MARKER.search(stdout + stderr)
+                contract.load_ok_marker.search(stdout + stderr)
+                and contract.access_ok_marker.search(stdout + stderr)
             ):
-                raise EvidenceError("engine smoke did not reach load/allocate/access markers")
-            if args.operation == "fault_injection" and not LOAD_REJECT_MARKER.search(
+                raise EvidenceError(
+                    f"engine smoke did not reach {contract.api_event} markers"
+                )
+            if args.operation == "fault_injection" and not contract.load_reject_marker.search(
                 stdout + stderr
             ):
                 raise EvidenceError("fault injection did not preserve a loader rejection marker")
@@ -2661,7 +2813,7 @@ def _supervise_operation(args: argparse.Namespace) -> int:
     )
     ended_datetime = started_datetime + timedelta(seconds=duration)
     operation_value = {
-        "schema_version": "tflite-v7-operation-v1",
+        "schema_version": contract.operation_schema,
         "operation": args.operation,
         "mode": "real",
         "target_id": profile["target_id"],
@@ -2712,6 +2864,7 @@ def _supervise(args: argparse.Namespace) -> int:
         subprocess.SubprocessError,
         baseline.ContractError,
     ) as error:
+        contract = failure_contract(args.run_root.absolute())
         failure_path = (
             args.run_root.absolute()
             / "operations"
@@ -2724,7 +2877,11 @@ def _supervise(args: argparse.Namespace) -> int:
                     failure_path,
                     canonical(
                         {
-                            "schema_version": "tflite-operation-failure-v1",
+                            "schema_version": target_schema(
+                                contract,
+                                "tflite-operation-failure-v1",
+                                "format-operation-failure-v1",
+                            ),
                             "reason": "supervisor_error",
                             "error": str(error),
                         }
@@ -2732,13 +2889,15 @@ def _supervise(args: argparse.Namespace) -> int:
                 )
             except (EvidenceError, OSError):
                 pass
-        print(f"[tflite-evidence-supervisor] fail: {error}", file=sys.stderr)
+        label = contract.label.lower().replace(" ", "-")
+        print(f"[{label}-evidence-supervisor] fail: {error}", file=sys.stderr)
         return 1
 
 
 def finalize(args: argparse.Namespace) -> int:
     run_root = args.run_root.absolute()
     prepared = read_prepare(run_root, recheck=True)
+    contract = prepared_contract(prepared)
     finalize_path = run_root / f"finalize-{args.requirement.lower()}.json"
     if finalize_path.exists() or finalize_path.is_symlink():
         raise EvidenceError(f"run root was already finalized for {args.requirement}")
@@ -2793,7 +2952,11 @@ def finalize(args: argparse.Namespace) -> int:
         finalize_path,
         canonical(
             {
-                "schema_version": "tflite-evidence-finalize-v1",
+                "schema_version": target_schema(
+                    contract,
+                    "tflite-evidence-finalize-v1",
+                    "format-evidence-finalize-v1",
+                ),
                 "state": "complete",
                 "requirement": args.requirement,
                 "bundle": str(destination),
@@ -2801,7 +2964,10 @@ def finalize(args: argparse.Namespace) -> int:
             }
         ),
     )
-    print(f"TFLITE_EVIDENCE_FINALIZED=yes requirement={args.requirement} bundle={destination}")
+    print(
+        f"{contract.marker_prefix}_FINALIZED=yes "
+        f"requirement={args.requirement} bundle={destination}"
+    )
     return 0
 
 
@@ -2813,12 +2979,25 @@ def validate_command(args: argparse.Namespace) -> int:
         expected_profile_sha256=args.expected_profile_sha256,
         require_current_aa=args.require_current_aa,
     )
-    print(f"TFLITE_EVIDENCE_BUNDLE_OK=yes requirement={args.requirement} files={len(identities)}")
+    manifest, _payload = read_json(args.bundle.absolute() / "manifest.json", "bundle manifest")
+    identity = manifest.get("identity")
+    fixed = identity.get("fixed") if isinstance(identity, dict) else None
+    contract = target_contract(fixed.get("target_id") if isinstance(fixed, dict) else "tflite")
+    print(
+        f"{contract.marker_prefix}_BUNDLE_OK=yes "
+        f"requirement={args.requirement} files={len(identities)}"
+    )
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser(default_target_id: str = "tflite") -> argparse.ArgumentParser:
+    target_contract(default_target_id)
+    description = __doc__
+    if default_target_id == "openvino-ir":
+        description = (
+            "Collect, supervise, publish, and revalidate OpenVINO Q10/Q11 evidence."
+        )
+    parser = argparse.ArgumentParser(description=description)
     subparsers = parser.add_subparsers(dest="command", required=True)
     prepare_parser = subparsers.add_parser("prepare")
     prepare_parser.add_argument("--run-root", required=True, type=Path)
@@ -2829,6 +3008,11 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--evidence-root", required=True, type=Path)
     prepare_parser.add_argument("--comparison-id", required=True)
     prepare_parser.add_argument("--expected-commit", required=True)
+    prepare_parser.add_argument(
+        "--target-id",
+        choices=tuple(sorted(_TARGET_CONTRACTS)),
+        default=default_target_id,
+    )
     prepare_parser.add_argument("--mode", choices=("real", "selftest"), default="real")
     prepare_parser.add_argument("--peak-rss-bytes", type=int, default=1_073_741_824)
     prepare_parser.add_argument("--log-bytes", type=int, required=True)
@@ -2880,8 +3064,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    default_target_id: str = "tflite",
+) -> int:
+    parser = build_parser(default_target_id)
     args = parser.parse_args(argv)
     if getattr(args, "sample_seconds", 1.0) <= 0:
         parser.error("--sample-seconds must be > 0")
@@ -2898,6 +3086,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         baseline.ContractError,
     ) as error:
         if args.command == "_supervise":
+            contract = failure_contract(args.run_root.absolute(), default_target_id)
             failure_path = (
                 args.run_root.absolute()
                 / "operations"
@@ -2910,7 +3099,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         failure_path,
                         canonical(
                             {
-                                "schema_version": "tflite-operation-failure-v1",
+                                "schema_version": target_schema(
+                                    contract,
+                                    "tflite-operation-failure-v1",
+                                    "format-operation-failure-v1",
+                                ),
                                 "reason": "supervisor_error",
                                 "error": str(error),
                             }
@@ -2918,7 +3111,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 except (EvidenceError, OSError):
                     pass
-        print(f"[tflite-evidence] fail: {error}", file=sys.stderr)
+        contract = (
+            failure_contract(args.run_root.absolute(), default_target_id)
+            if hasattr(args, "run_root")
+            else target_contract(getattr(args, "target_id", default_target_id))
+        )
+        label = contract.label.lower().replace(" ", "-")
+        print(f"[{label}-evidence] fail: {error}", file=sys.stderr)
         return 1
 
 

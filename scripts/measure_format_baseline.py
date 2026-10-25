@@ -668,6 +668,7 @@ def _validate_target_profile_shape(profile: dict[str, Any], label: str) -> None:
         "gguf": {"metadata", "tensor-info", "full"},
         "safetensors": {"deserialize"},
         "tflite": {"load-allocate-access"},
+        "openvino-ir": {"read-validate-constants"},
     }
     target_id = profile["target_id"]
     if target_id not in allowed_depths or depth not in allowed_depths[target_id]:
@@ -1980,7 +1981,10 @@ def _validate_operation_raw(
 ) -> dict[str, Any]:
     label = f"operations.{name}.raw_json"
     raw = _object(value, label, OPERATION_FIELDS)
-    if raw["schema_version"] != "tflite-v7-operation-v1":
+    if raw["schema_version"] not in {
+        "tflite-v7-operation-v1",
+        "format-v7-operation-v1",
+    }:
         raise ContractError(f"{label}.schema_version is unsupported")
     if raw["operation"] != name:
         raise ContractError(f"{label}.operation does not match its operation slot")

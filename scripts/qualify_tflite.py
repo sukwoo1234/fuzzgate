@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Audit FND-03 evidence and issue a TFLite qualification sidecar.
+"""Audit FND-03 evidence and issue a format qualification sidecar.
 
-This is intentionally TFLite-specific.  A verified sidecar is emitted only when
-all Q01..Q12 suites pass for one immutable profile and one clean tool commit.
+The TFLite CLI remains backward compatible; OpenVINO supplies a stricter target
+contract through its own entrypoint. A verified sidecar is emitted only when all
+Q01..Q12 suites pass for one immutable profile and one clean tool commit.
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -66,6 +68,63 @@ RECORD_FIELDS = {
 
 class QualificationError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class QualificationContract:
+    target_id: str
+    label: str
+    depth: str
+    input_kind: dict[str, Any]
+    capability: dict[str, str]
+    required_binary_roles: frozenset[str]
+    loader_version: str | None = None
+    patches: tuple[Any, ...] | None = None
+    primary_source: dict[str, Any] | None = None
+    allow_additional_binary_roles: bool = True
+
+
+TFLITE_CONTRACT = QualificationContract(
+    target_id="tflite",
+    label="TFLite",
+    depth="load-allocate-access",
+    input_kind={"kind": "single", "extensions": ["tflite"], "subformats": []},
+    capability={
+        "backend": "local-harness",
+        "binary_role": "replay",
+        "required_mode": "native",
+        "instrumentation_scope": "tensorflow/lite",
+    },
+    required_binary_roles=frozenset({"replay"}),
+)
+
+OPENVINO_CONTRACT = QualificationContract(
+    target_id="openvino-ir",
+    label="OpenVINO",
+    depth="read-validate-constants",
+    input_kind={
+        "kind": "fzb1",
+        "extensions": ["fzb"],
+        "subformats": ["model.bin", "model.xml"],
+    },
+    capability={
+        "backend": "local-harness",
+        "binary_role": "replay",
+        "required_mode": "native",
+        "instrumentation_scope": "openvino-core+ir-frontend",
+    },
+    required_binary_roles=frozenset({"replay", "fuzzer"}),
+    loader_version="2026.4.1",
+    patches=(),
+    primary_source={
+        "url": "https://github.com/openvinotoolkit/openvino/archive/refs/tags/2026.4.1.tar.gz",
+        "tag": "2026.4.1",
+        "resolved_commit": "e213a14725769a6a2bf86fc86650aa78a9c05d3e",
+        "sha256": "1ee85264556025486a4745a2d452ea823c578b3d162768bfef590366d2e6c539",
+        "size_bytes": 71349787,
+    },
+    allow_additional_binary_roles=False,
+)
 
 
 def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -297,12 +356,26 @@ def verify_record_identity(metadata: Any, label: str) -> tuple[Path, str]:
     return path, expected_hash
 
 
-def audit_profile(path: Path) -> tuple[str, bytes, list[tuple[Path, str]]]:
+def audit_profile(
+    path: Path,
+    contract: QualificationContract = TFLITE_CONTRACT,
+) -> tuple[str, bytes, list[tuple[Path, str]]]:
     require(path.is_absolute(), "profile path must be absolute")
-    profile, payload = read_json(path, "TFLite profile", MAX_PROFILE_BYTES)
+    profile, payload = read_json(path, f"{contract.label} profile", MAX_PROFILE_BYTES)
     require(profile.get("schema_version") == "1", "profile schema_version must be 1")
-    require(profile.get("target_id") == "tflite", "profile target_id must be tflite")
-    require(profile.get("depth") == "load-allocate-access", "profile depth mismatch")
+    require(
+        profile.get("target_id") == contract.target_id,
+        f"profile target_id must be {contract.target_id}",
+    )
+    require(profile.get("depth") == contract.depth, "profile depth mismatch")
+    require(profile.get("input_kind") == contract.input_kind, "profile input kind mismatch")
+    if contract.loader_version is not None:
+        require(
+            profile.get("loader_version") == contract.loader_version,
+            "profile loader version mismatch",
+        )
+    if contract.patches is not None:
+        require(profile.get("patches") == list(contract.patches), "profile patches are forbidden")
     artifacts = profile.get("source_artifacts")
     require(isinstance(artifacts, list) and artifacts, "profile source_artifacts must not be empty")
     for index, artifact in enumerate(artifacts):
@@ -313,19 +386,19 @@ def audit_profile(path: Path) -> tuple[str, bytes, list[tuple[Path, str]]]:
         require(isinstance(artifact.get("resolved_commit"), str) and artifact["resolved_commit"], f"source_artifacts[{index}].resolved_commit is empty")
         require_hash(artifact.get("sha256"), f"source_artifacts[{index}].sha256")
         require(isinstance(artifact.get("size_bytes"), int) and artifact["size_bytes"] > 0, f"source_artifacts[{index}].size_bytes is invalid")
+    if contract.primary_source is not None:
+        require(
+            artifacts[0] == contract.primary_source,
+            "profile primary source pin mismatch",
+        )
 
     engine_capabilities = profile.get("engine_capabilities")
-    require(isinstance(engine_capabilities, list) and len(engine_capabilities) == 1, "profile must declare exactly one TFLite backend")
-    capability = engine_capabilities[0]
     require(
-        capability == {
-            "backend": "local-harness",
-            "binary_role": "replay",
-            "required_mode": "native",
-            "instrumentation_scope": "tensorflow/lite",
-        },
-        "profile backend/depth scope mismatch",
+        isinstance(engine_capabilities, list) and len(engine_capabilities) == 1,
+        f"profile must declare exactly one {contract.label} backend",
     )
+    capability = engine_capabilities[0]
+    require(capability == contract.capability, "profile backend/depth scope mismatch")
 
     identities: list[tuple[Path, str]] = []
     for index, patch in enumerate(profile.get("patches", [])):
@@ -363,7 +436,17 @@ def audit_profile(path: Path) -> tuple[str, bytes, list[tuple[Path, str]]]:
                     f"profile binary {role} linked library {library_index}",
                 )
             )
-    require("replay" in roles, "profile has no replay binary")
+    require(
+        contract.required_binary_roles <= roles,
+        "profile misses required binary roles: "
+        + ",".join(sorted(contract.required_binary_roles - roles)),
+    )
+    if not contract.allow_additional_binary_roles:
+        require(
+            roles == contract.required_binary_roles,
+            "profile has unexpected binary roles: "
+            + ",".join(sorted(roles - contract.required_binary_roles)),
+        )
     return sha256_bytes(payload), payload, identities
 
 
@@ -458,6 +541,7 @@ def audit_suite(
     root: Path,
     suite: str,
     profile_hash: str,
+    contract: QualificationContract = TFLITE_CONTRACT,
 ) -> tuple[
     dict[str, str],
     dict[str, str],
@@ -472,7 +556,7 @@ def audit_suite(
     expected_requirements = list(SUITE_REQUIREMENTS[suite])
 
     require(run.get("schema_version") == "1" and run.get("state") == "incomplete", f"{suite} run manifest state mismatch")
-    require(run.get("target_id") == "tflite" and run.get("suite") == suite, f"{suite} run target/suite mismatch")
+    require(run.get("target_id") == contract.target_id and run.get("suite") == suite, f"{suite} run target/suite mismatch")
     require(run.get("profile_sha256") == profile_hash, f"{suite} run profile mismatch")
     require(run.get("required_requirement_ids") == expected_requirements, f"{suite} run requirement coverage mismatch")
     task_ids = require_string_list(run.get("required_task_ids"), f"{suite} run task IDs")
@@ -483,7 +567,7 @@ def audit_suite(
     run_hash = sha256_bytes(run_bytes)
 
     require(summary.get("schema_version") == "1" and summary.get("state") == "complete", f"{suite} summary state mismatch")
-    require(summary.get("target_id") == "tflite" and summary.get("suite") == suite, f"{suite} summary target/suite mismatch")
+    require(summary.get("target_id") == contract.target_id and summary.get("suite") == suite, f"{suite} summary target/suite mismatch")
     require(summary.get("profile_sha256") == profile_hash, f"{suite} summary profile mismatch")
     require(summary.get("run_manifest_sha256") == run_hash, f"{suite} run manifest hash mismatch")
     require(summary.get("required_requirement_ids") == expected_requirements, f"{suite} summary requirement coverage mismatch")
@@ -589,8 +673,16 @@ def audit_suite(
     return requirement_statuses, audited_hashes, tool_commit, dirty_diff, execution_identities
 
 
-def recheck_profile(path: Path, payload: bytes, identities: list[tuple[Path, str]]) -> None:
-    require(read_regular(path, "TFLite profile", MAX_PROFILE_BYTES) == payload, "profile changed during qualification")
+def recheck_profile(
+    path: Path,
+    payload: bytes,
+    identities: list[tuple[Path, str]],
+    contract: QualificationContract = TFLITE_CONTRACT,
+) -> None:
+    require(
+        read_regular(path, f"{contract.label} profile", MAX_PROFILE_BYTES) == payload,
+        "profile changed during qualification",
+    )
     for identity_path, expected_hash in identities:
         current = read_external_identity(
             identity_path, "profile identity", 1024 * 1024 * 1024
@@ -629,17 +721,27 @@ def publish(path: Path, value: dict[str, Any]) -> None:
         os.close(directory_fd)
 
 
-def qualify(profile: Path, evidence_root: Path, output: Path, status: str) -> None:
-    profile_hash, profile_payload, identities = audit_profile(profile)
-    directory_metadata(evidence_root, "TFLite evidence root")
+def qualify(
+    profile: Path,
+    evidence_root: Path,
+    output: Path,
+    status: str,
+    contract: QualificationContract = TFLITE_CONTRACT,
+) -> None:
+    profile_hash, profile_payload, identities = audit_profile(profile, contract)
+    directory_metadata(evidence_root, f"{contract.label} evidence root")
     try:
         observed_suites = {entry.name for entry in os.scandir(evidence_root)}
     except OSError as error:
-        raise QualificationError(f"could not inspect TFLite evidence root: {error}") from error
+        raise QualificationError(
+            f"could not inspect {contract.label} evidence root: {error}"
+        ) from error
     missing_suites = set(SUITE_REQUIREMENTS) - observed_suites
     if missing_suites:
         raise QualificationError(f"missing suite evidence: {','.join(sorted(missing_suites))}")
-    exact_inventory(evidence_root, set(), set(SUITE_REQUIREMENTS), "TFLite evidence root")
+    exact_inventory(
+        evidence_root, set(), set(SUITE_REQUIREMENTS), f"{contract.label} evidence root"
+    )
 
     statuses: dict[str, str] = {}
     hashes: dict[str, str] = {}
@@ -648,7 +750,7 @@ def qualify(profile: Path, evidence_root: Path, output: Path, status: str) -> No
     execution_identities: dict[Path, str] = {}
     for suite in SUITE_REQUIREMENTS:
         suite_statuses, suite_hashes, suite_commit, suite_dirty, suite_identities = audit_suite(
-            evidence_root, suite, profile_hash
+            evidence_root, suite, profile_hash, contract
         )
         if tool_commit is None:
             tool_commit = suite_commit
@@ -673,7 +775,7 @@ def qualify(profile: Path, evidence_root: Path, output: Path, status: str) -> No
     else:
         require(bool(passed), "smoke qualification has no passing requirement evidence")
 
-    recheck_profile(profile, profile_payload, identities)
+    recheck_profile(profile, profile_payload, identities, contract)
     for identity_path, expected_hash in execution_identities.items():
         current = read_external_identity(
             identity_path, "execution identity", 1024 * 1024 * 1024
@@ -695,7 +797,7 @@ def qualify(profile: Path, evidence_root: Path, output: Path, status: str) -> No
     pending_text = ",".join(pending) if pending else "none"
     assert tool_commit is not None
     print(
-        "TFL07_QUALIFICATION_OK=yes "
+        f"{'TFL07' if contract.target_id == 'tflite' else 'OVI07'}_QUALIFICATION_OK=yes "
         f"status={status} passed={len(passed)} pending={pending_text} "
         f"profile_sha256={profile_hash} tool_commit={tool_commit}"
     )

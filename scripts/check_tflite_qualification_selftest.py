@@ -55,27 +55,36 @@ def write_json(path: Path, value: Any) -> str:
     return digest_bytes(payload)
 
 
-def make_profile(root: Path) -> Path:
+def make_profile(root: Path, target_id: str = "tflite") -> Path:
     identity = root / "identity.bin"
     identity.write_bytes(b"tflite-qualification-selftest\n")
     identity.chmod(0o700)
     identity_hash = digest(identity)
+    openvino = target_id == "openvino-ir"
     profile = {
         "schema_version": "1",
-        "target_id": "tflite",
-        "format_revision": "3",
-        "loader_id": "tensorflow-lite",
-        "loader_version": "v2.20.0",
+        "target_id": target_id,
+        "format_revision": "ir-v11" if openvino else "3",
+        "loader_id": "openvino-ir-frontend" if openvino else "tensorflow-lite",
+        "loader_version": "2026.4.1" if openvino else "v2.20.0",
         "source_artifacts": [
             {
-                "url": "https://github.com/tensorflow/tensorflow/archive/refs/tags/v2.20.0.tar.gz",
-                "tag": "v2.20.0",
-                "resolved_commit": "72fbba3d20f4616d7312b5e2b7f79daf6e82f2fa",
-                "sha256": "2" * 64,
-                "size_bytes": 1,
+                "url": "https://github.com/openvinotoolkit/openvino/archive/refs/tags/2026.4.1.tar.gz"
+                if openvino
+                else "https://github.com/tensorflow/tensorflow/archive/refs/tags/v2.20.0.tar.gz",
+                "tag": "2026.4.1" if openvino else "v2.20.0",
+                "resolved_commit": "e213a14725769a6a2bf86fc86650aa78a9c05d3e"
+                if openvino
+                else "72fbba3d20f4616d7312b5e2b7f79daf6e82f2fa",
+                "sha256": "1ee85264556025486a4745a2d452ea823c578b3d162768bfef590366d2e6c539"
+                if openvino
+                else "2" * 64,
+                "size_bytes": 71349787 if openvino else 1,
             }
         ],
-        "patches": [{"order": 1, "path": str(identity), "sha256": identity_hash}],
+        "patches": []
+        if openvino
+        else [{"order": 1, "path": str(identity), "sha256": identity_hash}],
         "toolchain": {
             "compiler": {"version": "1", "path": str(identity), "sha256": identity_hash},
             "linker": {"version": "1", "path": str(identity), "sha256": identity_hash},
@@ -98,15 +107,34 @@ def make_profile(root: Path) -> Path:
                 "argv": ["{input}"],
                 "linked_libraries": [],
             }
-        ],
-        "input_kind": {"kind": "single", "extensions": ["tflite"], "subformats": []},
-        "depth": "load-allocate-access",
+        ]
+        + (
+            [
+                {
+                    "role": "fuzzer",
+                    "path": str(identity),
+                    "sha256": identity_hash,
+                    "argv": ["{corpus_dir}"],
+                    "linked_libraries": [],
+                }
+            ]
+            if openvino
+            else []
+        ),
+        "input_kind": {
+            "kind": "fzb1" if openvino else "single",
+            "extensions": ["fzb" if openvino else "tflite"],
+            "subformats": ["model.bin", "model.xml"] if openvino else [],
+        },
+        "depth": "read-validate-constants" if openvino else "load-allocate-access",
         "engine_capabilities": [
             {
                 "backend": "local-harness",
                 "binary_role": "replay",
                 "required_mode": "native",
-                "instrumentation_scope": "tensorflow/lite",
+                "instrumentation_scope": "openvino-core+ir-frontend"
+                if openvino
+                else "tensorflow/lite",
             }
         ],
         "limits": {
@@ -119,8 +147,10 @@ def make_profile(root: Path) -> Path:
         },
         "coverage_scope": {
             "unit": "source-line",
-            "include_sources": ["tensorflow/lite/**"],
-            "exclude_sources": ["**/*_test.cc"],
+            "include_sources": ["src/core", "src/frontends/ir"]
+            if openvino
+            else ["tensorflow/lite/**"],
+            "exclude_sources": [] if openvino else ["**/*_test.cc"],
         },
     }
     path = root / "profile.json"
@@ -137,6 +167,7 @@ def make_suite(
     dirty: str | None = None,
     commit: str = COMMIT,
     incomplete: set[str] | None = None,
+    target_id: str = "tflite",
 ) -> None:
     incomplete = incomplete or set()
     root = evidence_root / suite
@@ -147,7 +178,7 @@ def make_suite(
     run = {
         "schema_version": "1",
         "state": "incomplete",
-        "target_id": "tflite",
+        "target_id": target_id,
         "suite": suite,
         "profile_path": "/fixture/profile.json",
         "profile_sha256": profile_hash,
@@ -268,7 +299,7 @@ def make_suite(
         "state": "complete",
         "overall_status": overall,
         "counts": counts,
-        "target_id": "tflite",
+        "target_id": target_id,
         "suite": suite,
         "profile_sha256": profile_hash,
         "requirements_sha256": run["requirements_sha256"],
@@ -287,26 +318,34 @@ def make_suite(
     write_json(root / "summary.json", summary)
 
 
-def make_evidence(root: Path, profile_hash: str, task_identity: Path) -> Path:
+def make_evidence(
+    root: Path,
+    profile_hash: str,
+    task_identity: Path,
+    target_id: str = "tflite",
+) -> Path:
     evidence = root / "evidence"
     for suite in SUITE_REQUIREMENTS:
-        make_suite(evidence, suite, profile_hash, task_identity)
+        make_suite(
+            evidence, suite, profile_hash, task_identity, target_id=target_id
+        )
     return evidence
 
 
 class Selftest:
-    def __init__(self, assembler: Path) -> None:
+    def __init__(self, assembler: Path, label: str) -> None:
         self.assembler = assembler
+        self.label = label
         self.pass_count = 0
         self.fail_count = 0
 
     def ok(self, label: str) -> None:
         self.pass_count += 1
-        print(f"[tflite-qualification] ok: {label}")
+        print(f"[{self.label}-qualification] ok: {label}")
 
     def bad(self, label: str, detail: str) -> None:
         self.fail_count += 1
-        print(f"[tflite-qualification] fail: {label}: {detail}", file=sys.stderr)
+        print(f"[{self.label}-qualification] fail: {label}: {detail}", file=sys.stderr)
 
     def run(self, profile: Path, evidence: Path, output: Path, status: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -340,23 +379,29 @@ class Selftest:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--assembler", required=True, type=Path)
+    parser.add_argument(
+        "--target-id", choices=("tflite", "openvino-ir"), default="tflite"
+    )
     args = parser.parse_args()
-    test = Selftest(args.assembler.resolve())
+    label = "openvino" if args.target_id == "openvino-ir" else "tflite"
+    test = Selftest(args.assembler.resolve(), label)
     if not test.assembler.is_file():
         test.bad("assembler precondition", f"missing file: {test.assembler}")
-        print(f"[tflite-qualification] pass={test.pass_count} fail={test.fail_count}")
+        print(f"[{label}-qualification] pass={test.pass_count} fail={test.fail_count}")
         return 1
 
     with tempfile.TemporaryDirectory(prefix="tflite-qualification-") as temporary:
         root = Path(temporary)
-        profile = make_profile(root)
+        profile = make_profile(root, args.target_id)
         profile_hash = digest(profile)
         task_identity = root / "task-identity.py"
         task_identity.write_bytes(b"#!/usr/bin/env python3\n")
         task_identity.chmod(0o700)
         os.link(task_identity, root / "task-identity-alias.py")
 
-        evidence = make_evidence(root / "valid", profile_hash, task_identity)
+        evidence = make_evidence(
+            root / "valid", profile_hash, task_identity, args.target_id
+        )
         completed = test.run(profile, evidence, root / "verified.json", "verified")
         test.expect("all twelve clean requirements issue verified", completed, 0, "status=verified")
 
@@ -392,14 +437,28 @@ def main() -> int:
         dirty = root / "dirty"
         shutil.copytree(evidence, dirty)
         shutil.rmtree(dirty / "performance")
-        make_suite(dirty, "performance", profile_hash, task_identity, dirty="5" * 64)
+        make_suite(
+            dirty,
+            "performance",
+            profile_hash,
+            task_identity,
+            dirty="5" * 64,
+            target_id=args.target_id,
+        )
         completed = test.run(profile, dirty, root / "dirty.json", "verified")
         test.expect("dirty source identity is refused for verified", completed, 1, "dirty source")
 
         mixed = root / "mixed"
         shutil.copytree(evidence, mixed)
         shutil.rmtree(mixed / "soak")
-        make_suite(mixed, "soak", profile_hash, task_identity, commit="6" * 40)
+        make_suite(
+            mixed,
+            "soak",
+            profile_hash,
+            task_identity,
+            commit="6" * 40,
+            target_id=args.target_id,
+        )
         completed = test.run(profile, mixed, root / "mixed.json", "verified")
         test.expect("mixed tool commits are refused", completed, 1, "tool commit mismatch")
 
@@ -407,7 +466,14 @@ def main() -> int:
         shutil.copytree(evidence, partial)
         for suite, requirement in (("performance", "Q10"), ("soak", "Q11")):
             shutil.rmtree(partial / suite)
-            make_suite(partial, suite, profile_hash, task_identity, incomplete={requirement})
+            make_suite(
+                partial,
+                suite,
+                profile_hash,
+                task_identity,
+                incomplete={requirement},
+                target_id=args.target_id,
+            )
         completed = test.run(profile, partial, root / "smoke.json", "smoke_passed")
         test.expect("partial evidence stays smoke-passed", completed, 0, "pending=Q10,Q11")
         if completed.returncode == 0:
@@ -423,7 +489,7 @@ def main() -> int:
         no_replace = test.run(profile, evidence, root / "verified.json", "verified")
         test.expect("existing qualification is never overwritten", no_replace, 1, "already exists")
 
-    print(f"[tflite-qualification] pass={test.pass_count} fail={test.fail_count}")
+    print(f"[{label}-qualification] pass={test.pass_count} fail={test.fail_count}")
     return 0 if test.fail_count == 0 else 1
 
 
