@@ -21,6 +21,8 @@ pub(crate) enum TargetKind {
     Safetensors,
     #[value(name = "tflite")]
     Tflite,
+    #[value(name = "openvino-ir")]
+    OpenvinoIr,
 }
 
 #[derive(Clone, Copy)]
@@ -181,6 +183,27 @@ const TARGET_SPECS: &[TargetSpec] = &[
                 "https://github.com/tensorflow/tensorflow/archive/refs/tags/v2.20.0.tar.gz",
             official_owner: "tensorflow",
             official_repo: "tensorflow",
+        },
+    },
+    TargetSpec {
+        kind: TargetKind::OpenvinoIr,
+        target_id: "openvino-ir",
+        seed_subdir: "openvino-ir",
+        input_ext: "fzb",
+        storage_name: "openvino-ir",
+        coverage_env_key: Some("TOOL_COVERAGE_OPENVINO_CMD"),
+        coverage_runner: Some("scripts/run_coverage_openvino.sh"),
+        external_harness_env: "TOOL_OPENVINO_IR_HARNESS_CMD",
+        mutation_supported: false,
+        campaign_supported: false,
+        ui_supported: false,
+        preset: TargetPreset {
+            name: "openvino-ir",
+            default_version: "2026.4.1",
+            default_url:
+                "https://github.com/openvinotoolkit/openvino/archive/refs/tags/2026.4.1.tar.gz",
+            official_owner: "openvinotoolkit",
+            official_repo: "openvino",
         },
     },
 ];
@@ -379,6 +402,12 @@ impl std::fmt::Display for HarnessError {
 }
 
 pub(crate) fn run_harness(target: &TargetKind, input: &Path) -> Result<(), HarnessError> {
+    if matches!(target, TargetKind::OpenvinoIr) {
+        return Err(HarnessError::Unavailable(
+            "openvino-ir requires a pinned target profile; build it with scripts/build_openvino_execution_profile.sh"
+                .to_string(),
+        ));
+    }
     if !input.exists() {
         return Err(HarnessError::InputRejected(format!(
             "input not found: {}",
@@ -403,6 +432,7 @@ pub(crate) fn run_harness(target: &TargetKind, input: &Path) -> Result<(), Harne
             safetensors_precheck(&bytes).map_err(HarnessError::InputRejected)?
         }
         TargetKind::Tflite => tflite_precheck(&bytes).map_err(HarnessError::InputRejected)?,
+        TargetKind::OpenvinoIr => unreachable!("openvino-ir requires a target profile"),
     };
 
     let core_path_step = match target {
@@ -410,12 +440,14 @@ pub(crate) fn run_harness(target: &TargetKind, input: &Path) -> Result<(), Harne
         TargetKind::Onnx => "protobuf->onnxruntime session loader".to_string(),
         TargetKind::Safetensors => "header_json->safetensors deserialize".to_string(),
         TargetKind::Tflite => "verified FlatBuffer->Interpreter->AllocateTensors".to_string(),
+        TargetKind::OpenvinoIr => unreachable!("openvino-ir requires a target profile"),
     };
     let library_connect = match target {
         TargetKind::Gguf => gguf_library_connect(input),
         TargetKind::Onnx => onnx_library_connect(input),
         TargetKind::Safetensors => safetensors_library_connect(input),
         TargetKind::Tflite => tflite_library_connect(input),
+        TargetKind::OpenvinoIr => unreachable!("openvino-ir requires a target profile"),
     };
     let strict_connect = std::env::var("TOOL_REQUIRE_LIBRARY_CONNECT")
         .map(|v| v == "1")

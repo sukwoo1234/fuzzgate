@@ -1002,6 +1002,7 @@ fn validate_depth(target: &str, depth: &str) -> Result<(), String> {
         "onnx" => depth == "session",
         "safetensors" => depth == "deserialize",
         "tflite" => depth == "load-allocate-access",
+        "openvino-ir" => depth == "read-validate-constants",
         _ => false,
     };
     if accepted {

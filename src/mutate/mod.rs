@@ -49,5 +49,8 @@ pub(crate) fn run_mutate_pipeline(
                 target, input, out, input_dir, out_dir, count, seed, &resolved,
             )
         }
+        TargetKind::OpenvinoIr => {
+            unreachable!("mutation-disabled targets return before dispatch")
+        }
     }
 }

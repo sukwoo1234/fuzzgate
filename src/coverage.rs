@@ -50,6 +50,10 @@ fn expected_coverage_runner(target: &TargetKind) -> Result<TrustedCoverageRunner
             name: "scripts/run_coverage_tflite.sh",
             bytes: include_bytes!("../scripts/run_coverage_tflite.sh"),
         }),
+        Some("scripts/run_coverage_openvino.sh") => Ok(TrustedCoverageRunner {
+            name: "scripts/run_coverage_openvino.sh",
+            bytes: include_bytes!("../scripts/run_coverage_openvino.sh"),
+        }),
         Some(other) => Err(format!(
             "target '{}' registers unknown coverage runner '{other}'",
             target_label(target)

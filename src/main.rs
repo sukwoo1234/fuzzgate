@@ -100,7 +100,7 @@ enum Commands {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Target type: gguf | onnx | safetensors | tflite
+    /// Target type: gguf | onnx | safetensors | tflite | openvino-ir
     #[arg(long, value_enum)]
     target: TargetKind,
 
@@ -149,7 +149,7 @@ struct CampaignArgs {
     #[arg(long, value_enum)]
     mode: CampaignMode,
 
-    /// Target type: gguf | onnx | safetensors | tflite
+    /// Target type: gguf | onnx | safetensors | tflite | openvino-ir
     #[arg(long, value_enum)]
     target: TargetKind,
 
@@ -200,7 +200,7 @@ struct CampaignArgs {
 
 #[derive(Args)]
 struct TriageArgs {
-    /// Target type: gguf | onnx | safetensors | tflite
+    /// Target type: gguf | onnx | safetensors | tflite | openvino-ir
     #[arg(long, value_enum)]
     target: TargetKind,
 
@@ -238,7 +238,7 @@ enum SeedCommands {
 
 #[derive(Args)]
 struct SeedSyncArgs {
-    /// Target type: gguf | onnx | safetensors | tflite
+    /// Target type: gguf | onnx | safetensors | tflite | openvino-ir
     #[arg(long, value_enum)]
     target: TargetKind,
 
@@ -257,7 +257,7 @@ struct SeedSyncArgs {
 
 #[derive(Args)]
 struct SeedStatsArgs {
-    /// Target type: gguf | onnx | safetensors | tflite
+    /// Target type: gguf | onnx | safetensors | tflite | openvino-ir
     #[arg(long, value_enum)]
     target: TargetKind,
 
@@ -290,7 +290,7 @@ struct DashboardArgs {
 
 #[derive(Args)]
 struct CoverageArgs {
-    /// Target type: gguf | onnx | safetensors | tflite
+    /// Target type: gguf | onnx | safetensors | tflite | openvino-ir
     #[arg(long, value_enum)]
     target: TargetKind,
 
@@ -361,7 +361,7 @@ struct ReplayDiagnosticArgs {
 
 #[derive(Args)]
 struct PrepareTargetArgs {
-    /// Target type: gguf | onnx | safetensors | tflite
+    /// Target type: gguf | onnx | safetensors | tflite | openvino-ir
     #[arg(long, value_enum)]
     target: TargetKind,
 
@@ -376,7 +376,7 @@ struct PrepareTargetArgs {
 
 #[derive(Args)]
 struct HarnessArgs {
-    /// Target type: gguf | onnx | safetensors | tflite
+    /// Target type: gguf | onnx | safetensors | tflite | openvino-ir
     #[arg(long, value_enum)]
     target: TargetKind,
 
@@ -387,7 +387,7 @@ struct HarnessArgs {
 
 #[derive(Args)]
 struct MutateArgs {
-    /// Target type: gguf | onnx | safetensors | tflite
+    /// Target type: gguf | onnx | safetensors | tflite | openvino-ir
     #[arg(long, value_enum)]
     target: TargetKind,
 
