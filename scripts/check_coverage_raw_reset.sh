@@ -20,9 +20,9 @@
 #   1. behavioural - run the REAL safetensors runner twice into one OUT_DIR, big corpus
 #      then small, and require the small run to report what the small corpus really covers
 #      (measured in the same gate run against a fresh OUT_DIR; no number is hardcoded).
-#   2. class scan - every scripts/run_coverage_*.sh must remove each directory it creates
-#      under OUT_DIR before creating it, so the defect cannot come back one runner at a
-#      time. Paths are resolved through their assignments; names are never trusted.
+#   2. class scan - every scripts/run_coverage_*.sh must either remove each directory it
+#      creates under OUT_DIR before creating it, or reject an existing/symlink OUT_DIR
+#      before every create. Paths are resolved through assignments; names are never trusted.
 #   3. negative controls - the scan must reject a runner that skips the removal, one that
 #      removes a different path, one whose removal is reached only through a branch that is
 #      false at run time, and one whose removal is guarded by `&&`; it must still accept a
@@ -110,7 +110,7 @@ else
   skip "instrumented safetensors replay absent: corpora-differ precondition unobserved"
 fi
 
-# --- 2. class scan: every directory a runner creates under OUT_DIR is removed first -----
+# --- 2. class scan: every created path is removed first or belongs to fresh-only OUT_DIR --
 # Names are never trusted - a runner could hold its raw path in any variable, so each
 # mkdir and rm target is resolved through the script's own assignments and OUT_DIR is
 # reduced to a sentinel. What is required is the relation between the two, not a spelling.
@@ -170,6 +170,25 @@ def shell_lines(text):
     return out
 
 lines = shell_lines(text)
+
+fail_definition = re.search(
+    r'^\s*fail\s*\(\s*\)\s*\{(?P<body>.*?)\}',
+    text,
+    flags=re.MULTILINE | re.DOTALL,
+)
+fail_terminates = False
+if fail_definition:
+    direct_exit = re.search(
+        r'(?:^|;)\s*exit\s+[1-9][0-9]*(?:\s*;|\s*$)',
+        fail_definition.group('body'),
+        flags=re.MULTILINE,
+    )
+    conditional_exit = re.search(
+        r'^\s*(?:if|for|while|until|case)\b|&&|\|\|',
+        fail_definition.group('body'),
+        flags=re.MULTILINE,
+    )
+    fail_terminates = direct_exit is not None and conditional_exit is None
 
 assigns = {}
 for _, line in lines:
@@ -239,8 +258,38 @@ BRACE_CLOSE = re.compile(r'^\s*\}\s*$')
 LEADIN = re.compile(r'^\s*(?:then|else|do)\s+')
 
 ops = []
+fresh_guards = []
+continued_guard = None
 depth = 0
-for _, line in lines:
+for line_number, line in lines:
+    # A runner can preserve old evidence and still prevent profile reuse by refusing the
+    # entire OUT_DIR before creating anything. Both -e and -L are required: a dangling
+    # symlink must not become a way around the fresh-only contract. `|| true` is not a
+    # guard; accept only the project's fail helper or an explicit nonzero exit.
+    if continued_guard is None:
+        guard_line_number = line_number
+        guard_text = line
+    else:
+        guard_line_number, prefix = continued_guard
+        guard_text = prefix + line.lstrip()
+    if guard_text.rstrip().endswith('\\'):
+        continued_guard = (guard_line_number, guard_text.rstrip()[:-1] + ' ')
+    else:
+        continued_guard = None
+    if depth == 0 and continued_guard is None:
+        expanded_line = strip_quotes(expand(guard_text))
+        guard = re.match(
+            r'^\s*\[\[(.*)\]\]\s*\|\|\s*(fail(?:\s|$)|exit\s+[1-9][0-9]*(?:\s|$))',
+            expanded_line,
+        )
+        if guard:
+            condition = guard.group(1)
+            has_exists = re.search(r'!\s+-e\s+' + re.escape(SENT) + r'(?:\s|$)', condition)
+            has_symlink = re.search(r'!\s+-L\s+' + re.escape(SENT) + r'(?:\s|$)', condition)
+            handler = guard.group(2).strip()
+            handler_terminates = not handler.startswith('fail') or fail_terminates
+            if has_exists and has_symlink and handler_terminates:
+                fresh_guards.append(guard_line_number)
     parts = re.split(r'(;;|;|&&|\|\|)', line)
     prev_sep = None
     for k, piece in enumerate(parts):
@@ -254,6 +303,7 @@ for _, line in lines:
             depth -= 1
         # `rm -fr` and `rm -r -f` are the same command as `rm -rf`. Pinning one spelling
         # rejected correct runners and then told the operator they removed nothing.
+        command = None
         m = re.match(r'\s*(rm|mkdir)\s+((?:-[A-Za-z]+\s+)+)(.*)$', frag)
         if m:
             flags = set(m.group(2).replace("-", " ").replace(" ", ""))
@@ -261,14 +311,24 @@ for _, line in lines:
                 m = None
             elif m.group(1) == "mkdir" and "p" not in flags:
                 m = None
-        if m:
-            op = m.group(1)
+            if m:
+                command = (m.group(1), m.group(3))
+        if command is None:
+            plain_mkdir = re.match(r'\s*mkdir\s+(?:--\s+)?(.*)$', frag)
+            if plain_mkdir:
+                command = ("mkdir", plain_mkdir.group(1))
+        if command:
+            op, arguments = command
             guarded = depth > 0 or prev_sep in ("&&", "||")
-            for target in m.group(3).split():
+            # `mkdir -p "$(dirname -- "$OUT_DIR")"` creates OUT_DIR's parent, not a
+            # child of OUT_DIR. Replace the command substitution before tokenizing so its
+            # closing `)` is not mistaken for an OUT_DIR path.
+            targets_text = re.sub(r'\$\(\s*dirname\b[^)]*\)', '/__coverage_parent__', arguments)
+            for target in targets_text.split():
                 if target.startswith("-") or REDIR.match(target):
                     continue          # a flag, or `2>/dev/null`: not a path being removed
                 raw = expand(target)
-                ops.append((op, strip_quotes(raw), guarded, trailing_glob(raw)))
+                ops.append((op, strip_quotes(raw), guarded, trailing_glob(raw), line_number))
         prev_sep = None
 
 if depth != 0:
@@ -295,17 +355,19 @@ def covers(removal, globbed, target):
     # glob leaves its dot-named children behind.
     return not (globbed and any(seg.startswith(".") for seg in target[len(base) + 1:].split("/")))
 
-removed_all = [(t, g) for op, t, guarded, g in ops if op == "rm" and not guarded]
+removed_all = [(t, g) for op, t, guarded, g, _ in ops if op == "rm" and not guarded]
 problems = []
 removed = []
 conditional = []
-for op, target, guarded, globbed in ops:
+for op, target, guarded, globbed, line_number in ops:
     if op == "rm":
         (conditional if guarded else removed).append((target, globbed))
         continue
     if SENT not in target:          # not under OUT_DIR; not this contract's business
         continue
     if any(covers(r, g, target) for r, g in removed):
+        continue
+    if any(guard_line < line_number for guard_line in fresh_guards):
         continue
     # One line is all an operator gets, so it has to name the right cause. Reporting a
     # misdirected `rm` as a missing one sends them looking for code that is already there.
@@ -328,7 +390,7 @@ for op, target, guarded, globbed in ops:
 if problems:
     print("creates " + "; ".join(problems))
     sys.exit(1)
-if not any(op == "mkdir" and SENT in t for op, t, _, _ in ops):
+if not any(op == "mkdir" and SENT in t for op, t, _, _, _ in ops):
     print("creates nothing under OUT_DIR; scan had nothing to judge")
     sys.exit(1)
 sys.exit(0)
@@ -338,7 +400,7 @@ PY
 for runner in $RUNNER_GLOB; do
   [[ -f "$runner" ]] || continue
   if why="$(scan_runner "$runner")"; then
-    ok "$(basename "$runner") clears every directory it creates under OUT_DIR"
+    ok "$(basename "$runner") prevents prior profiles from surviving under OUT_DIR"
   else
     bad "$(basename "$runner") $why"
   fi
@@ -355,6 +417,69 @@ if scan_runner "$WORK/run_coverage_nofix.sh" >/dev/null 2>&1; then
   bad 'negative control: scan accepted a runner that creates raw/ without removing it'
 else
   ok 'negative control: scan rejects a runner that creates raw/ without removing it'
+fi
+
+# A runner may choose the stronger contract used by OVI-05: refuse every existing OUT_DIR
+# instead of deleting it. That makes reuse impossible and preserves the previous evidence.
+mk_fake run_coverage_fresh_only.sh '#!/usr/bin/env bash
+fail() { exit 1; }
+OUT_DIR="${OUT_DIR:?}"
+[[ ! -e "$OUT_DIR" && ! -L "$OUT_DIR" ]] || fail "OUT_DIR must be fresh"
+mkdir -p -- "$(dirname -- "$OUT_DIR")"
+mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR/raw"'
+if scan_runner "$WORK/run_coverage_fresh_only.sh" >/dev/null 2>&1; then
+  ok 'negative control: scan accepts an OUT_DIR that is fail-closed and fresh-only'
+else
+  bad "negative control: scan rejected a fail-closed fresh-only OUT_DIR ($(scan_runner "$WORK/run_coverage_fresh_only.sh" 2>&1 || true))"
+fi
+
+mk_fake run_coverage_weak_fresh.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+[[ ! -e "$OUT_DIR" ]] || fail "OUT_DIR must be fresh"
+mkdir -p "$OUT_DIR/raw"'
+if scan_runner "$WORK/run_coverage_weak_fresh.sh" >/dev/null 2>&1; then
+  bad 'negative control: scan accepted a fresh-only guard that omits the symlink check'
+else
+  ok 'negative control: scan rejects a fresh-only guard that omits the symlink check'
+fi
+
+mk_fake run_coverage_ignored_fresh.sh '#!/usr/bin/env bash
+OUT_DIR="${OUT_DIR:?}"
+[[ ! -e "$OUT_DIR" && ! -L "$OUT_DIR" ]] || true
+mkdir -p "$OUT_DIR/raw"'
+if scan_runner "$WORK/run_coverage_ignored_fresh.sh" >/dev/null 2>&1; then
+  bad 'negative control: scan accepted an ignored fresh-only guard'
+else
+  ok 'negative control: scan rejects an ignored fresh-only guard'
+fi
+
+mk_fake run_coverage_nonterminating_fresh.sh '#!/usr/bin/env bash
+fail() {
+  :
+}
+OUT_DIR="${OUT_DIR:?}"
+[[ ! -e "$OUT_DIR" && ! -L "$OUT_DIR" ]] || fail "OUT_DIR must be fresh"
+mkdir -p "$OUT_DIR/raw"'
+if scan_runner "$WORK/run_coverage_nonterminating_fresh.sh" >/dev/null 2>&1; then
+  bad 'negative control: scan accepted a fresh-only guard whose fail helper returns'
+else
+  ok 'negative control: scan rejects a fresh-only guard whose fail helper returns'
+fi
+
+mk_fake run_coverage_conditional_fail.sh '#!/usr/bin/env bash
+fail() {
+  if test -n "$ONLY_SOMETIMES"; then
+    exit 1
+  fi
+}
+OUT_DIR="${OUT_DIR:?}"
+[[ ! -e "$OUT_DIR" && ! -L "$OUT_DIR" ]] || fail "OUT_DIR must be fresh"
+mkdir -p "$OUT_DIR/raw"'
+if scan_runner "$WORK/run_coverage_conditional_fail.sh" >/dev/null 2>&1; then
+  bad 'negative control: scan accepted a conditionally terminating fail helper'
+else
+  ok 'negative control: scan rejects a conditionally terminating fail helper'
 fi
 
 mk_fake run_coverage_wrongpath.sh '#!/usr/bin/env bash

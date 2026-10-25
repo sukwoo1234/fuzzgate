@@ -178,6 +178,10 @@ def shell_lines(text):
         m = HEREDOC.search(line)
         if m:
             term = m.group(2)
+            # Preserve a quote opened around a heredoc command substitution. After the
+            # terminator, a line such as `)"` closes that quote; dropping this state makes
+            # the lexer treat it as a new opening quote and hide the rest of the runner.
+            sq, dq = nsq, ndq
             continue
         sq, dq = nsq, ndq
     return out
@@ -197,10 +201,31 @@ def join_continuations(lines):
 
 lines = join_continuations(shell_lines(text))
 
+fail_definition = re.search(
+    r'^\s*fail\s*\(\s*\)\s*\{(?P<body>.*?)\}',
+    text,
+    flags=re.MULTILINE | re.DOTALL,
+)
+fail_terminates = False
+if fail_definition:
+    body = fail_definition.group('body')
+    direct_exit = re.search(
+        r'(?:^|;)\s*exit\s+[1-9][0-9]*(?:\s*;|\s*$)',
+        body,
+        flags=re.MULTILINE,
+    )
+    conditional_exit = re.search(
+        r'^\s*(?:if|for|while|until|case)\b|&&|\|\|',
+        body,
+        flags=re.MULTILINE,
+    )
+    fail_terminates = direct_exit is not None and conditional_exit is None
+
 PROFILED = re.compile(r'\bLLVM_PROFILE_FILE=')
 MERGE = re.compile(r'profdata', re.I)   # llvm-profdata, $LLVM_PROFDATA, $PROFDATA alike
 CAPTURE = re.compile(r'\|\|\s*(?:local\s+)?([A-Za-z_]\w*)=\$\?')
 DISCARD = re.compile(r'\|\|\s*(?:true|:)\s*(?:$|;)')
+DIRECT_FAIL = re.compile(r'\|\|\s*fail(?:\s|$)')
 COND = re.compile(r'\[\[(.+?)\]\]|(?<!\[)\[(?!\[)(.+?)(?<!\])\](?!\])|\btest\b([^;&|]*)|\bcase\b(.+?)\bin\b')
 DASH_S = re.compile(r'(?<![-\w])-s\s+("?\$\{?[A-Za-z_]\w*)')
 
@@ -220,6 +245,8 @@ for i, line in profiled:
         continue
     m = CAPTURE.search(line)
     if not m:
+        if DIRECT_FAIL.search(line) and fail_terminates:
+            continue
         # No `||` at all under `set -e` means a non-zero status aborts the script, which
         # is a decision too - the status is not being thrown away.
         if re.search(r'\|\|', line):
@@ -334,6 +361,35 @@ keep=()
 for p in "${profiles[@]}"; do test -s "$p" && keep+=("$p"); done
 "$PROFDATA" merge -sparse "${keep[@]}" -o "$OUT/cov.profdata"'
 accept renamed 'the same contract with other names, `case`, `test -s` and a per-input loop'
+
+mk heredocprefix '#!/usr/bin/env bash
+run_id="$(python3 - <<PY
+print("fresh")
+PY
+)"
+status=0
+LLVM_PROFILE_FILE="$RAW/$run_id-%p.profraw" "$BIN" "${inputs[@]}" || status=$?
+[[ "$status" -eq 0 ]] || fail "the replay died (rc=$status)"
+keep=()
+for p in "${profiles[@]}"; do test -s "$p" && keep+=("$p"); done
+"$PROFDATA" merge -sparse "${keep[@]}" -o "$OUT/cov.profdata"'
+accept heredocprefix 'a profile run after a quoted heredoc command substitution'
+
+mk directfail '#!/usr/bin/env bash
+fail() { exit 1; }
+LLVM_PROFILE_FILE="$RAW/cov-%p.profraw" "$BIN" "${inputs[@]}" || fail "replay failed"
+keep=()
+for p in "${profiles[@]}"; do test -s "$p" && keep+=("$p"); done
+"$PROFDATA" merge -sparse "${keep[@]}" -o "$OUT/cov.profdata"'
+accept directfail 'a profile run whose terminating fail helper decides the status immediately'
+
+mk returningfail '#!/usr/bin/env bash
+fail() { :; }
+LLVM_PROFILE_FILE="$RAW/cov-%p.profraw" "$BIN" "${inputs[@]}" || fail "replay failed"
+keep=()
+for p in "${profiles[@]}"; do test -s "$p" && keep+=("$p"); done
+"$PROFDATA" merge -sparse "${keep[@]}" -o "$OUT/cov.profdata"'
+reject returningfail 'a profile run whose fail helper returns without deciding the status'
 
 mk notinclass '#!/usr/bin/env bash
 echo "this runner analyses an existing profile"
