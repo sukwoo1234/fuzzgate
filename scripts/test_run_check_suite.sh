@@ -368,6 +368,143 @@ grep -Fq 'fixture: nightly toolchain unavailable' \
   exit 1
 }
 
+HDF5_SOURCE="$WORK/hdf5-source"
+HDF5_COPY="$WORK/hdf5-copy"
+cp -a "$SOURCE/." "$HDF5_SOURCE/"
+rm "$HDF5_SOURCE/scripts/check_fail.sh" "$HDF5_SOURCE/scripts/check_skip.sh"
+HDF5_SOURCE_TARGET="$HDF5_SOURCE/data/targets/hdf5-weights/2.2.0"
+mkdir -p "$HDF5_SOURCE_TARGET/source" "$HDF5_SOURCE_TARGET/install/lib" \
+  "$HDF5_SOURCE_TARGET/bin" "$HDF5_SOURCE_TARGET/evidence" "$HDF5_SOURCE/toolchain"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$HDF5_SOURCE/toolchain/clang-17"
+chmod +x "$HDF5_SOURCE/toolchain/clang-17"
+ln -s clang-17 "$HDF5_SOURCE/toolchain/clang++"
+printf 'pinned HDF5 archive fixture\n' >"$HDF5_SOURCE_TARGET/source/2.2.0.tar.gz"
+printf 'source core\n' >"$HDF5_SOURCE_TARGET/install/lib/libhdf5.so"
+printf 'source high level\n' >"$HDF5_SOURCE_TARGET/install/lib/libhdf5_hl.so"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$HDF5_SOURCE_TARGET/bin/probe"
+chmod +x "$HDF5_SOURCE_TARGET/bin/probe"
+printf 'source evidence\n' >"$HDF5_SOURCE_TARGET/evidence/build.log"
+printf '{}\n' >"$HDF5_SOURCE_TARGET/linkage-manifest.json"
+cat >"$HDF5_SOURCE_TARGET/build-profile.json" <<EOF
+{
+  "toolchain": {
+    "cmake": {"path": "/usr/bin/true"},
+    "c_compiler": {"path": "$HDF5_SOURCE/toolchain/clang-17"},
+    "cxx_compiler": {"path": "$HDF5_SOURCE/toolchain/clang-17"},
+    "linker": {"path": "/usr/bin/true"},
+    "ninja": {"path": "/usr/bin/true"},
+    "readelf": {"path": "/usr/bin/true"}
+  },
+  "components": {
+    "core": {"path": "$HDF5_SOURCE_TARGET/install/lib/libhdf5.so"},
+    "high_level": {"path": "$HDF5_SOURCE_TARGET/install/lib/libhdf5_hl.so"},
+    "probe": {"path": "$HDF5_SOURCE_TARGET/bin/probe"}
+  },
+  "evidence_files": {
+    "build_log": {"path": "$HDF5_SOURCE_TARGET/evidence/build.log"}
+  },
+  "linkage_manifest": "$HDF5_SOURCE_TARGET/linkage-manifest.json"
+}
+EOF
+cat >"$HDF5_SOURCE/scripts/check_hdf5_profile.py" <<'PY'
+#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[sys.argv.index("--target-root") + 1]).resolve()
+profile = json.loads((root / "build-profile.json").read_text(encoding="utf-8"))
+paths = [row["path"] for row in profile["components"].values()]
+paths += [row["path"] for row in profile["evidence_files"].values()]
+paths.append(profile["linkage_manifest"])
+for raw in paths:
+    path = pathlib.Path(raw).resolve()
+    path.relative_to(root)
+    if not path.is_file():
+        raise SystemExit(f"missing profile artifact: {path}")
+print("[fixture-hdf5-profile] pass=1 fail=0")
+PY
+chmod +x "$HDF5_SOURCE/scripts/check_hdf5_profile.py"
+cat >"$HDF5_SOURCE/scripts/build_hdf5_profiles.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+target="$PROJECT_ROOT/data/targets/hdf5-weights/2.2.0"
+[[ "$PWD" == "$PROJECT_ROOT" && "$HDF5_TARGET_ROOT" == "$target" ]] \
+  || { echo 'HDF5 builder ran outside the isolated copy' >&2; exit 81; }
+[[ "$HDF5_ARCHIVE" == "$target/source/2.2.0.tar.gz" && -f "$HDF5_ARCHIVE" ]] \
+  || { echo 'HDF5 builder did not receive the copy-local archive' >&2; exit 82; }
+[[ "$JOBS" == 4 && "$CMAKE" == /usr/bin/true && "$NINJA" == /usr/bin/true \
+   && "${CLANGXX##*/}" == clang++ \
+   && "$(readlink -f "$CLANG")" == "$(readlink -f "$CLANGXX")" \
+   && "$READELF" == /usr/bin/true ]] \
+  || { echo 'HDF5 builder did not receive the pinned source toolchain' >&2; exit 83; }
+rm -rf "$target/install" "$target/bin" "$target/evidence"
+mkdir -p "$target/install/lib" "$target/bin" "$target/evidence"
+printf 'copy core\n' >"$target/install/lib/libhdf5.so"
+printf 'copy high level\n' >"$target/install/lib/libhdf5_hl.so"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$target/bin/probe"
+chmod +x "$target/bin/probe"
+printf 'copy evidence\n' >"$target/evidence/build.log"
+printf '{}\n' >"$target/linkage-manifest.json"
+cat >"$target/build-profile.json" <<PROFILE
+{
+  "toolchain": {
+    "cmake": {"path": "/usr/bin/true"},
+    "c_compiler": {"path": "$(readlink -f "$CLANG")"},
+    "cxx_compiler": {"path": "$(readlink -f "$CLANGXX")"},
+    "linker": {"path": "/usr/bin/true"},
+    "ninja": {"path": "/usr/bin/true"},
+    "readelf": {"path": "/usr/bin/true"}
+  },
+  "components": {
+    "core": {"path": "$target/install/lib/libhdf5.so"},
+    "high_level": {"path": "$target/install/lib/libhdf5_hl.so"},
+    "probe": {"path": "$target/bin/probe"}
+  },
+  "evidence_files": {
+    "build_log": {"path": "$target/evidence/build.log"}
+  },
+  "linkage_manifest": "$target/linkage-manifest.json"
+}
+PROFILE
+printf 'copy-local HDF5 build\n' >"$target/built.marker"
+echo '[fixture-hdf5-build] rebuilt copy-local HDF5 profile'
+EOF
+chmod +x "$HDF5_SOURCE/scripts/build_hdf5_profiles.sh"
+cat >"$HDF5_SOURCE/scripts/check_hdf5_copy.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+target="$PROJECT_ROOT/data/targets/hdf5-weights/2.2.0"
+[[ "$HDF5_TARGET_ROOT" == "$target" ]]
+python3 -B "$PROJECT_ROOT/scripts/check_hdf5_profile.py" --target-root "$target"
+grep -Fxq 'copy-local HDF5 build' "$target/built.marker"
+EOF
+chmod +x "$HDF5_SOURCE/scripts/check_hdf5_copy.sh"
+cp -a "$HDF5_SOURCE/." "$HDF5_COPY/"
+rc=0
+HDF5_TARGET_ROOT="$SOURCE/escaped-hdf5-root" \
+HDF5_ARCHIVE="$SOURCE/escaped-hdf5-archive" \
+CMAKE="$SOURCE/escaped-cmake" NINJA="$SOURCE/escaped-ninja" \
+CLANG="$SOURCE/escaped-clang" CLANGXX="$SOURCE/escaped-clangxx" \
+READELF="$SOURCE/escaped-readelf" JOBS=99 \
+bash "$HDF5_SOURCE/scripts/run_check_suite.sh" --isolated-root "$HDF5_COPY" \
+  --log-dir "$WORK/hdf5-logs" >"$WORK/hdf5.log" 2>&1 || rc=$?
+[[ "$rc" -eq 0 ]] || {
+  cat "$WORK/hdf5.log"
+  echo "copy-local HDF5 profile was not rebuilt (rc=$rc)" >&2
+  exit 1
+}
+grep -Fq 'check_hdf5_copy.sh: PASS' "$WORK/hdf5.log"
+grep -Fq '[fixture-hdf5-build] rebuilt copy-local HDF5 profile' \
+  "$WORK/hdf5-logs/setup-hdf5.log"
+grep -Fxq 'copy-local HDF5 build' \
+  "$HDF5_COPY/data/targets/hdf5-weights/2.2.0/built.marker"
+[[ ! -e "$SOURCE/escaped-hdf5-root" \
+   && ! -e "$SOURCE/escaped-hdf5-archive" ]] || {
+  echo 'copy-local HDF5 builder wrote through an inherited output path' >&2
+  exit 1
+}
+
 TFLITE_SOURCE="$WORK/tflite-source"
 TFLITE_COPY="$WORK/tflite-copy"
 cp -a "$SOURCE/." "$TFLITE_SOURCE/"

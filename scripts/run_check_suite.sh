@@ -221,6 +221,117 @@ elif [[ -e "$coverage_replay_source" || -L "$coverage_replay_source" \
   fail_setup 'safetensors coverage replay exists without its verified build script'
 fi
 
+# HDF5 profiles bind absolute component and evidence paths. A byte-for-byte copy
+# would otherwise validate and execute the source tree's libraries while claiming
+# that the isolated tree passed. Validate the source profile for tool identity,
+# rebuild HDF5 inside the copy, and admit only copy-local generated artifacts.
+hdf5_builder_source="$SOURCE_ROOT/scripts/build_hdf5_profiles.sh"
+hdf5_builder_copy="$ISOLATED_ROOT/scripts/build_hdf5_profiles.sh"
+hdf5_checker_copy="$ISOLATED_ROOT/scripts/check_hdf5_profile.py"
+hdf5_source_target="$SOURCE_ROOT/data/targets/hdf5-weights/2.2.0"
+hdf5_target="$ISOLATED_ROOT/data/targets/hdf5-weights/2.2.0"
+hdf5_archive="$hdf5_target/source/2.2.0.tar.gz"
+if [[ -e "$hdf5_builder_source" || -L "$hdf5_builder_source" ]]; then
+  [[ -f "$hdf5_builder_copy" && ! -L "$hdf5_builder_copy" ]] \
+    || fail_setup 'isolated copy needs its own regular HDF5 builder'
+  [[ -f "$hdf5_checker_copy" && ! -L "$hdf5_checker_copy" ]] \
+    || fail_setup 'isolated copy needs its own regular HDF5 profile checker'
+  [[ -f "$hdf5_archive" && ! -L "$hdf5_archive" ]] \
+    || fail_setup 'isolated copy needs the pinned regular HDF5 source archive'
+  [[ -f "$hdf5_source_target/build-profile.json" \
+     && ! -L "$hdf5_source_target/build-profile.json" ]] \
+    || fail_setup 'source tree needs a regular validated HDF5 build profile'
+  hdf5_source_profile_log="$LOG_DIR/setup-hdf5-source-profile.log"
+  python3 -B "$hdf5_checker_copy" --target-root "$hdf5_source_target" \
+    >"$hdf5_source_profile_log" 2>&1 \
+    || fail_setup "source HDF5 profile validation failed (log: $hdf5_source_profile_log)"
+
+  hdf5_tool_file="$LOG_DIR/setup-hdf5-tools.bin"
+  python3 -B - "$hdf5_source_target/build-profile.json" \
+    >"$hdf5_tool_file" <<'PY' \
+    || fail_setup 'could not read the validated HDF5 toolchain'
+import json
+import pathlib
+import sys
+
+profile = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+toolchain = profile.get("toolchain")
+if not isinstance(toolchain, dict):
+    raise SystemExit("HDF5 profile has no toolchain")
+for key in ("cmake", "ninja", "c_compiler", "cxx_compiler", "readelf"):
+    row = toolchain.get(key)
+    path = row.get("path") if isinstance(row, dict) else None
+    if not isinstance(path, str) or not path:
+        raise SystemExit(f"HDF5 profile tool path is invalid: {key}")
+    if key == "cxx_compiler":
+        canonical = pathlib.Path(path).resolve()
+        driver = canonical.parent / "clang++"
+        if driver.is_file() and driver.resolve() == canonical:
+            path = str(driver)
+    sys.stdout.write(path + "\0")
+PY
+  mapfile -d '' -t hdf5_tools <"$hdf5_tool_file"
+  [[ ${#hdf5_tools[@]} -eq 5 ]] \
+    || fail_setup 'validated HDF5 profile yielded an incomplete toolchain'
+
+  hdf5_build_log="$LOG_DIR/setup-hdf5.log"
+  hdf5_build_rc=0
+  (
+    cd -- "$ISOLATED_ROOT"
+    env "${shell_env_unsets[@]}" \
+      -u PROJECT_ROOT -u WORKDIR -u TOOL_BIN \
+      -u HDF5_TARGET_ROOT -u HDF5_ARCHIVE \
+      -u JOBS -u CMAKE -u NINJA -u CLANG -u CLANGXX -u READELF \
+      PROJECT_ROOT="$ISOLATED_ROOT" \
+      HDF5_TARGET_ROOT="$hdf5_target" HDF5_ARCHIVE="$hdf5_archive" \
+      JOBS=4 CMAKE="${hdf5_tools[0]}" NINJA="${hdf5_tools[1]}" \
+      CLANG="${hdf5_tools[2]}" CLANGXX="${hdf5_tools[3]}" \
+      READELF="${hdf5_tools[4]}" \
+      bash -p scripts/build_hdf5_profiles.sh
+  ) >"$hdf5_build_log" 2>&1 || hdf5_build_rc=$?
+  if [[ "$hdf5_build_rc" -ne 0 ]]; then
+    for detail_name in configure.log build.log install.log \
+      probe-configure.log probe-build.log check.log; do
+      detail_path="$hdf5_target/$detail_name"
+      if [[ -f "$detail_path" && ! -L "$detail_path" ]]; then
+        cp -- "$detail_path" "$LOG_DIR/setup-hdf5-$detail_name" \
+          || fail_setup "could not preserve failed HDF5 $detail_name"
+      fi
+    done
+    fail_setup "copy-local HDF5 build failed rc=$hdf5_build_rc (log: $hdf5_build_log)"
+  fi
+  hdf5_copy_profile_log="$LOG_DIR/setup-hdf5-copy-profile.log"
+  python3 -B "$hdf5_checker_copy" --target-root "$hdf5_target" \
+    >"$hdf5_copy_profile_log" 2>&1 \
+    || fail_setup "copy-local HDF5 profile validation failed (log: $hdf5_copy_profile_log)"
+  python3 -B - "$hdf5_source_target/build-profile.json" \
+    "$hdf5_target/build-profile.json" "$hdf5_target" <<'PY' \
+    || fail_setup 'copy-local HDF5 profile escaped its target root or changed toolchain'
+import json
+import pathlib
+import sys
+
+source = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+copied = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+root = pathlib.Path(sys.argv[3]).resolve()
+if source.get("toolchain") != copied.get("toolchain"):
+    raise SystemExit("copy-local HDF5 toolchain differs from the validated source profile")
+rows = list(copied.get("components", {}).values())
+rows += list(copied.get("evidence_files", {}).values())
+paths = [row.get("path") for row in rows if isinstance(row, dict)]
+paths.append(copied.get("linkage_manifest"))
+if not paths or any(not isinstance(raw, str) for raw in paths):
+    raise SystemExit("copy-local HDF5 profile path inventory is incomplete")
+for raw in paths:
+    pathlib.Path(raw).resolve().relative_to(root)
+PY
+  suite_gate_env+=("HDF5_TARGET_ROOT=$hdf5_target")
+  printf '[suite] rebuilt HDF5 profile target_root=%s log=%s\n' \
+    "$hdf5_target" "$hdf5_build_log"
+elif compgen -G "$SOURCE_ROOT/scripts/check_hdf5_*.sh" >/dev/null; then
+  fail_setup 'HDF5 gates exist without their verified build script'
+fi
+
 # TFLite profile and fixture gates bind absolute paths for flatc, replay, the
 # shared-loader fuzzer, and linked libraries. A byte-for-byte copy therefore
 # cannot be valid in another root. Rebuild those artifacts inside a fresh,
