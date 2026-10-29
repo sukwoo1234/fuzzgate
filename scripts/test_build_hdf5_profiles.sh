@@ -46,6 +46,50 @@ expect_project_root_override_rejection() {
   fi
 }
 
+expect_ninja_binding_contract() {
+  local log="$WORK/ninja-binding-contract.log"
+  local rc=0
+  python3 -B - "$BUILDER" >"$log" 2>&1 <<'PY' || rc=$?
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+lines = text.splitlines()
+option = '-DCMAKE_MAKE_PROGRAM="$NINJA"'
+if text.count(option) != 2:
+    raise SystemExit(
+        "expected exactly two pinned CMAKE_MAKE_PROGRAM options, "
+        f"observed {text.count(option)}"
+    )
+required = (
+    's/^CMAKE_MAKE_PROGRAM:[^=]*=//p',
+    'HDF5 CMake selected a different Ninja executable',
+    'probe CMake selected a different Ninja executable',
+)
+for token in required:
+    if token not in text:
+        raise SystemExit(f"missing Ninja binding guard: {token}")
+comparisons = (
+    '[[ "$ACTUAL_NINJA" == "$NINJA" ]] \\',
+    '[[ "$ACTUAL_PROBE_NINJA" == "$NINJA" ]] \\',
+)
+for comparison in comparisons:
+    if lines.count(comparison) != 1:
+        raise SystemExit(
+            f"expected one live Ninja identity comparison: {comparison}"
+        )
+print("Ninja configure/cache binding contract present")
+PY
+  if [[ "$rc" -eq 0 ]]; then
+    printf '[hdf5-build-safety] PASS ninja-binding-contract\n'
+    pass=$((pass + 1))
+  else
+    printf '[hdf5-build-safety] FAIL ninja-binding-contract rc=%d\n' "$rc" >&2
+    cat "$log" >&2
+    fail=$((fail + 1))
+  fi
+}
+
 mkdir "$WORK/real-target"
 ln -s -- "$WORK/real-target" "$WORK/linked-target"
 mkdir "$WORK/real-parent" "$WORK/child-path-target" "$WORK/external-build"
@@ -69,6 +113,7 @@ expect_rejection intermediate-symlink "$WORK/linked-parent/target" \
   'HDF5_TARGET_ROOT must not traverse a symlink'
 expect_rejection owned-build-symlink "$WORK/child-path-target" \
   'HDF5 target-owned path must not be a symlink'
+expect_ninja_binding_contract
 
 printf '[hdf5-build-safety] pass=%d fail=%d\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

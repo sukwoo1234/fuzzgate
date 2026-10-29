@@ -119,6 +119,7 @@ log "configuring shared HDF5 core + high-level library without optional filters"
 "$CMAKE" -G Ninja \
   -S "$SOURCE_DIR" \
   -B "$BUILD_DIR" \
+  -DCMAKE_MAKE_PROGRAM="$NINJA" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_C_COMPILER="$CLANG" \
   -DCMAKE_CXX_COMPILER="$CLANGXX" \
@@ -151,6 +152,12 @@ log "configuring shared HDF5 core + high-level library without optional filters"
 ACTUAL_LINKER="$(sed -n 's/^CMAKE_LINKER:FILEPATH=//p' "$BUILD_DIR/CMakeCache.txt" | head -1)"
 [[ -n "$ACTUAL_LINKER" && -x "$ACTUAL_LINKER" ]] \
   || fail "CMake did not select an executable linker: $ACTUAL_LINKER"
+ACTUAL_NINJA="$(sed -n 's/^CMAKE_MAKE_PROGRAM:[^=]*=//p' "$BUILD_DIR/CMakeCache.txt" | head -1)"
+[[ -n "$ACTUAL_NINJA" && -x "$ACTUAL_NINJA" ]] \
+  || fail "HDF5 CMake did not select an executable Ninja: $ACTUAL_NINJA"
+ACTUAL_NINJA="$(readlink -f -- "$ACTUAL_NINJA")"
+[[ "$ACTUAL_NINJA" == "$NINJA" ]] \
+  || fail "HDF5 CMake selected a different Ninja executable: expected=$NINJA observed=$ACTUAL_NINJA"
 
 log "building HDF5 core + high-level shared libraries (jobs=$JOBS)"
 "$CMAKE" --build "$BUILD_DIR" --target hdf5-shared hdf5_hl-shared -j"$JOBS" \
@@ -169,6 +176,7 @@ log "building the H5LT file-image runtime probe"
 "$CMAKE" -G Ninja \
   -S "$PROJECT_ROOT/harnesses/hdf5" \
   -B "$PROBE_BUILD_DIR" \
+  -DCMAKE_MAKE_PROGRAM="$NINJA" \
   -DHDF5_DIR="$HDF5_CMAKE_DIR" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_CXX_COMPILER="$CLANGXX" \
@@ -176,6 +184,12 @@ log "building the H5LT file-image runtime probe"
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
   >"$TARGET_ROOT/probe-configure.log" 2>&1 \
   || fail "probe configure failed; see $TARGET_ROOT/probe-configure.log"
+ACTUAL_PROBE_NINJA="$(sed -n 's/^CMAKE_MAKE_PROGRAM:[^=]*=//p' "$PROBE_BUILD_DIR/CMakeCache.txt" | head -1)"
+[[ -n "$ACTUAL_PROBE_NINJA" && -x "$ACTUAL_PROBE_NINJA" ]] \
+  || fail "probe CMake did not select an executable Ninja: $ACTUAL_PROBE_NINJA"
+ACTUAL_PROBE_NINJA="$(readlink -f -- "$ACTUAL_PROBE_NINJA")"
+[[ "$ACTUAL_PROBE_NINJA" == "$NINJA" ]] \
+  || fail "probe CMake selected a different Ninja executable: expected=$NINJA observed=$ACTUAL_PROBE_NINJA"
 "$CMAKE" --build "$PROBE_BUILD_DIR" --target hdf5_file_image_probe -j"$JOBS" \
   >"$TARGET_ROOT/probe-build.log" 2>&1 \
   || fail "probe build failed; see $TARGET_ROOT/probe-build.log"

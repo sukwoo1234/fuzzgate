@@ -159,6 +159,15 @@ def cache_path(cache_text: str, key: str) -> pathlib.Path:
     return pathlib.Path(match.group(1)).resolve()
 
 
+def validate_ninja_cache_bindings(
+    ninja: pathlib.Path, cache_text: str, probe_cache_text: str
+) -> None:
+    if cache_path(cache_text, "CMAKE_MAKE_PROGRAM") != ninja:
+        fail("HDF5 CMake cache Ninja differs from the recorded identity")
+    if cache_path(probe_cache_text, "CMAKE_MAKE_PROGRAM") != ninja:
+        fail("probe CMake cache Ninja differs from the recorded identity")
+
+
 def validate_linker_evidence(
     main_commands: str,
     probe_commands: str,
@@ -369,7 +378,7 @@ def validate(root: pathlib.Path) -> tuple[pathlib.Path, dict[str, Any]]:
     c_compiler = require_identity(toolchain["c_compiler"], "C compiler", executable=True)
     cxx_compiler = require_identity(toolchain["cxx_compiler"], "C++ compiler", executable=True)
     linker = require_identity(toolchain["linker"], "linker", executable=True)
-    require_identity(toolchain["ninja"], "ninja", executable=True)
+    ninja = require_identity(toolchain["ninja"], "ninja", executable=True)
     readelf = require_identity(toolchain["readelf"], "readelf", executable=True)
 
     components = profile["components"]
@@ -404,6 +413,7 @@ def validate(root: pathlib.Path) -> tuple[pathlib.Path, dict[str, Any]]:
     }
     cache_text = evidence_paths["cmake_cache"].read_text(encoding="utf-8")
     probe_cache_text = evidence_paths["probe_cmake_cache"].read_text(encoding="utf-8")
+    validate_ninja_cache_bindings(ninja, cache_text, probe_cache_text)
     if cache_path(cache_text, "CMAKE_C_COMPILER") != c_compiler:
         fail("HDF5 CMake cache C compiler differs from the recorded identity")
     if cache_path(cache_text, "CMAKE_CXX_COMPILER") != cxx_compiler:
@@ -616,6 +626,18 @@ def invalid_case(name: str) -> None:
             '"/toolchain/bin/ld.lld"\n"/toolchain/bin/ld.lld"\n',
             pathlib.Path("/toolchain/bin/lld"),
         )
+    elif name == "wrong-hdf5-ninja-binding":
+        validate_ninja_cache_bindings(
+            pathlib.Path("/toolchain/bin/ninja"),
+            "CMAKE_MAKE_PROGRAM:UNINITIALIZED=/other/bin/ninja\n",
+            "CMAKE_MAKE_PROGRAM:FILEPATH=/toolchain/bin/ninja\n",
+        )
+    elif name == "wrong-probe-ninja-binding":
+        validate_ninja_cache_bindings(
+            pathlib.Path("/toolchain/bin/ninja"),
+            "CMAKE_MAKE_PROGRAM:UNINITIALIZED=/toolchain/bin/ninja\n",
+            "CMAKE_MAKE_PROGRAM:FILEPATH=/other/bin/ninja\n",
+        )
     else:
         fail(f"unknown self-test case: {name}")
     fail(f"negative self-test unexpectedly passed: {name}")
@@ -629,6 +651,8 @@ def selftest() -> None:
         "stale-build-log",
         "soname-symlink-mismatch",
         "wrong-linker-driver",
+        "wrong-hdf5-ninja-binding",
+        "wrong-probe-ninja-binding",
     )
     for name in cases:
         try:
@@ -636,7 +660,7 @@ def selftest() -> None:
         except CheckError:
             continue
         fail(f"negative self-test unexpectedly passed: {name}")
-    print("[hdf5-profile-selftest] pass=6 fail=0")
+    print("[hdf5-profile-selftest] pass=8 fail=0")
 
 
 def parse_args() -> argparse.Namespace:
@@ -652,6 +676,8 @@ def parse_args() -> argparse.Namespace:
             "stale-build-log",
             "soname-symlink-mismatch",
             "wrong-linker-driver",
+            "wrong-hdf5-ninja-binding",
+            "wrong-probe-ninja-binding",
         ),
     )
     args = parser.parse_args()
