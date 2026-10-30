@@ -707,6 +707,171 @@ grep -Fxq 'fixture: dependency download failed' \
   exit 1
 }
 
+OPENVINO_SOURCE="$WORK/openvino-source"
+OPENVINO_COPY="$WORK/openvino-copy"
+cp -a "$SOURCE/." "$OPENVINO_SOURCE/"
+rm "$OPENVINO_SOURCE"/scripts/check_*.sh
+OPENVINO_SOURCE_TARGET="$OPENVINO_SOURCE/data/targets/openvino-ir/2026.4.1"
+mkdir -p "$OPENVINO_SOURCE_TARGET/source/dependencies" \
+  "$OPENVINO_SOURCE_TARGET/install/lib" "$OPENVINO_SOURCE/toolchain"
+for archive in \
+  2026.4.1.tar.gz \
+  dependencies/pugixml-ee86beb30e4973f5feffe3ce63bfa4fbadf72f38.tar.gz \
+  dependencies/xbyak-431abd865e70a46d56f5aa0e1f87572decb60169.tar.gz \
+  dependencies/nlohmann-json-9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03.tar.gz
+do
+  printf 'verified OpenVINO archive fixture: %s\n' "$archive" \
+    >"$OPENVINO_SOURCE_TARGET/source/$archive"
+done
+printf '#!/usr/bin/env bash\nexit 0\n' >"$OPENVINO_SOURCE/toolchain/clang-17"
+chmod +x "$OPENVINO_SOURCE/toolchain/clang-17"
+ln -s clang-17 "$OPENVINO_SOURCE/toolchain/clang"
+ln -s clang-17 "$OPENVINO_SOURCE/toolchain/clang++"
+printf 'source OpenVINO core\n' >"$OPENVINO_SOURCE_TARGET/install/lib/libopenvino.so"
+cat >"$OPENVINO_SOURCE_TARGET/build-profile.json" <<EOF
+{
+  "toolchain": {
+    "cmake": {"path": "/usr/bin/true"},
+    "compiler": {"path": "$OPENVINO_SOURCE/toolchain/clang-17"},
+    "linker": {"path": "$OPENVINO_SOURCE/toolchain/clang-17"},
+    "ninja": {"path": "/usr/bin/true"},
+    "readelf": {"path": "/usr/bin/true"}
+  },
+  "components": {
+    "core": {"path": "$OPENVINO_SOURCE_TARGET/install/lib/libopenvino.so"}
+  },
+  "linkage_manifest": "$OPENVINO_SOURCE_TARGET/linkage-manifest.json"
+}
+EOF
+printf '{}\n' >"$OPENVINO_SOURCE_TARGET/linkage-manifest.json"
+cat >"$OPENVINO_SOURCE/scripts/check_openvino_profile.py" <<'PY'
+#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[sys.argv.index("--target-root") + 1]).resolve()
+profile = json.loads((root / "build-profile.json").read_text(encoding="utf-8"))
+for row in profile["components"].values():
+    if not pathlib.Path(row["path"]).is_file():
+        raise SystemExit("OpenVINO component is missing")
+print("[fixture-openvino-profile] pass=1 fail=0")
+PY
+chmod +x "$OPENVINO_SOURCE/scripts/check_openvino_profile.py"
+cat >"$OPENVINO_SOURCE/scripts/build_openvino_profiles.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$PWD" == "$PROJECT_ROOT" ]] || exit 81
+[[ "$OPENVINO_TARGET_ROOT" == "$PROJECT_ROOT/data/targets/openvino-ir/.check-suite-2026.4.1-"* \
+   && -d "$OPENVINO_TARGET_ROOT" ]] || exit 82
+[[ "$OPENVINO_ARCHIVE" == "$OPENVINO_TARGET_ROOT/source/2026.4.1.tar.gz" \
+   && -f "$OPENVINO_ARCHIVE" ]] || exit 83
+[[ "$JOBS" == 4 && "$CMAKE" == /usr/bin/true && "$NINJA" == /usr/bin/true \
+   && "${CLANG##*/}" == clang && "${CLANGXX##*/}" == clang++ \
+   && "$READELF" == /usr/bin/true ]] || exit 84
+mkdir -p "$OPENVINO_TARGET_ROOT/install/lib"
+printf 'copy-local OpenVINO core\n' >"$OPENVINO_TARGET_ROOT/install/lib/libopenvino.so"
+cat >"$OPENVINO_TARGET_ROOT/build-profile.json" <<PROFILE
+{
+  "toolchain": {
+    "cmake": {"path": "$CMAKE"},
+    "compiler": {"path": "$(readlink -f "$CLANG")"},
+    "linker": {"path": "$(readlink -f "$CLANGXX")"},
+    "ninja": {"path": "$NINJA"},
+    "readelf": {"path": "$READELF"}
+  },
+  "components": {
+    "core": {"path": "$OPENVINO_TARGET_ROOT/install/lib/libopenvino.so"}
+  },
+  "linkage_manifest": "$OPENVINO_TARGET_ROOT/linkage-manifest.json"
+}
+PROFILE
+printf '{}\n' >"$OPENVINO_TARGET_ROOT/meta.json"
+printf '{}\n' >"$OPENVINO_TARGET_ROOT/linkage-manifest.json"
+printf 'copy-local OpenVINO normal build\n' >"$OPENVINO_TARGET_ROOT/normal.marker"
+echo '[fixture-openvino-build] rebuilt copy-local normal profile'
+EOF
+cat >"$OPENVINO_SOURCE/scripts/build_openvino_guided.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$PWD" == "$PROJECT_ROOT" && "$JOBS" == 4 ]] || exit 85
+[[ "$OPENVINO_TARGET_ROOT" == "$PROJECT_ROOT/data/targets/openvino-ir/.check-suite-2026.4.1-"* ]] || exit 86
+printf '{}\n' >"$OPENVINO_TARGET_ROOT/guided-instrumentation.json"
+printf 'copy-local OpenVINO guided build\n' >"$OPENVINO_TARGET_ROOT/guided.marker"
+echo '[fixture-openvino-guided] rebuilt copy-local guided artifacts'
+EOF
+cat >"$OPENVINO_SOURCE/scripts/build_coverage_openvino.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$PWD" == "$PROJECT_ROOT" && "$JOBS" == 4 ]] || exit 87
+[[ "$OPENVINO_TARGET_ROOT" == "$PROJECT_ROOT/data/targets/openvino-ir/.check-suite-2026.4.1-"* ]] || exit 88
+printf '{}\n' >"$OPENVINO_TARGET_ROOT/coverage-instrumentation.json"
+printf 'copy-local OpenVINO coverage build\n' >"$OPENVINO_TARGET_ROOT/coverage.marker"
+echo '[fixture-openvino-coverage] rebuilt copy-local coverage artifacts'
+EOF
+cat >"$OPENVINO_SOURCE/scripts/run_coverage_openvino.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$PWD" == "$PROJECT_ROOT" && "$OUT_DIR" == \
+   "$OPENVINO_TARGET_ROOT/instrumentation-evidence/coverage" ]] || exit 89
+[[ ! -e "$OUT_DIR" ]] || exit 90
+mkdir -p "$OUT_DIR"
+printf '{}\n' >"$OUT_DIR/coverage.json"
+printf 'copy-local OpenVINO coverage evidence\n' >"$OUT_DIR/evidence.marker"
+echo '[fixture-openvino-coverage-run] wrote copy-local coverage evidence'
+EOF
+chmod +x "$OPENVINO_SOURCE/scripts/build_openvino_profiles.sh" \
+  "$OPENVINO_SOURCE/scripts/build_openvino_guided.sh" \
+  "$OPENVINO_SOURCE/scripts/build_coverage_openvino.sh" \
+  "$OPENVINO_SOURCE/scripts/run_coverage_openvino.sh"
+cat >"$OPENVINO_SOURCE/scripts/check_openvino_instrumentation.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$OPENVINO_TARGET_ROOT" == "$PROJECT_ROOT/data/targets/openvino-ir/.check-suite-2026.4.1-"* ]]
+grep -Fxq 'copy-local OpenVINO normal build' "$OPENVINO_TARGET_ROOT/normal.marker"
+grep -Fxq 'copy-local OpenVINO guided build' "$OPENVINO_TARGET_ROOT/guided.marker"
+grep -Fxq 'copy-local OpenVINO coverage build' "$OPENVINO_TARGET_ROOT/coverage.marker"
+grep -Fxq 'copy-local OpenVINO coverage evidence' \
+  "$OPENVINO_TARGET_ROOT/instrumentation-evidence/coverage/evidence.marker"
+EOF
+chmod +x "$OPENVINO_SOURCE/scripts/check_openvino_instrumentation.sh"
+cp -a "$OPENVINO_SOURCE/." "$OPENVINO_COPY/"
+rc=0
+OPENVINO_TARGET_ROOT="$SOURCE/escaped-openvino-root" \
+OPENVINO_ARCHIVE="$SOURCE/escaped-openvino-archive" \
+OPENVINO_COVERAGE_EVIDENCE="$SOURCE/escaped-openvino-evidence" \
+CMAKE="$SOURCE/escaped-cmake" NINJA="$SOURCE/escaped-ninja" \
+CLANG="$SOURCE/escaped-clang" CLANGXX="$SOURCE/escaped-clangxx" \
+READELF="$SOURCE/escaped-readelf" JOBS=99 \
+bash "$OPENVINO_SOURCE/scripts/run_check_suite.sh" \
+  --isolated-root "$OPENVINO_COPY" --log-dir "$WORK/openvino-logs" \
+  >"$WORK/openvino.log" 2>&1 || rc=$?
+[[ "$rc" -eq 0 ]] || {
+  cat "$WORK/openvino.log"
+  echo "copy-local OpenVINO instrumentation was not rebuilt (rc=$rc)" >&2
+  exit 1
+}
+grep -Fq 'check_openvino_instrumentation.sh: PASS' "$WORK/openvino.log"
+grep -Fq '[fixture-openvino-build] rebuilt copy-local normal profile' \
+  "$WORK/openvino-logs/setup-openvino.log"
+grep -Fq '[fixture-openvino-guided] rebuilt copy-local guided artifacts' \
+  "$WORK/openvino-logs/setup-openvino-guided.log"
+grep -Fq '[fixture-openvino-coverage] rebuilt copy-local coverage artifacts' \
+  "$WORK/openvino-logs/setup-openvino-coverage.log"
+grep -Fq '[fixture-openvino-coverage-run] wrote copy-local coverage evidence' \
+  "$WORK/openvino-logs/setup-openvino-coverage-run.log"
+[[ -z "$(find "$OPENVINO_COPY/data/targets/openvino-ir" -maxdepth 1 -type d \
+  -name '.check-suite-2026.4.1-*' -print -quit)" ]] || {
+  echo 'runner left its temporary OpenVINO target root behind' >&2
+  exit 1
+}
+[[ ! -e "$SOURCE/escaped-openvino-root" \
+   && ! -e "$SOURCE/escaped-openvino-archive" \
+   && ! -e "$SOURCE/escaped-openvino-evidence" ]] || {
+  echo 'copy-local OpenVINO builder wrote through an inherited output path' >&2
+  exit 1
+}
+
 NATIVE_SOURCE="$WORK/native-source"
 NATIVE_COPY="$WORK/native-copy"
 cp -a "$SOURCE/." "$NATIVE_SOURCE/"

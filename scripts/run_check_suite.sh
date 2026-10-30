@@ -332,6 +332,229 @@ elif compgen -G "$SOURCE_ROOT/scripts/check_hdf5_*.sh" >/dev/null; then
   fail_setup 'HDF5 gates exist without their verified build script'
 fi
 
+# OpenVINO instrumentation profiles bind normal, guided, coverage, object, and
+# raw-profile evidence to absolute paths. Rebuild only the OVI-05 evidence in a
+# fresh target root, then expose that root solely to its instrumentation gate;
+# OVI-02/03/04/06/07 keep using the caller-supplied copy-local target state.
+openvino_instrumentation_target_root=""
+openvino_builder_source="$SOURCE_ROOT/scripts/build_openvino_profiles.sh"
+openvino_builder_copy="$ISOLATED_ROOT/scripts/build_openvino_profiles.sh"
+openvino_checker_copy="$ISOLATED_ROOT/scripts/check_openvino_profile.py"
+openvino_source_target="$SOURCE_ROOT/data/targets/openvino-ir/2026.4.1"
+openvino_copy_parent="$ISOLATED_ROOT/data/targets/openvino-ir"
+if [[ -e "$openvino_builder_source" || -L "$openvino_builder_source" ]]; then
+  for required in \
+    "$openvino_builder_copy" \
+    "$openvino_checker_copy" \
+    "$ISOLATED_ROOT/scripts/build_openvino_guided.sh" \
+    "$ISOLATED_ROOT/scripts/build_coverage_openvino.sh" \
+    "$ISOLATED_ROOT/scripts/run_coverage_openvino.sh"
+  do
+    [[ -f "$required" && ! -L "$required" ]] \
+      || fail_setup "isolated copy needs its own regular OpenVINO helper: $required"
+  done
+  [[ -f "$openvino_source_target/build-profile.json" \
+     && ! -L "$openvino_source_target/build-profile.json" ]] \
+    || fail_setup 'source tree needs a regular validated OpenVINO build profile'
+  openvino_source_profile_log="$LOG_DIR/setup-openvino-source-profile.log"
+  python3 -B "$openvino_checker_copy" --target-root "$openvino_source_target" \
+    >"$openvino_source_profile_log" 2>&1 \
+    || fail_setup "source OpenVINO profile validation failed (log: $openvino_source_profile_log)"
+
+  openvino_tool_file="$LOG_DIR/setup-openvino-tools.bin"
+  python3 -B - "$openvino_source_target/build-profile.json" \
+    >"$openvino_tool_file" <<'PY' \
+    || fail_setup 'could not read the validated OpenVINO toolchain'
+import json
+import pathlib
+import sys
+
+profile = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+toolchain = profile.get("toolchain")
+if not isinstance(toolchain, dict):
+    raise SystemExit("OpenVINO profile has no toolchain")
+for key in ("cmake", "ninja"):
+    row = toolchain.get(key)
+    path = row.get("path") if isinstance(row, dict) else None
+    if not isinstance(path, str) or not path:
+        raise SystemExit(f"OpenVINO profile tool path is invalid: {key}")
+    sys.stdout.write(path + "\0")
+compiler = toolchain.get("compiler")
+compiler_path = compiler.get("path") if isinstance(compiler, dict) else None
+if not isinstance(compiler_path, str) or not compiler_path:
+    raise SystemExit("OpenVINO compiler path is invalid")
+compiler = pathlib.Path(compiler_path).resolve()
+for name in ("clang", "clang++"):
+    driver = compiler.parent / name
+    if not driver.is_file() or driver.resolve() != compiler:
+        raise SystemExit(f"OpenVINO compiler driver is invalid: {driver}")
+    sys.stdout.write(str(driver) + "\0")
+readelf = toolchain.get("readelf")
+readelf_path = readelf.get("path") if isinstance(readelf, dict) else None
+if not isinstance(readelf_path, str) or not readelf_path:
+    raise SystemExit("OpenVINO readelf path is invalid")
+sys.stdout.write(readelf_path + "\0")
+PY
+  mapfile -d '' -t openvino_tools <"$openvino_tool_file"
+  [[ ${#openvino_tools[@]} -eq 5 ]] \
+    || fail_setup 'validated OpenVINO profile yielded an incomplete toolchain'
+  for tool in "${openvino_tools[@]}"; do
+    [[ -f "$tool" && ! -L "$tool" || -L "$tool" ]] \
+      || fail_setup "validated OpenVINO tool is unavailable: $tool"
+    [[ -x "$tool" ]] || fail_setup "validated OpenVINO tool is not executable: $tool"
+  done
+
+  [[ -d "$openvino_copy_parent" && ! -L "$openvino_copy_parent" ]] \
+    || fail_setup 'isolated copy needs its own regular OpenVINO target parent'
+  openvino_instrumentation_target_root="$(mktemp -d -- \
+    "$openvino_copy_parent/.check-suite-2026.4.1-XXXXXX")" \
+    || fail_setup 'could not create a fresh copy-local OpenVINO target root'
+  suite_cleanup_paths+=("$openvino_instrumentation_target_root")
+  mkdir -p -- "$openvino_instrumentation_target_root/source/dependencies"
+  for relative in \
+    2026.4.1.tar.gz \
+    dependencies/pugixml-ee86beb30e4973f5feffe3ce63bfa4fbadf72f38.tar.gz \
+    dependencies/xbyak-431abd865e70a46d56f5aa0e1f87572decb60169.tar.gz \
+    dependencies/nlohmann-json-9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03.tar.gz
+  do
+    source_archive="$ISOLATED_ROOT/data/targets/openvino-ir/2026.4.1/source/$relative"
+    copy_archive="$openvino_instrumentation_target_root/source/$relative"
+    [[ -f "$source_archive" && ! -L "$source_archive" ]] \
+      || fail_setup "isolated copy needs the pinned OpenVINO archive: $source_archive"
+    cp -- "$source_archive" "$copy_archive" \
+      || fail_setup "could not stage copy-local OpenVINO archive: $relative"
+  done
+
+  openvino_build_log="$LOG_DIR/setup-openvino.log"
+  openvino_build_rc=0
+  (
+    cd -- "$ISOLATED_ROOT"
+    env "${shell_env_unsets[@]}" \
+      -u PROJECT_ROOT -u WORKDIR -u TOOL_BIN \
+      -u OPENVINO_TARGET_ROOT -u OPENVINO_ARCHIVE \
+      -u OPENVINO_COVERAGE_EVIDENCE -u OPENVINO_COVERAGE_MANIFEST \
+      -u JOBS -u CMAKE -u NINJA -u CLANG -u CLANGXX -u READELF \
+      PROJECT_ROOT="$ISOLATED_ROOT" \
+      OPENVINO_TARGET_ROOT="$openvino_instrumentation_target_root" \
+      OPENVINO_ARCHIVE="$openvino_instrumentation_target_root/source/2026.4.1.tar.gz" \
+      JOBS=4 CMAKE="${openvino_tools[0]}" NINJA="${openvino_tools[1]}" \
+      CLANG="${openvino_tools[2]}" CLANGXX="${openvino_tools[3]}" \
+      READELF="${openvino_tools[4]}" \
+      bash -p scripts/build_openvino_profiles.sh
+  ) >"$openvino_build_log" 2>&1 || openvino_build_rc=$?
+  if [[ "$openvino_build_rc" -ne 0 ]]; then
+    for detail_name in configure.log build.log install.log \
+      probe-configure.log probe-build.log check.log; do
+      detail_path="$openvino_instrumentation_target_root/$detail_name"
+      if [[ -f "$detail_path" && ! -L "$detail_path" ]]; then
+        cp -- "$detail_path" "$LOG_DIR/setup-openvino-$detail_name" \
+          || fail_setup "could not preserve failed OpenVINO $detail_name"
+      fi
+    done
+    fail_setup "copy-local OpenVINO normal build failed rc=$openvino_build_rc (log: $openvino_build_log)"
+  fi
+  openvino_copy_profile_log="$LOG_DIR/setup-openvino-copy-profile.log"
+  python3 -B "$openvino_checker_copy" \
+    --target-root "$openvino_instrumentation_target_root" \
+    >"$openvino_copy_profile_log" 2>&1 \
+    || fail_setup "copy-local OpenVINO profile validation failed (log: $openvino_copy_profile_log)"
+  python3 -B - "$openvino_source_target/build-profile.json" \
+    "$openvino_instrumentation_target_root/build-profile.json" \
+    "$openvino_instrumentation_target_root" <<'PY' \
+    || fail_setup 'copy-local OpenVINO profile escaped its target root or changed toolchain'
+import json
+import pathlib
+import sys
+
+source = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+copied = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+root = pathlib.Path(sys.argv[3]).resolve()
+if source.get("toolchain") != copied.get("toolchain"):
+    raise SystemExit("copy-local OpenVINO toolchain differs from the validated source profile")
+rows = list(copied.get("components", {}).values())
+rows += list(copied.get("evidence_files", {}).values())
+paths = [row.get("path") for row in rows if isinstance(row, dict)]
+paths.append(copied.get("linkage_manifest"))
+if not paths or any(not isinstance(raw, str) for raw in paths):
+    raise SystemExit("copy-local OpenVINO profile path inventory is incomplete")
+for raw in paths:
+    pathlib.Path(raw).resolve().relative_to(root)
+PY
+
+  for openvino_variant in guided coverage; do
+    case "$openvino_variant" in
+      guided) openvino_variant_builder=scripts/build_openvino_guided.sh ;;
+      coverage) openvino_variant_builder=scripts/build_coverage_openvino.sh ;;
+    esac
+    openvino_variant_log="$LOG_DIR/setup-openvino-$openvino_variant.log"
+    openvino_variant_rc=0
+    (
+      cd -- "$ISOLATED_ROOT"
+      env "${shell_env_unsets[@]}" \
+        -u PROJECT_ROOT -u WORKDIR -u TOOL_BIN \
+        -u OPENVINO_TARGET_ROOT -u OPENVINO_ARCHIVE \
+        -u OPENVINO_COVERAGE_EVIDENCE -u OPENVINO_COVERAGE_MANIFEST \
+        -u JOBS -u CMAKE -u NINJA -u CLANG -u CLANGXX \
+        -u LLVM_NM -u LLVM_OBJDUMP -u CLANG_BUNDLE_DIR \
+        PROJECT_ROOT="$ISOLATED_ROOT" \
+        OPENVINO_TARGET_ROOT="$openvino_instrumentation_target_root" \
+        JOBS=4 CMAKE="${openvino_tools[0]}" NINJA="${openvino_tools[1]}" \
+        CLANG="${openvino_tools[2]}" CLANGXX="${openvino_tools[3]}" \
+        bash -p "$openvino_variant_builder"
+    ) >"$openvino_variant_log" 2>&1 || openvino_variant_rc=$?
+    if [[ "$openvino_variant_rc" -ne 0 ]]; then
+      for detail_path in "$openvino_instrumentation_target_root/$openvino_variant-"*.log; do
+        if [[ -f "$detail_path" && ! -L "$detail_path" ]]; then
+          detail_name="${detail_path##*/}"
+          cp -- "$detail_path" "$LOG_DIR/setup-openvino-$detail_name" \
+            || fail_setup "could not preserve failed OpenVINO $detail_name"
+        fi
+      done
+      fail_setup "copy-local OpenVINO $openvino_variant build failed rc=$openvino_variant_rc (log: $openvino_variant_log)"
+    fi
+  done
+
+  openvino_coverage_run_log="$LOG_DIR/setup-openvino-coverage-run.log"
+  openvino_coverage_run_rc=0
+  (
+    cd -- "$ISOLATED_ROOT"
+    env "${shell_env_unsets[@]}" \
+      -u PROJECT_ROOT -u WORKDIR -u TOOL_BIN \
+      -u OPENVINO_TARGET_ROOT -u OPENVINO_ARCHIVE \
+      -u OPENVINO_COVERAGE_EVIDENCE -u OPENVINO_COVERAGE_MANIFEST \
+      -u OUT_DIR -u CORPUS_DIR -u CLANG_BUNDLE_DIR \
+      -u LLVM_PROFDATA -u LLVM_COV \
+      PROJECT_ROOT="$ISOLATED_ROOT" \
+      OPENVINO_TARGET_ROOT="$openvino_instrumentation_target_root" \
+      CLANG_BUNDLE_DIR="$(dirname -- "${openvino_tools[3]}")" \
+      OUT_DIR="$openvino_instrumentation_target_root/instrumentation-evidence/coverage" \
+      bash -p scripts/run_coverage_openvino.sh
+  ) >"$openvino_coverage_run_log" 2>&1 || openvino_coverage_run_rc=$?
+  [[ "$openvino_coverage_run_rc" -eq 0 ]] \
+    || fail_setup "copy-local OpenVINO coverage run failed rc=$openvino_coverage_run_rc (log: $openvino_coverage_run_log)"
+
+  for artifact in \
+    "$openvino_instrumentation_target_root/build-profile.json" \
+    "$openvino_instrumentation_target_root/guided-instrumentation.json" \
+    "$openvino_instrumentation_target_root/coverage-instrumentation.json" \
+    "$openvino_instrumentation_target_root/instrumentation-evidence/coverage/coverage.json"
+  do
+    [[ -f "$artifact" && ! -L "$artifact" ]] \
+      || fail_setup "copy-local OpenVINO build produced no regular artifact: $artifact"
+    artifact_resolved="$(realpath -e -- "$artifact")" \
+      || fail_setup "could not resolve copy-local OpenVINO artifact: $artifact"
+    case "$artifact_resolved/" in
+      "$ISOLATED_ROOT/"*) : ;;
+      *) fail_setup "OpenVINO build artifact escaped isolated root: $artifact_resolved" ;;
+    esac
+  done
+  printf '[suite] rebuilt OpenVINO instrumentation target_root=%s log=%s\n' \
+    "$openvino_instrumentation_target_root" "$openvino_build_log"
+elif [[ -e "$SOURCE_ROOT/scripts/check_openvino_instrumentation.sh" \
+     || -L "$SOURCE_ROOT/scripts/check_openvino_instrumentation.sh" ]]; then
+  fail_setup 'OpenVINO instrumentation gate exists without its verified build script'
+fi
+
 # TFLite profile and fixture gates bind absolute paths for flatc, replay, the
 # shared-loader fuzzer, and linked libraries. A byte-for-byte copy therefore
 # cannot be valid in another root. Rebuild those artifacts inside a fresh,
@@ -496,6 +719,11 @@ fail_with_skip=0
 for gate in "${copy_checks[@]}"; do
   name="$(basename -- "$gate")"
   log="$LOG_DIR/$name.log"
+  gate_env=("${suite_gate_env[@]}")
+  if [[ "$name" == check_openvino_instrumentation.sh \
+     && -n "$openvino_instrumentation_target_root" ]]; then
+    gate_env+=("OPENVINO_TARGET_ROOT=$openvino_instrumentation_target_root")
+  fi
   rc=0
   if ! env "${shell_env_unsets[@]}" \
       bash -p -n "$gate" >"$log" 2>&1; then
@@ -507,10 +735,12 @@ for gate in "${copy_checks[@]}"; do
         -u ALLOW_SKIPPED_CASES -u OUT_DIR -u AFLPP_CHECK_DIR -u LOG_DIR -u TMPDIR \
         -u SEED_ROOT -u SEED_DIR -u SEEDS_DIR -u VALID_DIR -u MAL_DIR -u DATA_DIR \
         -u CARGO_TARGET_DIR \
+        -u OPENVINO_TARGET_ROOT -u OPENVINO_ARCHIVE \
+        -u OPENVINO_COVERAGE_EVIDENCE -u OPENVINO_COVERAGE_MANIFEST \
         -u REPLAY -u FUZZER -u AFLPP_REPLAY -u LEGACY_PROBE -u SRC \
         -u LIBFUZZER_DRIVER -u AFLPP_CONTAINER_TOOL \
         -u TOOL_LIBFUZZER_CMD -u TOOL_AFLPP_CMD \
-        "${suite_gate_env[@]}" \
+        "${gate_env[@]}" \
         PROJECT_ROOT="$ISOLATED_ROOT" WORKDIR="$ISOLATED_ROOT" \
         TOOL_BIN="$ISOLATED_ROOT/target/debug/tool" \
         bash -p "scripts/$name"
