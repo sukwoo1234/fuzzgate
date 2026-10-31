@@ -55,6 +55,18 @@ if(HDF5_BUILD_FIXTURE_TEST_MUTANTS)
   configure_hdf5_fixture_target(hdf5_fixture_attribute_mutant)
 endif()
 
+option(HDF5_BUILD_MUTATOR "Build the HDF-04 structural mutator" OFF)
+if(HDF5_BUILD_MUTATOR)
+  add_executable(hdf5_structural_mutator structural_mutator.cc)
+  configure_hdf5_fixture_target(hdf5_structural_mutator)
+endif()
+
+option(HDF5_BUILD_MUTATOR_TESTS "Build the HDF-04 mutation checker tool" OFF)
+if(HDF5_BUILD_MUTATOR_TESTS)
+  add_executable(hdf5_mutation_test_tool mutation_test_tool.cc)
+  configure_hdf5_fixture_target(hdf5_mutation_test_tool)
+endif()
+
 option(HDF5_BUILD_LOADER "Build the HDF-03 shared loader wrappers" OFF)
 option(HDF5_BUILD_LOADER_TESTS "Build HDF-03 policy and handle probes" OFF)
 
