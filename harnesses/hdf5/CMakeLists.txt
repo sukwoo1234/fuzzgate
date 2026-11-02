@@ -42,6 +42,14 @@ if(HDF5_BUILD_FIXTURE_TOOL)
   configure_hdf5_fixture_target(hdf5_fixture_tool)
 endif()
 
+option(HDF5_BUILD_INSTRUMENTATION_FIXTURE_TOOL
+  "Build the HDF-05 filtered dataset fixture generator" OFF)
+if(HDF5_BUILD_INSTRUMENTATION_FIXTURE_TOOL)
+  add_executable(hdf5_instrumentation_fixture_tool
+    instrumentation_fixture_tool.cc)
+  configure_hdf5_fixture_target(hdf5_instrumentation_fixture_tool)
+endif()
+
 option(HDF5_BUILD_FIXTURE_TEST_MUTANTS "Build HDF-02 negative-control writers" OFF)
 if(HDF5_BUILD_FIXTURE_TEST_MUTANTS)
   add_executable(hdf5_fixture_chunk_mutant fixture_tool.cc)
