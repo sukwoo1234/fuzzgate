@@ -274,6 +274,24 @@ PY
   [[ ${#hdf5_tools[@]} -eq 5 ]] \
     || fail_setup 'validated HDF5 profile yielded an incomplete toolchain'
 
+  # The caller's hardlink-free copy can contain ignored HDF-05 outputs from the
+  # source tree. They are not admissible evidence in this run: remove only the
+  # fixed copy-local variant roots before rebuilding normal/guided/coverage.
+  for stale_hdf5_path in \
+    "$hdf5_target/install-guided" \
+    "$hdf5_target/install-coverage" \
+    "$hdf5_target/instrumentation-fixtures" \
+    "$hdf5_target/instrumentation-evidence" \
+    "$hdf5_target/coverage-build-probe" \
+    "$hdf5_target/guided-instrumentation.json" \
+    "$hdf5_target/coverage-instrumentation.json"
+  do
+    [[ ! -L "$stale_hdf5_path" ]] \
+      || fail_setup "copy-local HDF5 instrumentation path is a symlink: $stale_hdf5_path"
+    rm -rf -- "$stale_hdf5_path" \
+      || fail_setup "could not clear copy-local HDF5 instrumentation path: $stale_hdf5_path"
+  done
+
   hdf5_build_log="$LOG_DIR/setup-hdf5.log"
   hdf5_build_rc=0
   (
@@ -325,6 +343,77 @@ if not paths or any(not isinstance(raw, str) for raw in paths):
 for raw in paths:
     pathlib.Path(raw).resolve().relative_to(root)
 PY
+
+  if [[ -e "$SOURCE_ROOT/scripts/check_hdf5_instrumentation.sh" \
+     || -L "$SOURCE_ROOT/scripts/check_hdf5_instrumentation.sh" ]]; then
+    for required in \
+      "$ISOLATED_ROOT/scripts/build_hdf5_guided.sh" \
+      "$ISOLATED_ROOT/scripts/build_coverage_hdf5.sh" \
+      "$ISOLATED_ROOT/scripts/run_coverage_hdf5.sh" \
+      "$ISOLATED_ROOT/scripts/lib/hdf5_variant_build.sh"
+    do
+      [[ -f "$required" && ! -L "$required" ]] \
+        || fail_setup "isolated copy needs its own regular HDF5 instrumentation helper: $required"
+    done
+    for hdf5_variant in guided coverage; do
+      case "$hdf5_variant" in
+        guided) hdf5_variant_builder=scripts/build_hdf5_guided.sh ;;
+        coverage) hdf5_variant_builder=scripts/build_coverage_hdf5.sh ;;
+      esac
+      hdf5_variant_log="$LOG_DIR/setup-hdf5-$hdf5_variant.log"
+      hdf5_variant_rc=0
+      (
+        cd -- "$ISOLATED_ROOT"
+        env "${shell_env_unsets[@]}" \
+          -u PROJECT_ROOT -u WORKDIR -u TOOL_BIN \
+          -u HDF5_TARGET_ROOT -u HDF5_ARCHIVE \
+          -u HDF5_COVERAGE_EVIDENCE -u HDF5_COVERAGE_MANIFEST \
+          -u HDF5_INSTRUMENTATION_FIXTURE \
+          -u JOBS -u CMAKE -u NINJA -u CLANG -u CLANGXX \
+          -u LLVM_NM -u LLVM_OBJDUMP -u CLANG_BUNDLE_DIR \
+          PROJECT_ROOT="$ISOLATED_ROOT" HDF5_TARGET_ROOT="$hdf5_target" \
+          JOBS=4 CMAKE="${hdf5_tools[0]}" NINJA="${hdf5_tools[1]}" \
+          CLANG="${hdf5_tools[2]}" CLANGXX="${hdf5_tools[3]}" \
+          bash -p "$hdf5_variant_builder"
+      ) >"$hdf5_variant_log" 2>&1 || hdf5_variant_rc=$?
+      [[ "$hdf5_variant_rc" -eq 0 ]] \
+        || fail_setup "copy-local HDF5 $hdf5_variant build failed rc=$hdf5_variant_rc (log: $hdf5_variant_log)"
+    done
+
+    hdf5_coverage_log="$LOG_DIR/setup-hdf5-coverage-run.log"
+    hdf5_coverage_rc=0
+    (
+      cd -- "$ISOLATED_ROOT"
+      env "${shell_env_unsets[@]}" \
+        -u PROJECT_ROOT -u WORKDIR -u TOOL_BIN \
+        -u HDF5_TARGET_ROOT -u HDF5_ARCHIVE \
+        -u HDF5_COVERAGE_EVIDENCE -u HDF5_COVERAGE_MANIFEST \
+        -u HDF5_INSTRUMENTATION_FIXTURE \
+        -u OUT_DIR -u CLANG_BUNDLE_DIR -u LLVM_PROFDATA -u LLVM_COV \
+        PROJECT_ROOT="$ISOLATED_ROOT" HDF5_TARGET_ROOT="$hdf5_target" \
+        CLANG_BUNDLE_DIR="$(dirname -- "${hdf5_tools[3]}")" \
+        OUT_DIR="$hdf5_target/instrumentation-evidence/coverage" \
+        bash -p scripts/run_coverage_hdf5.sh
+    ) >"$hdf5_coverage_log" 2>&1 || hdf5_coverage_rc=$?
+    [[ "$hdf5_coverage_rc" -eq 0 ]] \
+      || fail_setup "copy-local HDF5 coverage run failed rc=$hdf5_coverage_rc (log: $hdf5_coverage_log)"
+    for artifact in \
+      "$hdf5_target/guided-instrumentation.json" \
+      "$hdf5_target/coverage-instrumentation.json" \
+      "$hdf5_target/instrumentation-evidence/coverage/coverage.json"
+    do
+      [[ -f "$artifact" && ! -L "$artifact" ]] \
+        || fail_setup "copy-local HDF5 instrumentation produced no regular artifact: $artifact"
+      artifact_resolved="$(realpath -e -- "$artifact")" \
+        || fail_setup "could not resolve copy-local HDF5 artifact: $artifact"
+      case "$artifact_resolved/" in
+        "$ISOLATED_ROOT/"*) : ;;
+        *) fail_setup "HDF5 instrumentation artifact escaped isolated root: $artifact_resolved" ;;
+      esac
+    done
+    printf '[suite] rebuilt HDF5 instrumentation target_root=%s logs=%s,%s\n' \
+      "$hdf5_target" "$LOG_DIR/setup-hdf5-guided.log" "$LOG_DIR/setup-hdf5-coverage.log"
+  fi
   suite_gate_env+=("HDF5_TARGET_ROOT=$hdf5_target")
   printf '[suite] rebuilt HDF5 profile target_root=%s log=%s\n' \
     "$hdf5_target" "$hdf5_build_log"
@@ -735,6 +824,9 @@ for gate in "${copy_checks[@]}"; do
         -u ALLOW_SKIPPED_CASES -u OUT_DIR -u AFLPP_CHECK_DIR -u LOG_DIR -u TMPDIR \
         -u SEED_ROOT -u SEED_DIR -u SEEDS_DIR -u VALID_DIR -u MAL_DIR -u DATA_DIR \
         -u CARGO_TARGET_DIR \
+        -u HDF5_TARGET_ROOT -u HDF5_ARCHIVE \
+        -u HDF5_COVERAGE_EVIDENCE -u HDF5_COVERAGE_MANIFEST \
+        -u HDF5_INSTRUMENTATION_FIXTURE \
         -u OPENVINO_TARGET_ROOT -u OPENVINO_ARCHIVE \
         -u OPENVINO_COVERAGE_EVIDENCE -u OPENVINO_COVERAGE_MANIFEST \
         -u REPLAY -u FUZZER -u AFLPP_REPLAY -u LEGACY_PROBE -u SRC \

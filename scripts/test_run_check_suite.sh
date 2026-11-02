@@ -374,7 +374,10 @@ cp -a "$SOURCE/." "$HDF5_SOURCE/"
 rm "$HDF5_SOURCE/scripts/check_fail.sh" "$HDF5_SOURCE/scripts/check_skip.sh"
 HDF5_SOURCE_TARGET="$HDF5_SOURCE/data/targets/hdf5-weights/2.2.0"
 mkdir -p "$HDF5_SOURCE_TARGET/source" "$HDF5_SOURCE_TARGET/install/lib" \
-  "$HDF5_SOURCE_TARGET/bin" "$HDF5_SOURCE_TARGET/evidence" "$HDF5_SOURCE/toolchain"
+  "$HDF5_SOURCE_TARGET/bin" "$HDF5_SOURCE_TARGET/evidence" "$HDF5_SOURCE/toolchain" \
+  "$HDF5_SOURCE/scripts/lib"
+printf '#!/usr/bin/env bash\nexit 89\n' \
+  >"$HDF5_SOURCE/scripts/lib/hdf5_variant_build.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$HDF5_SOURCE/toolchain/clang-17"
 chmod +x "$HDF5_SOURCE/toolchain/clang-17"
 ln -s clang-17 "$HDF5_SOURCE/toolchain/clang++"
@@ -385,6 +388,11 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$HDF5_SOURCE_TARGET/bin/probe"
 chmod +x "$HDF5_SOURCE_TARGET/bin/probe"
 printf 'source evidence\n' >"$HDF5_SOURCE_TARGET/evidence/build.log"
 printf '{}\n' >"$HDF5_SOURCE_TARGET/linkage-manifest.json"
+mkdir -p "$HDF5_SOURCE_TARGET/install-guided" \
+  "$HDF5_SOURCE_TARGET/instrumentation-evidence/coverage"
+printf 'stale guided output\n' >"$HDF5_SOURCE_TARGET/install-guided/stale.marker"
+printf 'stale coverage output\n' \
+  >"$HDF5_SOURCE_TARGET/instrumentation-evidence/coverage/stale.marker"
 cat >"$HDF5_SOURCE_TARGET/build-profile.json" <<EOF
 {
   "toolchain": {
@@ -471,6 +479,53 @@ printf 'copy-local HDF5 build\n' >"$target/built.marker"
 echo '[fixture-hdf5-build] rebuilt copy-local HDF5 profile'
 EOF
 chmod +x "$HDF5_SOURCE/scripts/build_hdf5_profiles.sh"
+cat >"$HDF5_SOURCE/scripts/build_hdf5_guided.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+target="$PROJECT_ROOT/data/targets/hdf5-weights/2.2.0"
+[[ "$PWD" == "$PROJECT_ROOT" && "$HDF5_TARGET_ROOT" == "$target" ]] \
+  || { echo 'guided HDF5 fixture escaped the isolated copy' >&2; exit 84; }
+[[ "$JOBS" == 4 && "$CMAKE" == /usr/bin/true && "$NINJA" == /usr/bin/true \
+   && "${CLANGXX##*/}" == clang++ ]] \
+  || { echo 'guided HDF5 fixture did not receive the validated toolchain' >&2; exit 85; }
+printf '{"fixture":"guided"}\n' >"$target/guided-instrumentation.json"
+EOF
+chmod +x "$HDF5_SOURCE/scripts/build_hdf5_guided.sh"
+cat >"$HDF5_SOURCE/scripts/build_coverage_hdf5.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+target="$PROJECT_ROOT/data/targets/hdf5-weights/2.2.0"
+[[ "$PWD" == "$PROJECT_ROOT" && "$HDF5_TARGET_ROOT" == "$target" ]] \
+  || { echo 'coverage HDF5 fixture escaped the isolated copy' >&2; exit 86; }
+[[ "$JOBS" == 4 && "$CMAKE" == /usr/bin/true && "$NINJA" == /usr/bin/true \
+   && "${CLANGXX##*/}" == clang++ ]] \
+  || { echo 'coverage HDF5 fixture did not receive the validated toolchain' >&2; exit 87; }
+printf '{"fixture":"coverage"}\n' >"$target/coverage-instrumentation.json"
+EOF
+chmod +x "$HDF5_SOURCE/scripts/build_coverage_hdf5.sh"
+cat >"$HDF5_SOURCE/scripts/run_coverage_hdf5.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+target="$PROJECT_ROOT/data/targets/hdf5-weights/2.2.0"
+[[ "$PWD" == "$PROJECT_ROOT" && "$HDF5_TARGET_ROOT" == "$target" \
+   && "$OUT_DIR" == "$target/instrumentation-evidence/coverage" \
+   && -x "$CLANG_BUNDLE_DIR/clang++" ]] \
+  || { echo 'HDF5 coverage runner fixture escaped the isolated copy' >&2; exit 88; }
+mkdir -p "$OUT_DIR"
+printf '{"fixture":"coverage-run"}\n' >"$OUT_DIR/coverage.json"
+EOF
+chmod +x "$HDF5_SOURCE/scripts/run_coverage_hdf5.sh"
+cat >"$HDF5_SOURCE/scripts/check_hdf5_instrumentation.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+target="$PROJECT_ROOT/data/targets/hdf5-weights/2.2.0"
+[[ "$HDF5_TARGET_ROOT" == "$target" ]]
+grep -Fq '"guided"' "$target/guided-instrumentation.json"
+grep -Fq '"coverage"' "$target/coverage-instrumentation.json"
+grep -Fq '"coverage-run"' "$target/instrumentation-evidence/coverage/coverage.json"
+printf '[fixture-hdf5-instrumentation] pass=1 fail=0\n'
+EOF
+chmod +x "$HDF5_SOURCE/scripts/check_hdf5_instrumentation.sh"
 cat >"$HDF5_SOURCE/scripts/check_hdf5_copy.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -499,6 +554,11 @@ grep -Fq '[fixture-hdf5-build] rebuilt copy-local HDF5 profile' \
   "$WORK/hdf5-logs/setup-hdf5.log"
 grep -Fxq 'copy-local HDF5 build' \
   "$HDF5_COPY/data/targets/hdf5-weights/2.2.0/built.marker"
+[[ ! -e "$HDF5_COPY/data/targets/hdf5-weights/2.2.0/install-guided/stale.marker" \
+   && ! -e "$HDF5_COPY/data/targets/hdf5-weights/2.2.0/instrumentation-evidence/coverage/stale.marker" ]] || {
+  echo 'copy-local HDF5 instrumentation reused stale source evidence' >&2
+  exit 1
+}
 [[ ! -e "$SOURCE/escaped-hdf5-root" \
    && ! -e "$SOURCE/escaped-hdf5-archive" ]] || {
   echo 'copy-local HDF5 builder wrote through an inherited output path' >&2
