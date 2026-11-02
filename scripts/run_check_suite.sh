@@ -274,10 +274,17 @@ PY
   [[ ${#hdf5_tools[@]} -eq 5 ]] \
     || fail_setup 'validated HDF5 profile yielded an incomplete toolchain'
 
-  # The caller's hardlink-free copy can contain ignored HDF-05 outputs from the
-  # source tree. They are not admissible evidence in this run: remove only the
-  # fixed copy-local variant roots before rebuilding normal/guided/coverage.
+  # The caller's hardlink-free copy can contain ignored HDF-05/HDF-06 outputs
+  # from the source tree. They are not admissible evidence in this run: remove
+  # only the fixed copy-local roots before rebuilding them inside the copy.
   for stale_hdf5_path in \
+    "$hdf5_target/build/execution-harness" \
+    "$hdf5_target/execution-fixtures" \
+    "$hdf5_target/profile.json" \
+    "$hdf5_target/execution-profile-precheck.log" \
+    "$hdf5_target/execution-profile-configure.log" \
+    "$hdf5_target/execution-profile-build.log" \
+    "$hdf5_target/execution-fixtures.log" \
     "$hdf5_target/install-guided" \
     "$hdf5_target/install-coverage" \
     "$hdf5_target/instrumentation-fixtures" \
@@ -343,6 +350,47 @@ if not paths or any(not isinstance(raw, str) for raw in paths):
 for raw in paths:
     pathlib.Path(raw).resolve().relative_to(root)
 PY
+
+  if [[ -e "$SOURCE_ROOT/scripts/check_hdf5_integration.sh" \
+     || -L "$SOURCE_ROOT/scripts/check_hdf5_integration.sh" ]]; then
+    hdf5_execution_builder="$ISOLATED_ROOT/scripts/build_hdf5_execution_profile.sh"
+    hdf5_scope_checker="$ISOLATED_ROOT/scripts/check_hdf5_scope.py"
+    [[ -f "$hdf5_execution_builder" && ! -L "$hdf5_execution_builder" ]] \
+      || fail_setup 'isolated copy needs its own regular HDF5 execution-profile builder'
+    [[ -f "$hdf5_scope_checker" && ! -L "$hdf5_scope_checker" ]] \
+      || fail_setup 'isolated copy needs its own regular HDF5 scope checker'
+    hdf5_execution_log="$LOG_DIR/setup-hdf5-execution.log"
+    hdf5_execution_rc=0
+    (
+      cd -- "$ISOLATED_ROOT"
+      env "${shell_env_unsets[@]}" \
+        -u PROJECT_ROOT -u WORKDIR -u TOOL_BIN \
+        -u HDF5_TARGET_ROOT -u HDF5_ARCHIVE \
+        -u JOBS -u CMAKE -u NINJA -u CLANGXX \
+        PROJECT_ROOT="$ISOLATED_ROOT" HDF5_TARGET_ROOT="$hdf5_target" \
+        JOBS=4 CMAKE="${hdf5_tools[0]}" NINJA="${hdf5_tools[1]}" \
+        CLANGXX="${hdf5_tools[3]}" \
+        bash -p scripts/build_hdf5_execution_profile.sh
+    ) >"$hdf5_execution_log" 2>&1 || hdf5_execution_rc=$?
+    [[ "$hdf5_execution_rc" -eq 0 ]] \
+      || fail_setup "copy-local HDF5 execution-profile build failed rc=$hdf5_execution_rc (log: $hdf5_execution_log)"
+    for artifact in \
+      "$hdf5_target/profile.json" \
+      "$hdf5_target/build/execution-harness/hdf5_loader_replay" \
+      "$hdf5_target/execution-fixtures/manifest.json"
+    do
+      [[ -f "$artifact" && ! -L "$artifact" ]] \
+        || fail_setup "copy-local HDF5 execution build produced no regular artifact: $artifact"
+      artifact_resolved="$(realpath -e -- "$artifact")" \
+        || fail_setup "could not resolve copy-local HDF5 execution artifact: $artifact"
+      case "$artifact_resolved/" in
+        "$ISOLATED_ROOT/"*) : ;;
+        *) fail_setup "HDF5 execution artifact escaped isolated root: $artifact_resolved" ;;
+      esac
+    done
+    printf '[suite] rebuilt HDF5 execution profile target_root=%s log=%s\n' \
+      "$hdf5_target" "$hdf5_execution_log"
+  fi
 
   if [[ -e "$SOURCE_ROOT/scripts/check_hdf5_instrumentation.sh" \
      || -L "$SOURCE_ROOT/scripts/check_hdf5_instrumentation.sh" ]]; then
