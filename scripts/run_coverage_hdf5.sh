@@ -58,7 +58,13 @@ import secrets
 print(secrets.token_hex(16))
 PY
 )"
-RUN_STARTED_NS="$(date +%s%N)"
+RUN_STARTED_NS="$(python3 -B - "$OUT_DIR/raw" <<'PY'
+import pathlib
+import sys
+
+print(pathlib.Path(sys.argv[1]).stat().st_mtime_ns)
+PY
+)" || fail 'could not read the coverage output filesystem clock'
 [[ "$RUN_ID" =~ ^[0-9a-f]{32}$ && "$RUN_STARTED_NS" =~ ^[0-9]+$ ]] \
   || fail 'could not create coverage run identity'
 

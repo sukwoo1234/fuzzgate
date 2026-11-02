@@ -26,6 +26,19 @@ def main() -> int:
         )
         return 1
 
+    runner = required[2]
+    runner_source = runner.read_text(encoding="utf-8")
+    if (
+        'RUN_STARTED_NS="$(date +%s%N)"' in runner_source
+        or "pathlib.Path(sys.argv[1]).stat().st_mtime_ns" not in runner_source
+    ):
+        print(
+            "[hdf5-instrumentation-test] fail: coverage run start must use the "
+            "output filesystem clock, not the wall clock",
+            file=sys.stderr,
+        )
+        return 1
+
     completed = subprocess.run(
         [sys.executable, "-B", str(checker), "--selftest"],
         cwd=project,
