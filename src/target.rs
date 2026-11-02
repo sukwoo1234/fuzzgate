@@ -23,6 +23,8 @@ pub(crate) enum TargetKind {
     Tflite,
     #[value(name = "openvino-ir")]
     OpenvinoIr,
+    #[value(name = "hdf5-weights")]
+    Hdf5Weights,
 }
 
 #[derive(Clone, Copy)]
@@ -204,6 +206,27 @@ const TARGET_SPECS: &[TargetSpec] = &[
                 "https://github.com/openvinotoolkit/openvino/archive/refs/tags/2026.4.1.tar.gz",
             official_owner: "openvinotoolkit",
             official_repo: "openvino",
+        },
+    },
+    TargetSpec {
+        kind: TargetKind::Hdf5Weights,
+        target_id: "hdf5-weights",
+        seed_subdir: "hdf5-weights",
+        input_ext: "h5",
+        storage_name: "hdf5-weights",
+        coverage_env_key: Some("TOOL_COVERAGE_HDF5_CMD"),
+        coverage_runner: Some("scripts/run_coverage_hdf5.sh"),
+        external_harness_env: "TOOL_HDF5_WEIGHTS_HARNESS_CMD",
+        mutation_supported: false,
+        campaign_supported: false,
+        ui_supported: false,
+        preset: TargetPreset {
+            name: "hdf5-weights",
+            default_version: "2.2.0",
+            default_url:
+                "https://github.com/HDFGroup/hdf5/releases/download/2.2.0/hdf5-2.2.0.tar.gz",
+            official_owner: "HDFGroup",
+            official_repo: "hdf5",
         },
     },
 ];
@@ -402,11 +425,16 @@ impl std::fmt::Display for HarnessError {
 }
 
 pub(crate) fn run_harness(target: &TargetKind, input: &Path) -> Result<(), HarnessError> {
-    if matches!(target, TargetKind::OpenvinoIr) {
-        return Err(HarnessError::Unavailable(
-            "openvino-ir requires a pinned target profile; build it with scripts/build_openvino_execution_profile.sh"
-                .to_string(),
-        ));
+    if matches!(target, TargetKind::OpenvinoIr | TargetKind::Hdf5Weights) {
+        let preparation = match target {
+            TargetKind::OpenvinoIr => "scripts/build_openvino_execution_profile.sh",
+            TargetKind::Hdf5Weights => "scripts/build_hdf5_execution_profile.sh",
+            _ => unreachable!("profile-only target checked above"),
+        };
+        return Err(HarnessError::Unavailable(format!(
+            "{} requires a pinned target profile; build it with {preparation}",
+            target_label(target)
+        )));
     }
     if !input.exists() {
         return Err(HarnessError::InputRejected(format!(
@@ -433,6 +461,7 @@ pub(crate) fn run_harness(target: &TargetKind, input: &Path) -> Result<(), Harne
         }
         TargetKind::Tflite => tflite_precheck(&bytes).map_err(HarnessError::InputRejected)?,
         TargetKind::OpenvinoIr => unreachable!("openvino-ir requires a target profile"),
+        TargetKind::Hdf5Weights => unreachable!("hdf5-weights requires a target profile"),
     };
 
     let core_path_step = match target {
@@ -441,6 +470,7 @@ pub(crate) fn run_harness(target: &TargetKind, input: &Path) -> Result<(), Harne
         TargetKind::Safetensors => "header_json->safetensors deserialize".to_string(),
         TargetKind::Tflite => "verified FlatBuffer->Interpreter->AllocateTensors".to_string(),
         TargetKind::OpenvinoIr => unreachable!("openvino-ir requires a target profile"),
+        TargetKind::Hdf5Weights => unreachable!("hdf5-weights requires a target profile"),
     };
     let library_connect = match target {
         TargetKind::Gguf => gguf_library_connect(input),
@@ -448,6 +478,7 @@ pub(crate) fn run_harness(target: &TargetKind, input: &Path) -> Result<(), Harne
         TargetKind::Safetensors => safetensors_library_connect(input),
         TargetKind::Tflite => tflite_library_connect(input),
         TargetKind::OpenvinoIr => unreachable!("openvino-ir requires a target profile"),
+        TargetKind::Hdf5Weights => unreachable!("hdf5-weights requires a target profile"),
     };
     let strict_connect = std::env::var("TOOL_REQUIRE_LIBRARY_CONNECT")
         .map(|v| v == "1")

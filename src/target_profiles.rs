@@ -1003,6 +1003,7 @@ fn validate_depth(target: &str, depth: &str) -> Result<(), String> {
         "safetensors" => depth == "deserialize",
         "tflite" => depth == "load-allocate-access",
         "openvino-ir" => depth == "read-validate-constants",
+        "hdf5-weights" => depth == "read-numeric-datasets",
         _ => false,
     };
     if accepted {

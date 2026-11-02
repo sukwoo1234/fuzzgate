@@ -54,6 +54,10 @@ fn expected_coverage_runner(target: &TargetKind) -> Result<TrustedCoverageRunner
             name: "scripts/run_coverage_openvino.sh",
             bytes: include_bytes!("../scripts/run_coverage_openvino.sh"),
         }),
+        Some("scripts/run_coverage_hdf5.sh") => Ok(TrustedCoverageRunner {
+            name: "scripts/run_coverage_hdf5.sh",
+            bytes: include_bytes!("../scripts/run_coverage_hdf5.sh"),
+        }),
         Some(other) => Err(format!(
             "target '{}' registers unknown coverage runner '{other}'",
             target_label(target)
@@ -678,6 +682,10 @@ mod tests {
             coverage_cmd_env_key(&TargetKind::Tflite).unwrap(),
             "TOOL_COVERAGE_TFLITE_CMD"
         );
+        assert_eq!(
+            coverage_cmd_env_key(&TargetKind::Hdf5Weights).unwrap(),
+            "TOOL_COVERAGE_HDF5_CMD"
+        );
     }
 
     #[test]
@@ -691,6 +699,7 @@ mod tests {
                 "scripts/run_coverage_safetensors.sh",
             ),
             (TargetKind::Tflite, "scripts/run_coverage_tflite.sh"),
+            (TargetKind::Hdf5Weights, "scripts/run_coverage_hdf5.sh"),
         ] {
             let runner = root.join(name);
             let configured = format!("bash {}", runner.display());
