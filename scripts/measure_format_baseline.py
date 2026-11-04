@@ -669,6 +669,7 @@ def _validate_target_profile_shape(profile: dict[str, Any], label: str) -> None:
         "safetensors": {"deserialize"},
         "tflite": {"load-allocate-access"},
         "openvino-ir": {"read-validate-constants"},
+        "hdf5-weights": {"read-numeric-datasets"},
     }
     target_id = profile["target_id"]
     if target_id not in allowed_depths or depth not in allowed_depths[target_id]:

@@ -123,6 +123,32 @@ _TARGET_CONTRACTS = {
             "scripts/measure_format_baseline.py",
         ),
     ),
+    "hdf5-weights": TargetContract(
+        target_id="hdf5-weights",
+        label="HDF5",
+        marker_prefix="HDF5_EVIDENCE",
+        api_event="ReadNumericDatasets",
+        load_marker=re.compile(rb"(?m)^HDF5_RESULT classification="),
+        load_ok_marker=re.compile(
+            rb"(?m)^HDF5_RESULT classification=accepted stage=complete\b"
+        ),
+        load_reject_marker=re.compile(
+            rb"(?m)^HDF5_RESULT classification=(?:target_reject|policy_limit|unsupported_feature)\b"
+        ),
+        access_ok_marker=re.compile(rb"(?m)^HDF5_ACCESS_OK\b"),
+        accepted_detail="read-numeric-datasets-complete",
+        rejected_detail="read-numeric-datasets-rejected",
+        prepare_schema="format-evidence-run-v1",
+        operation_schema="format-v7-operation-v1",
+        source_paths=(
+            "harnesses/hdf5/loader.cc",
+            "harnesses/hdf5/loader.h",
+            "harnesses/hdf5/replay.cc",
+            "scripts/collect_tflite_evidence.py",
+            "scripts/collect_hdf5_evidence.py",
+            "scripts/measure_format_baseline.py",
+        ),
+    ),
 }
 
 
@@ -2997,6 +3023,8 @@ def build_parser(default_target_id: str = "tflite") -> argparse.ArgumentParser:
         description = (
             "Collect, supervise, publish, and revalidate OpenVINO Q10/Q11 evidence."
         )
+    elif default_target_id == "hdf5-weights":
+        description = "Collect, supervise, publish, and revalidate HDF5 Q10/Q11 evidence."
     parser = argparse.ArgumentParser(description=description)
     subparsers = parser.add_subparsers(dest="command", required=True)
     prepare_parser = subparsers.add_parser("prepare")

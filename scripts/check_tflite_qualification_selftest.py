@@ -61,29 +61,36 @@ def make_profile(root: Path, target_id: str = "tflite") -> Path:
     identity.chmod(0o700)
     identity_hash = digest(identity)
     openvino = target_id == "openvino-ir"
+    hdf5 = target_id == "hdf5-weights"
     profile = {
         "schema_version": "1",
         "target_id": target_id,
-        "format_revision": "ir-v11" if openvino else "3",
-        "loader_id": "openvino-ir-frontend" if openvino else "tensorflow-lite",
-        "loader_version": "2026.4.1" if openvino else "v2.20.0",
+        "format_revision": "hdf5-2.2.0-numeric-datasets-v1" if hdf5 else "ir-v11" if openvino else "3",
+        "loader_id": "hdf5-file-image-numeric-dataset" if hdf5 else "openvino-ir-frontend" if openvino else "tensorflow-lite",
+        "loader_version": "2.2.0" if hdf5 else "2026.4.1" if openvino else "v2.20.0",
         "source_artifacts": [
             {
-                "url": "https://github.com/openvinotoolkit/openvino/archive/refs/tags/2026.4.1.tar.gz"
+                "url": "https://github.com/HDFGroup/hdf5/releases/download/2.2.0/hdf5-2.2.0.tar.gz"
+                if hdf5
+                else "https://github.com/openvinotoolkit/openvino/archive/refs/tags/2026.4.1.tar.gz"
                 if openvino
                 else "https://github.com/tensorflow/tensorflow/archive/refs/tags/v2.20.0.tar.gz",
-                "tag": "2026.4.1" if openvino else "v2.20.0",
-                "resolved_commit": "e213a14725769a6a2bf86fc86650aa78a9c05d3e"
+                "tag": "2.2.0" if hdf5 else "2026.4.1" if openvino else "v2.20.0",
+                "resolved_commit": "49df1b4e5ca4108d56e80f06321a749da1535268"
+                if hdf5
+                else "e213a14725769a6a2bf86fc86650aa78a9c05d3e"
                 if openvino
                 else "72fbba3d20f4616d7312b5e2b7f79daf6e82f2fa",
-                "sha256": "1ee85264556025486a4745a2d452ea823c578b3d162768bfef590366d2e6c539"
+                "sha256": "1a1ab8209b35586fbc1aa279ba76d102130b95badcb20ca329587219112d8c16"
+                if hdf5
+                else "1ee85264556025486a4745a2d452ea823c578b3d162768bfef590366d2e6c539"
                 if openvino
                 else "2" * 64,
-                "size_bytes": 71349787 if openvino else 1,
+                "size_bytes": 42131403 if hdf5 else 71349787 if openvino else 1,
             }
         ],
         "patches": []
-        if openvino
+        if openvino or hdf5
         else [{"order": 1, "path": str(identity), "sha256": identity_hash}],
         "toolchain": {
             "compiler": {"version": "1", "path": str(identity), "sha256": identity_hash},
@@ -118,21 +125,23 @@ def make_profile(root: Path, target_id: str = "tflite") -> Path:
                     "linked_libraries": [],
                 }
             ]
-            if openvino
+            if openvino or hdf5
             else []
         ),
         "input_kind": {
             "kind": "fzb1" if openvino else "single",
-            "extensions": ["fzb" if openvino else "tflite"],
-            "subformats": ["model.bin", "model.xml"] if openvino else [],
+            "extensions": ["h5" if hdf5 else "fzb" if openvino else "tflite"],
+            "subformats": ["numeric-dataset"] if hdf5 else ["model.bin", "model.xml"] if openvino else [],
         },
-        "depth": "read-validate-constants" if openvino else "load-allocate-access",
+        "depth": "read-numeric-datasets" if hdf5 else "read-validate-constants" if openvino else "load-allocate-access",
         "engine_capabilities": [
             {
                 "backend": "local-harness",
                 "binary_role": "replay",
                 "required_mode": "native",
-                "instrumentation_scope": "openvino-core+ir-frontend"
+                "instrumentation_scope": "hdf5-core+high-level-file-image"
+                if hdf5
+                else "openvino-core+ir-frontend"
                 if openvino
                 else "tensorflow/lite",
             }
@@ -147,15 +156,64 @@ def make_profile(root: Path, target_id: str = "tflite") -> Path:
         },
         "coverage_scope": {
             "unit": "source-line",
-            "include_sources": ["src/core", "src/frontends/ir"]
+            "include_sources": ["src/H5Fio.c", "src/H5Dio.c", "src/H5Dchunk.c", "src/H5Z.c", "src/H5Zshuffle.c", "src/H5Zfletcher32.c"]
+            if hdf5
+            else ["src/core", "src/frontends/ir"]
             if openvino
             else ["tensorflow/lite/**"],
-            "exclude_sources": [] if openvino else ["**/*_test.cc"],
+            "exclude_sources": [] if openvino or hdf5 else ["**/*_test.cc"],
         },
     }
     path = root / "profile.json"
     write_json(path, profile)
     return path
+
+
+def make_hdf5_support_documents(root: Path) -> tuple[Path, Path]:
+    target_spec = {
+        "schema_version": "1",
+        "target_id": "hdf5-weights",
+        "seed_subdir": "hdf5-weights",
+        "input_ext": "h5",
+        "storage_name": "hdf5-weights",
+        "coverage_env_key": "TOOL_COVERAGE_HDF5_CMD",
+        "coverage_runner": "scripts/run_coverage_hdf5.sh",
+        "external_harness_env": "TOOL_HDF5_WEIGHTS_HARNESS_CMD",
+        "mutation_supported": False,
+        "campaign_supported": False,
+        "ui_supported": False,
+        "support_scope": "profile-backend",
+    }
+    build_profile = {
+        "schema_version": "hdf5-weights-build-profile-v1",
+        "target_id": "hdf5-weights",
+        "target_version": "2.2.0",
+        "status": "provisioned",
+        "execution_profile_ready": False,
+        "source_artifacts": [
+            {
+                "name": "hdf5",
+                "url": "https://github.com/HDFGroup/hdf5/releases/download/2.2.0/hdf5-2.2.0.tar.gz",
+                "tag": "2.2.0",
+                "resolved_commit": "49df1b4e5ca4108d56e80f06321a749da1535268",
+                "sha256": "1a1ab8209b35586fbc1aa279ba76d102130b95badcb20ca329587219112d8c16",
+                "size_bytes": 42131403,
+            }
+        ],
+        "patches": [],
+        "filter_contract": {
+            "built_in_filters": ["shuffle", "fletcher32", "nbit", "scaleoffset"],
+            "deflate": "unsupported-build-disabled",
+            "dynamic_plugin_loading": False,
+            "external_support": "NO",
+            "szip": "unsupported-build-disabled",
+        },
+    }
+    target_path = root / "target-spec.json"
+    build_path = root / "build-profile.json"
+    write_json(target_path, target_spec)
+    write_json(build_path, build_profile)
+    return target_path, build_path
 
 
 def make_suite(
@@ -333,9 +391,15 @@ def make_evidence(
 
 
 class Selftest:
-    def __init__(self, assembler: Path, label: str) -> None:
+    def __init__(
+        self,
+        assembler: Path,
+        label: str,
+        support_documents: tuple[Path, Path] | None = None,
+    ) -> None:
         self.assembler = assembler
         self.label = label
+        self.support_documents = support_documents
         self.pass_count = 0
         self.fail_count = 0
 
@@ -348,8 +412,7 @@ class Selftest:
         print(f"[{self.label}-qualification] fail: {label}: {detail}", file=sys.stderr)
 
     def run(self, profile: Path, evidence: Path, output: Path, status: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [
+        command = [
                 sys.executable,
                 "-B",
                 str(self.assembler),
@@ -361,7 +424,19 @@ class Selftest:
                 str(output),
                 "--status",
                 status,
-            ],
+        ]
+        if self.support_documents is not None:
+            target_spec, build_profile = self.support_documents
+            command.extend(
+                [
+                    "--target-spec",
+                    str(target_spec),
+                    "--build-profile",
+                    str(build_profile),
+                ]
+            )
+        return subprocess.run(
+            command,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -380,18 +455,25 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--assembler", required=True, type=Path)
     parser.add_argument(
-        "--target-id", choices=("tflite", "openvino-ir"), default="tflite"
+        "--target-id", choices=("tflite", "openvino-ir", "hdf5-weights"), default="tflite"
     )
     args = parser.parse_args()
-    label = "openvino" if args.target_id == "openvino-ir" else "tflite"
-    test = Selftest(args.assembler.resolve(), label)
-    if not test.assembler.is_file():
-        test.bad("assembler precondition", f"missing file: {test.assembler}")
+    label = "hdf5" if args.target_id == "hdf5-weights" else "openvino" if args.target_id == "openvino-ir" else "tflite"
+    assembler = args.assembler.resolve()
+    if not assembler.is_file():
+        test = Selftest(assembler, label)
+        test.bad("assembler precondition", f"missing file: {assembler}")
         print(f"[{label}-qualification] pass={test.pass_count} fail={test.fail_count}")
         return 1
 
     with tempfile.TemporaryDirectory(prefix="tflite-qualification-") as temporary:
         root = Path(temporary)
+        support_documents = (
+            make_hdf5_support_documents(root)
+            if args.target_id == "hdf5-weights"
+            else None
+        )
+        test = Selftest(assembler, label, support_documents)
         profile = make_profile(root, args.target_id)
         profile_hash = digest(profile)
         task_identity = root / "task-identity.py"

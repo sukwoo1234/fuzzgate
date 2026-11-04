@@ -126,6 +126,34 @@ OPENVINO_CONTRACT = QualificationContract(
     allow_additional_binary_roles=False,
 )
 
+HDF5_CONTRACT = QualificationContract(
+    target_id="hdf5-weights",
+    label="HDF5",
+    depth="read-numeric-datasets",
+    input_kind={
+        "kind": "single",
+        "extensions": ["h5"],
+        "subformats": ["numeric-dataset"],
+    },
+    capability={
+        "backend": "local-harness",
+        "binary_role": "replay",
+        "required_mode": "native",
+        "instrumentation_scope": "hdf5-core+high-level-file-image",
+    },
+    required_binary_roles=frozenset({"replay", "fuzzer"}),
+    loader_version="2.2.0",
+    patches=(),
+    primary_source={
+        "url": "https://github.com/HDFGroup/hdf5/releases/download/2.2.0/hdf5-2.2.0.tar.gz",
+        "tag": "2.2.0",
+        "resolved_commit": "49df1b4e5ca4108d56e80f06321a749da1535268",
+        "sha256": "1a1ab8209b35586fbc1aa279ba76d102130b95badcb20ca329587219112d8c16",
+        "size_bytes": 42131403,
+    },
+    allow_additional_binary_roles=False,
+)
+
 
 def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
@@ -796,8 +824,13 @@ def qualify(
     publish(output, qualification)
     pending_text = ",".join(pending) if pending else "none"
     assert tool_commit is not None
+    marker = {
+        "tflite": "TFL07",
+        "openvino-ir": "OVI07",
+        "hdf5-weights": "HDF07",
+    }[contract.target_id]
     print(
-        f"{'TFL07' if contract.target_id == 'tflite' else 'OVI07'}_QUALIFICATION_OK=yes "
+        f"{marker}_QUALIFICATION_OK=yes "
         f"status={status} passed={len(passed)} pending={pending_text} "
         f"profile_sha256={profile_hash} tool_commit={tool_commit}"
     )
